@@ -1,0 +1,19 @@
+# HAProxyWeb 每日数据库备份（sqlite3 在线备份，需已安装 sqlite3 命令行工具）
+# 保留最近 30 份，更早的自动删除。安装见 README「备份与恢复」。
+# 异地推送（可选）：在 [Service] 中设置 Environment=HAWEB_BACKUP_PUSH_CMD=...
+# （接收备份文件路径的命令，如 rclone copy），推送失败本单元转 failed 便于告警发现。
+[Unit]
+Description=HAProxyWeb 数据库每日备份
+After=haproxyweb.service
+
+[Service]
+Type=oneshot
+User=haproxyweb
+Group=haproxyweb
+Environment=HAWEB_DATA_DIR=/var/lib/haproxyweb
+ExecStart=/usr/local/share/haproxyweb/backup.sh
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/haproxyweb
+ProtectHome=true
+PrivateTmp=true

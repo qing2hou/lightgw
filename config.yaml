@@ -1,0 +1,50 @@
+web:
+  # Web 管理后台监听地址（转发规则不能占用该端口）
+  # 安全底线：非回环监听且未配置 TLS 时启动即失败（生产必须启用 HTTPS）。
+  # 当前为局域网自签证书部署：0.0.0.0 + 下方 cert/key（证书 SAN 含本机 IP）。
+  listen: "0.0.0.0:8443"
+  # 数据目录：SQLite 数据库与 JWT 密钥存放位置
+  data_dir: "./data"
+  # 流量日志保留天数，超期自动清理
+  log_retention_days: 30
+  # 操作审计保留天数，0 = 永久保留
+  audit_retention_days: 90
+  # TLS 证书（同时配置下面两项启用 HTTPS；自签证书 SAN 含 172.22.140.11，
+  # 浏览器首次访问需手动信任一次）
+  cert_file: "./tls/cert.pem"
+  key_file: "./tls/key.pem"
+  # 仅当管理后台置于反向代理之后才配置可信代理网段（HAWEB_TRUSTED_PROXIES，逗号分隔）；
+  # 保持为空时完全不信任 X-Forwarded-For，直连部署下登录锁定与审计记录才可靠：
+  # trusted_proxies: ["127.0.0.1"]
+  # 允许非回环监听 + 明文 HTTP（仅限隔离内网/临时调试，生产保持注释）：
+  # allow_insecure: false
+
+tuning:
+  # 转发面运行参数（默认即为生产推荐值；环境变量 HAWEB_<大写蛇形名> 同名覆盖）
+  # 进程级并发连接总上限（TCP+UDP 合计），0 = 不限。建议按文件句柄限额的 80% 设置
+  max_global_conns: 0
+  # TCP 空闲连接超时秒数：持续无数据的连接会被断开，防止僵死连接耗尽句柄；0 = 禁用。
+  # 每条规则可用 idle_timeout_sec 覆盖（0 = 跟随全局）
+  tcp_idle_timeout_sec: 900
+  # TCP 后端拨号超时秒数
+  tcp_dial_timeout_sec: 10
+  # UDP 会话空闲回收秒数
+  udp_session_idle_sec: 60
+  # UDP 限速时单包最长等待毫秒数，拿不到令牌直接丢包（符合 UDP 语义）
+  udp_limiter_max_wait_ms: 100
+  # TCP 拷贝缓冲区字节数，[4096, 262144]，所有连接复用（池化），一般无需调整
+  buffer_size: 32768
+  # 零拷贝快路径（Linux splice）：仅对未配置限速的规则生效。
+  # 开启后传输期间实时字节统计不再逐块刷新（会话结束时精确落库），空闲超时对该路径不生效
+  splice: false
+  # 优雅关闭时等待存量连接结束的宽限秒数，0 = 立即断开
+  drain_timeout_sec: 10
+  # 后端健康检查周期秒数（仅 TCP 规则；也可在规则表单按需关闭），0 = 全局禁用。
+  # 检测结果落库，历史可在规则列表「后端」状态抽屉按时间段查看
+  health_check_interval_sec: 60
+  # 健康检测记录保留天数，-1 = 跟随 log_retention_days，0 = 永久保留
+  health_log_retention_days: -1
+  # 整机带宽上限 KB/s（所有规则共享配额，规则级限速之外二次限制），0 = 不限。
+  # 注意：配置后未限速规则不再走 splice 零拷贝快路径
+  # global_upload_kbps: 0
+  # global_download_kbps: 0

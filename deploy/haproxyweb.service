@@ -1,0 +1,46 @@
+# 专线网关 生产部署 systemd 单元
+# 安装步骤见 README「生产部署（systemd）」章节。
+[Unit]
+Description=专线网关 流量转发管理平台
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Type=notify + NotifyAccess=all：双进程零中断升级时子进程通过 sd_notify
+# 交接 MAINPID，systemd 不会在旧主进程退出时回收整个 cgroup（详见 README）
+Type=notify
+NotifyAccess=all
+User=haproxyweb
+Group=haproxyweb
+# 数据目录：SQLite、JWT 密钥所在处，须与 HAWEB_DATA_DIR 一致
+WorkingDirectory=/var/lib/haproxyweb
+Environment=HAWEB_DATA_DIR=/var/lib/haproxyweb
+ExecStart=/usr/local/bin/haproxyweb -c /etc/haproxyweb/config.yaml
+# reload = SIGHUP 热加载配置（tuning 参数即时生效，详见 README 配置热加载）；
+# 优雅关闭：应用收到 SIGTERM 后停止接收新连接并落库残余日志
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+# 须覆盖应用的关闭预算：Web 排空 10s + 转发连接排空 drain_timeout_sec（默认 10s）
+TimeoutStopSec=30
+
+# 允许绑定 1024 以下特权端口（转发低位端口时需要）；不授予其他能力
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+LimitNOFILE=65535
+
+# 沙箱加固：文件系统与内核接口只读，仅数据目录可写
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/haproxyweb
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

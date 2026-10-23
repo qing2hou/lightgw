@@ -1,0 +1,27 @@
+# 构建产物（web/dist 由 go:embed 使用，构建时生成）
+/bin/
+/web/dist/
+/web/node_modules/
+
+# 运行时数据（数据库、JWT 密钥——绝不入库）
+/data/
+*.db
+*.db-shm
+*.db-wal
+secret.key
+
+# 本地配置副本与系统文件
+config.local.yaml
+.DS_Store
+
+# ZCode 本地会话产物
+.zcode/
+
+# 临时构建产物与运行文件（误构建在仓库根）
+/haproxyweb
+/pid
+
+# TLS 运行时凭据（自签证书/私钥，绝不入库）
+/tls/
+lightgw-deploy-*.tar.gz
+lightgw-deploy-*.tar.gz.sha256
