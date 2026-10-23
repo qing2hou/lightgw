@@ -530,9 +530,26 @@ type session struct {
 	start      time.Time
 	up         atomic.Int64
 	down       atomic.Int64
+	// lastActive 连接级最后活动时刻（unix nano）。TCP 空闲超时按连接级判定：
+	// 任一方向有数据都刷新——纯下行/纯上行会话不因对向无数据被误杀
+	// （原实现两方向各自维护 deadline，纯下载会话的上行方向 60s 必死）。
+	lastActive atomic.Int64
 	// cfgPtr 规则运行时配置的原子指针（TCP[tcpEntry.cfg] / 该指针变化时存量
 	// 会话的热跟随通道）。nil 时 currentLimiter 走快照回退（测试构造兼容）。
 	cfgPtr *atomic.Pointer[ruleConfig]
+}
+
+// touch 更新连接级活动时刻（任一方向收到数据即调用）。
+func (s *session) touch() {
+	s.lastActive.Store(time.Now().UnixNano())
+}
+
+// activeAt 返回连接级最后活动时刻（零值=未记录，调用方兜底为会话开始时刻）。
+func (s *session) activeAt() time.Time {
+	if n := s.lastActive.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return s.start
 }
 
 // currentLimiter 会话当前应使用的限速器：优先从原子指针取最新配置

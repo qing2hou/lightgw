@@ -49,11 +49,18 @@ func (p *bufferPool) put(b *[]byte) { p.pool.Put(b) }
 // 相比 io.Copy + 包装链：零额外堆分配（池化缓冲）、每块读后即续期 deadline、
 // 计数不经过包装对象。EOF 视为正常结束返回 nil。
 //
-// 空闲超时语义：单次 Read 最长等 idle，单次 Write 最长等 idle——
-// 限速等待发生在两次 deadline 设置之间，不会挤占活动传输的超时窗口。
+// 空闲超时语义（连接级）：deadline 基于**会话级最后活动时刻**（sess.lastActive，
+// 任一方向有数据都刷新）判定，而非本方向自己的读活动——纯下行/纯上行会话
+// （如 wget 下载全程客户端不发数据）不会因对向无数据被误杀（P1 缺陷修复：
+// 原实现两方向各自 deadline，纯下载 60s 必被上行方向的空闲超时切断）。
+// 实现：Read deadline 取 min(连接级截止, now+1s 轮询)；到点后复查 lastActive
+// ——对向延长了活动则重新装填继续阻塞（纯等待场景每秒至多一次空转唤醒），
+// 连接级真超时才返回 errIdleTimeout。
 //
 // 限速热跟随：每块数据前从 entry.cfg 原子指针重取限速器——带宽包编辑/规则更新
 // 触发 cfg.Store 后，存量连接下一块即用新额度（不中断会话、即时生效）。
+const idlePollInterval = time.Second
+
 func (m *Manager) copyTCP(dst, src net.Conn, cfg *ruleConfig, sess *session, download bool, ctx context.Context) error {
 	buf := m.bufs.get()
 	defer m.bufs.put(buf)
@@ -62,12 +69,19 @@ func (m *Manager) copyTCP(dst, src net.Conn, cfg *ruleConfig, sess *session, dow
 	limiter := cfg.limiter
 	for {
 		if idle > 0 {
-			now := time.Now()
-			_ = src.SetReadDeadline(now.Add(idle))
-			_ = dst.SetWriteDeadline(now.Add(idle))
+			limit := sess.activeAt().Add(idle) // 连接级空闲截止
+			dl := limit
+			if now := time.Now(); dl.After(now.Add(idlePollInterval)) {
+				dl = now.Add(idlePollInterval) // 截止还很远：先装轮询刻度
+			} else if !dl.After(now) {
+				dl = now.Add(100 * time.Millisecond) // 已过期：短暂等待统一走超时路径
+			}
+			_ = src.SetReadDeadline(dl)
+			_ = dst.SetWriteDeadline(dl)
 		}
 		n, rerr := src.Read(*buf)
 		if n > 0 {
+			sess.touch() // 连接级活动：对向方向的空闲窗口随之后移
 			sess.addBytes(download, int64(n))
 			// 热跟随：配置可能已被原子替换（带宽包编辑等 tc-only 场景），
 			// 取当前快照的限速器——存量连接立即按新额度整形
@@ -104,6 +118,10 @@ func (m *Manager) copyTCP(dst, src net.Conn, cfg *ruleConfig, sess *session, dow
 			case errors.Is(rerr, io.EOF):
 				return nil
 			case errors.Is(rerr, os.ErrDeadlineExceeded):
+				// 轮询刻度到期：对向方向延长了连接级活动 → 重新装填继续等
+				if idle > 0 && time.Now().Before(sess.activeAt().Add(idle)) {
+					continue
+				}
 				return errIdleTimeout
 			default:
 				return rerr

@@ -160,8 +160,54 @@ func TestCopyTCPLimiterHotFollow(t *testing.T) {
 }
 
 // 空闲超过配置时长后拷贝应返回 errIdleTimeout，且计数包含超时前已收到的字节。
-func TestCopyTCPIdleTimeout(t *testing.T) {
-	m := newTestManager(4096, 200*time.Millisecond)
+// 连接级空闲语义（P1 修复回归）：本方向无数据、但对向方向持续活跃（touch 刷新）
+// 时不应被误杀；活动停止后按 idle 正常超时。原缺陷：纯下载会话的上行方向
+// 60s 必被自己的方向级 deadline 切断（全速下载中静默断流）。
+func TestCopyTCPIdleConnectionLevel(t *testing.T) {
+	m := newTestManager(4096, 300*time.Millisecond)
+	srcC, _ := dialPair(t) // 本方向读 srcC（模拟客户端侧：纯下载期间无上行数据）
+	dstC, dstS := dialPair(t)
+	go func() { _, _ = io.Copy(io.Discard, dstS) }()
+
+	cfgUp := testCfg(t, m, 0)
+	cfgUp.idleTimeout = 300 * time.Millisecond
+	sess := m.registerSession(cfgUp, "1.2.3.4", 12345, "", 0)
+	sess.touch()
+
+	done := make(chan error, 1)
+	go func() { done <- m.copyTCP(dstC, srcC, cfgUp, sess, false, context.Background()) }()
+
+	// 模拟对向（下载）方向持续活跃：每 80ms touch 一次，持续 900ms（远超 300ms idle）
+	stop := make(chan struct{})
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(80 * time.Millisecond):
+				sess.touch()
+			}
+		}
+	}()
+	// 活跃期内本方向不应被切断
+	select {
+	case err := <-done:
+		t.Fatalf("对向活跃期间不应超时（连接级空闲语义未生效）: %v", err)
+	case <-time.After(900 * time.Millisecond):
+	}
+	close(stop)
+	// 活动停止后应在 idle+缓冲 内返回 errIdleTimeout
+	select {
+	case err := <-done:
+		if !errors.Is(err, errIdleTimeout) {
+			t.Fatalf("应返回空闲超时，实际: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("活动停止后空闲超时未生效")
+	}
+}
+
+func TestCopyTCPIdleTimeout(t *testing.T) {	m := newTestManager(4096, 200*time.Millisecond)
 	srcC, srcS := dialPair(t)
 	dstC, dstS := dialPair(t)
 	go func() { _, _ = io.Copy(io.Discard, dstS) }()
