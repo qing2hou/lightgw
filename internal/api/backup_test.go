@@ -35,7 +35,7 @@ func newBackupHandlers(t *testing.T) (*handlers, *gorm.DB) {
 	if err := db.AutoMigrate(&model.ForwardRule{}, &model.TrafficLog{}); err != nil {
 		t.Fatalf("建表失败: %v", err)
 	}
-	tlog := trafficlog.New(db, 1)
+	tlog := trafficlog.New(db, trafficlog.Options{RetentionDays: 1})
 	t.Cleanup(func() { tlog.Close() })
 	auditW := audit.New(db, 90)
 	t.Cleanup(func() { auditW.Close() })

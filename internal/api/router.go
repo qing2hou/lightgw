@@ -183,6 +183,7 @@ func (h *handlers) healthz(c *gin.Context) {
 		"audit_log_dropped":      h.Audit.Dropped(),
 		"traffic_cleanup_failed": h.TLog.CleanupFailures(),
 		"audit_cleanup_failed":   h.Audit.CleanupFailures(),
+		"traffic_log_rotated":    h.TLog.Rotated(), // 容量/水位自动轮转累计删除行数（非零=轮转已发生）
 	})
 }
 

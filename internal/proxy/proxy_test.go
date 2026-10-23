@@ -29,7 +29,7 @@ func newFullManager(t *testing.T, opts Options) *Manager {
 	if err := db.AutoMigrate(&model.TrafficLog{}, &model.ForwardRule{}, &model.HealthLog{}); err != nil {
 		t.Fatalf("建表失败: %v", err)
 	}
-	tlog := trafficlog.New(db, 1)
+	tlog := trafficlog.New(db, trafficlog.Options{RetentionDays: 1})
 	t.Cleanup(func() { tlog.Close() })
 	return NewManager(db, tlog, 0, opts)
 }

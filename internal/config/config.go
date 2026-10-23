@@ -16,6 +16,8 @@ type Config struct {
 		Listen             string   `yaml:"listen"`               // Web 后台监听地址
 		DataDir            string   `yaml:"data_dir"`             // 数据目录（SQLite、JWT 密钥）
 		LogRetentionDays   int      `yaml:"log_retention_days"`   // 流量日志保留天数
+		LogMaxDiskMB       int      `yaml:"log_max_disk_mb"`      // 流量日志库文件轮转上限（MB）：超过自动淘汰最老日志；0 = 不限
+		LogDiskWatermarkPc int      `yaml:"log_disk_high_watermark_pct"` // 数据卷磁盘水位（%）：超过即紧急淘汰最老日志（兜底防打爆）；0 = 默认 90
 		AuditRetentionDays int      `yaml:"audit_retention_days"` // 审计日志保留天数，0 = 永久保留
 		CertFile           string   `yaml:"cert_file"`            // TLS 证书路径；与 key_file 同时配置时管理后台启用 HTTPS
 		KeyFile            string   `yaml:"key_file"`             // TLS 私钥路径
@@ -48,6 +50,8 @@ func defaults() *Config {
 	c.Web.Listen = "127.0.0.1:8080"
 	c.Web.DataDir = "./data"
 	c.Web.LogRetentionDays = 30
+	c.Web.LogMaxDiskMB = 2048       // 开箱防打爆：流量日志库 2GB 自动轮转最老数据
+	c.Web.LogDiskWatermarkPc = 90   // 数据卷 90% 使用率紧急淘汰
 	c.Web.AuditRetentionDays = 90
 	c.Tuning.MaxGlobalConns = 0
 	c.Tuning.TCPIdleTimeoutSec = 900
@@ -124,6 +128,8 @@ func Load(path string) (*Config, error) {
 	// 其余数值型配置：非法值启动即失败，不静默忽略
 	envInts := map[string]*int{
 		"HAWEB_AUDIT_RETENTION_DAYS":      &c.Web.AuditRetentionDays,
+		"HAWEB_LOG_MAX_DISK_MB":           &c.Web.LogMaxDiskMB,
+		"HAWEB_LOG_DISK_HIGH_WATERMARK_PCT": &c.Web.LogDiskWatermarkPc,
 		"HAWEB_MAX_GLOBAL_CONNS":          &c.Tuning.MaxGlobalConns,
 		"HAWEB_TCP_IDLE_TIMEOUT_SEC":      &c.Tuning.TCPIdleTimeoutSec,
 		"HAWEB_TCP_DIAL_TIMEOUT_SEC":      &c.Tuning.TCPDialTimeoutSec,
@@ -166,6 +172,16 @@ func (c *Config) validate() error {
 	}
 	if c.Web.LogRetentionDays <= 0 {
 		c.Web.LogRetentionDays = 30
+	}
+	if c.Web.LogMaxDiskMB < 0 {
+		return fmt.Errorf("web.log_max_disk_mb 不能为负数（0 表示不限容量轮转）")
+	}
+	// 水位合法域 (0,100]；<=0 视为未配置取默认 90
+	if c.Web.LogDiskWatermarkPc < 0 || c.Web.LogDiskWatermarkPc > 100 {
+		return fmt.Errorf("web.log_disk_high_watermark_pct 取值应为 1-100（磁盘使用率百分比）")
+	}
+	if c.Web.LogDiskWatermarkPc == 0 {
+		c.Web.LogDiskWatermarkPc = 90
 	}
 	if c.Web.AuditRetentionDays < 0 {
 		return fmt.Errorf("web.audit_retention_days 不能为负数（0 表示永久保留）")

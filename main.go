@@ -90,7 +90,12 @@ func main() {
 		log.Fatalf("初始化认证服务失败: %v", err)
 	}
 
-	tlog := trafficlog.New(db, cfg.Web.LogRetentionDays)
+	tlog := trafficlog.New(db, trafficlog.Options{
+		RetentionDays: cfg.Web.LogRetentionDays,
+		MaxDiskMB:     cfg.Web.LogMaxDiskMB,
+		WatermarkPct:  cfg.Web.LogDiskWatermarkPc,
+		DataDir:       cfg.Web.DataDir,
+	})
 	auditW := audit.New(db, cfg.Web.AuditRetentionDays)
 
 	mgr := proxy.NewManager(db, tlog, cfg.ListenPort(), buildProxyOptions(cfg))
@@ -192,10 +197,13 @@ func main() {
 			}
 		}
 		tlog.SetRetention(cfg2.Web.LogRetentionDays)
+		tlog.SetRotation(cfg2.Web.LogMaxDiskMB, cfg2.Web.LogDiskWatermarkPc)
 		auditW.SetRetention(cfg2.Web.AuditRetentionDays)
 		mgr.ApplyOptions(buildProxyOptions(cfg2))
 		// 记录已热应用的字段供下次 diff（handlers 持有的 cfg 不动，避免数据竞争）
 		lastApplied.Web.LogRetentionDays = cfg2.Web.LogRetentionDays
+		lastApplied.Web.LogMaxDiskMB = cfg2.Web.LogMaxDiskMB
+		lastApplied.Web.LogDiskWatermarkPc = cfg2.Web.LogDiskWatermarkPc
 		lastApplied.Web.AuditRetentionDays = cfg2.Web.AuditRetentionDays
 		lastApplied.Web.HealthWebhookURL = cfg2.Web.HealthWebhookURL
 		lastApplied.Tuning = cfg2.Tuning
