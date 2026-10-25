@@ -233,3 +233,38 @@ func TestCompileSNATDstWhitelistNoSrc(t *testing.T) {
 		t.Fatal("目标白名单×无源组合应有带 daddr 无 saddr 的放行行（旧形态语义）")
 	}
 }
+
+func TestCIDRMatchDataBytes(t *testing.T) {
+	// B2 回归：v4 CIDR 的 Cmp Data 必须是网络地址本身（曾回归为 To16 切片全零）
+	rules, err := CompileSNAT(Spec{
+		ID: 1, IfIn: "e0", IfOut: "e1", OutIP: "1.2.3.4",
+		AllowSrcs: []string{"192.168.1.0/24"}, DstMode: "off",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rules {
+		if r.Chain != nft.ChainSrcNAT {
+			continue
+		}
+		for i := 0; i+1 < len(r.Rule.Exprs); i++ {
+			bw, ok1 := r.Rule.Exprs[i].(*expr.Bitwise)
+			cm, ok2 := r.Rule.Exprs[i+1].(*expr.Cmp)
+			if !ok1 || !ok2 {
+				continue
+			}
+			if len(bw.Mask) != 4 {
+				continue
+			}
+			want := []byte{192, 168, 1, 0}
+			if string(cm.Data) != string(want) {
+				t.Fatalf("v4 CIDR Cmp Data = %v，期望网络地址 %v（B2 回归：To16 切片全零）", cm.Data, want)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("未在 srcnat 行找到 CIDR Bitwise+Cmp 对")
+	}
+}

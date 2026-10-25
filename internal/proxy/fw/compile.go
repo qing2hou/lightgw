@@ -33,10 +33,10 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 	if s.OutIP == "" {
 		// 旧 installSnat 的 fail-fast 语义沿承：空 SNAT 源装出去就是单向黑洞
 		// （出去的包源是私网地址、回程必丢）——宁可拒绝安装
-		return nil, fmt.Errorf("出口网卡 %s 无 IPv4 地址（SNAT 源为空）", s.IfOut)
+		return nil, fmt.Errorf("出口网卡 %s 无 IP 地址（SNAT 源为空）", s.IfOut)
 	}
-	if v4(s.OutIP) == nil {
-		return nil, fmt.Errorf("SNAT 源 %s 不是合法 IPv4", s.OutIP)
+	if v4(s.OutIP) == nil && v4OrV6(s.OutIP) == nil {
+		return nil, fmt.Errorf("SNAT 源 %s 不是合法 IP", s.OutIP)
 	}
 	for _, d := range s.DstDeny {
 		if !validDst(d) {
@@ -161,12 +161,22 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 				outIP = m
 			}
 		}
-		if v4(outIP) == nil {
-			return nil, fmt.Errorf("SNAT 源 %q 不是合法 IPv4", outIP)
+		// B8：v6 SNAT（NAT66）——地址族由改写目标推断（v4 4B AF_INET；v6 16B AF_INET6）
+		var natIP net.IP
+		if ip := v4(outIP); ip != nil {
+			natIP = ip
+		} else if ip := v4OrV6(outIP); ip != nil {
+			natIP = ip
+		} else {
+			return nil, fmt.Errorf("SNAT 源 %q 不是合法 IP", outIP)
+		}
+		natFamily := uint32(unix.AF_INET)
+		if len(natIP) == 16 {
+			natFamily = unix.AF_INET6
 		}
 		nat = append(nat,
-			&expr.Immediate{Register: 1, Data: v4(outIP)},
-			&expr.NAT{Type: expr.NATTypeSourceNAT, Family: unix.AF_INET,
+			&expr.Immediate{Register: 1, Data: natIP},
+			&expr.NAT{Type: expr.NATTypeSourceNAT, Family: natFamily,
 				RegAddrMin: 1, RegAddrMax: 1},
 		)
 		out = append(out, Rule{Chain: nft.ChainSrcNAT, Rule: &nftables.Rule{
@@ -254,19 +264,26 @@ func addrMatchExprsSrc(src string) []expr.Any {
 
 // cidrMatchExprs CIDR 网段匹配（Bitwise+网络序；v4/v6 由 ipn 派生长度与偏移）。
 func cidrMatchExprs(ipn *net.IPNet, offset uint32) []expr.Any {
-	mask := make([]byte, len(ipn.Mask))
-	copy(mask, ipn.Mask)
-	network := ipn.IP
-	if network.To4() != nil && len(mask) == net.IPv6len {
-		// v4 IP 带 /24 等 v4 掩码——归一
-		network = network.To4()
-		mask = mask[12:]
+	// 族归一（B2：v4 的 To16() 是 v4-in-v6 映射 [::ffff:a.b.c.d]——前 4 字节全零，
+	// Cmp Data 若按 To16 切片会全零把网段匹配退化为 ==0.0.0.0——v4 一律 To4）
+	isV4 := ipn.IP.To4() != nil
+	var mask, network []byte
+	if isV4 {
+		if len(ipn.Mask) == net.IPv6len {
+			mask = ipn.Mask[12:] // v6 长度掩码表示 v4：取尾 4 字节
+		} else {
+			mask = ipn.Mask
+		}
+		network = ipn.IP.To4()
+	} else {
+		mask = ipn.Mask // 16B v6 掩码
+		network = ipn.IP.To16()
 	}
 	return []expr.Any{
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: uint32(len(mask))},
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: uint32(len(mask)),
 			Mask: mask, Xor: make([]byte, len(mask))},
-		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network.To16()[:len(mask)]},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network},
 	}
 }
 
@@ -350,14 +367,13 @@ func CompileDefaultDenyEx(ruleID uint, ifaces, dnatBackends []string) []Rule {
 		}})
 	}
 	for _, b := range dnatBackends {
-		ip := v4(b)
-		if ip == nil {
+		// B7：v6 后端同样有辖区行（此前 v4-only continue——v6 发布的名单外
+		// 拒绝失效，vanilla 宿主下直接放行到 v6 后端）
+		m := dstMatchExprsD(b)
+		if m == nil {
 			continue
 		}
-		ex := append([]expr.Any{
-			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
-		}, dropTail()...)
+		ex := append(m, dropTail()...)
 		out = append(out, Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
 			Table: tbl, UserData: []byte(ud), Exprs: ex,
 		}})

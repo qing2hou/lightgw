@@ -52,7 +52,11 @@ type Manager struct {
 
 	// 出口探测循环（M3/T202）
 	egressDone      chan struct{}
+	egressReapply   chan struct{} // 出口翻转重算的聚批信号（S1）
 	egressStartOnce sync.Once
+	// egressDirty 出口状态/绑定脏标记（B1：置位后 applySNAT 绕过快路径——
+	// sameForwarding 不含出口维度，翻转触发的 reapply 若走快路径切换永不发生）
+	egressDirty atomic.Bool
 
 	// 带宽包共享令牌桶（ADR-9：包ID -> Limiter；tcp/udp 成员规则注入；额度变更重建）
 	bwMu       sync.Mutex
@@ -97,26 +101,27 @@ func NewManager(db *gorm.DB, tlog *trafficlog.Writer, webPort int, opts Options)
 		opts.TCPDialTimeout = 10 * time.Second
 	}
 	m := &Manager{
-		db:          db,
-		tlog:        tlog,
-		webPort:     webPort,
-		tcpRules:    map[uint]*tcpEntry{},
-		udpRules:    map[uint]*udpEntry{},
-		snatRules:   map[uint]*snatEntry{},
-		snatBase:    map[uint]*snatBaseline{},
-		bwLimiters:  map[uint]*ratelimit.Limiter{},
-		snatAcc:     map[uint]int64{},
-		snatDone:    make(chan struct{}),
-		adoptedTCP:  map[uint]net.Listener{},
-		adoptedUDP:  map[uint]*net.UDPConn{},
-		bufs:        newBufferPool(opts.BufferSize),
-		udpBufs:     sync.Pool{New: func() any { b := make([]byte, 65535); return &b }},
-		globalConns: newConnLimiter(opts.MaxGlobalConns),
-		stats:       map[uint]*ruleStats{},
-		health:      map[uint]*ruleHealth{},
-		healthDone:  make(chan struct{}),
-		deniedLast:  map[string]time.Time{},
-		egressDone:  make(chan struct{}),
+		db:            db,
+		tlog:          tlog,
+		webPort:       webPort,
+		tcpRules:      map[uint]*tcpEntry{},
+		udpRules:      map[uint]*udpEntry{},
+		snatRules:     map[uint]*snatEntry{},
+		snatBase:      map[uint]*snatBaseline{},
+		bwLimiters:    map[uint]*ratelimit.Limiter{},
+		snatAcc:       map[uint]int64{},
+		snatDone:      make(chan struct{}),
+		adoptedTCP:    map[uint]net.Listener{},
+		adoptedUDP:    map[uint]*net.UDPConn{},
+		bufs:          newBufferPool(opts.BufferSize),
+		udpBufs:       sync.Pool{New: func() any { b := make([]byte, 65535); return &b }},
+		globalConns:   newConnLimiter(opts.MaxGlobalConns),
+		stats:         map[uint]*ruleStats{},
+		health:        map[uint]*ruleHealth{},
+		healthDone:    make(chan struct{}),
+		deniedLast:    map[string]time.Time{},
+		egressDone:    make(chan struct{}),
+		egressReapply: make(chan struct{}, 1),
 	}
 	m.optsStore.Store(&opts)
 	m.globalLimiter.Store(ratelimit.New(opts.GlobalUploadKBps*1024, opts.GlobalDownloadKBps*1024))

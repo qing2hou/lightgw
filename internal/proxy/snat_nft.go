@@ -66,6 +66,7 @@ func (m *Manager) installSnatNFT(spec *snatRuleSpec) error {
 	}
 	fwSpec := fw.Spec{
 		ID: spec.ID, IfIn: spec.IfIn, IfOut: spec.IfOut, OutIP: spec.OutIP,
+		Pool:      spec.Pool, // B5：此前漏传——rotate/sticky 全退化为固定 OutIP
 		AllowSrcs: spec.AllowSrcs, DstMode: spec.DstAclMode,
 		DstAllow: spec.DstAllow, DstDeny: spec.DstDeny,
 		EgGw: spec.EgressGw,

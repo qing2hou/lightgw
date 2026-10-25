@@ -735,6 +735,8 @@ func (h *handlers) updateRule(c *gin.Context) {
 		"Name", "Protocol", "ListenAddr", "TargetAddr", "AclMode",
 		"AllowList", "DenyList", "AclGroupID", "SnatIP", "EgressGw", "MinKBps", "SourceIP",
 		"DstAclMode", "DstAllowList", "DstDenyList",
+		// B6：M2/M3 新列显式加入（AGENTS 踩坑：Select 白名单漏新列=编辑静默丢字段）
+		"DnatRejectMode", "SnatMode", "SnatPool", "EgressIDs",
 		"UploadLimitKBps", "DownloadLimitKBps", "MaxConns", "IdleTimeoutSec", "HealthCheck", "Enabled",
 	).Updates(rule).Error; err != nil {
 		h.serverError(c, "保存规则", err)

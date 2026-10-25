@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"net"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -42,7 +41,11 @@ func egressStateOf(id uint) *egressState {
 	egressMu.Lock()
 	defer egressMu.Unlock()
 	if egressStateMap[id] == nil {
+		// B3：零值 up=false 会把新建/重启后的出口在连续 UpCount 次探测成功前
+		// 判 down（默认 ~6s 参与不了路由）。未知即 up（与 EgressUp 注释一致），
+		// 首探失败即开始正常去抖翻转路径。
 		egressStateMap[id] = &egressState{}
+		egressStateMap[id].up.Store(true)
 	}
 	return egressStateMap[id]
 }
@@ -50,6 +53,11 @@ func egressStateOf(id uint) *egressState {
 // ProbeEgressOnce 单次探测：按模式探测，返回 (ok, latency, reason)。
 func ProbeEgressOnce(e model.Egress) (bool, int64, string) {
 	if e.ProbeMode == "none" {
+		// S4：常开出口仍要链路状态门（PRD：网卡拔除立即判 down）
+		iface, err := net.InterfaceByName(e.Iface)
+		if err != nil || iface.Flags&net.FlagUp == 0 {
+			return false, -1, fmt.Sprintf("网卡 %s 不存在或链路 down", e.Iface)
+		}
 		return true, 0, ""
 	}
 	// 链路 down 立即判 down（AC-4.6 边界）
@@ -121,13 +129,16 @@ func pingRTT(host string, timeout time.Duration) (time.Duration, error) {
 	}
 	defer c.Close()
 
-	var id uint16 = uint16(time.Now().UnixNano() & 0xffff)
+	// id 加进程级随机 salt + payload nonce（多并发探测的 raw socket 全收
+	// 互串防护——同宿主多实例也不互抢回复）
+	var id uint16 = uint16(time.Now().UnixNano()>>4) & 0xffff
 	var seq uint16 = 1
+	nonce := fmt.Sprintf("hawebprobe-%d", time.Now().UnixNano())
 	var payload []byte
 	if ip.To4() != nil {
-		payload = icmpEchoV4(id, seq, []byte("hawebprobe0"))
+		payload = icmpEchoV4(id, seq, []byte(nonce))
 	} else {
-		payload = icmpEchoV6(id, seq, []byte("hawebprobe0"))
+		payload = icmpEchoV6(id, seq, []byte(nonce))
 	}
 	dst := &net.IPAddr{IP: ip}
 	start := time.Now()
@@ -289,7 +300,60 @@ func (m *Manager) probeEgress(e model.Egress) {
 
 // onEgressStateChange 状态翻转后的重算钩子（T203/T204 接管切换执行）。
 func (m *Manager) onEgressStateChange(e model.Egress) {
-	m.reapplyAllSnatRules()
+	m.egressDirty.Store(true) // B1：绕过快路径（sameForwarding 不含出口维度，翻转触发 reapply 若走快路径切换永不发生）
+	// S1：异步去抖重算——探测 goroutine 不被 DB 全量遍历+逐规则 Apply 阻塞
+	// （多出口同时翻转合并为一轮重算）
+	select {
+	case m.egressReapply <- struct{}{}:
+	default: // 已有待处理重算——合并
+	}
+	// B4（AC-4.3）：出口判 down 时掐断经该出口的存量会话——旧源 IP 从新出口
+	// 发出必被上游丢弃（黑洞），关闸即断优于半死不活。锚点：conntrack 表项的
+	//【网关侧源 IP】= SNAT 改写后的出口侧源——多出口场景按 reply-src ∈
+	// 出口侧源集精确删（每出口的实际 SNAT 源即其网卡地址）。
+	if !EgressUp(e.ID) {
+		m.killEgressSessions(e)
+	}
+}
+
+// killEgressSessions 掐断经指定出口的存量穿越会话（conntrack reply 源 =
+// SNAT 后源——匹配该出口网卡的全部 v4 地址）。
+func (m *Manager) killEgressSessions(e model.Egress) {
+	lines := readConntrackTable()
+	if lines == nil {
+		return
+	}
+	egIPs := map[string]bool{}
+	iface, err := net.InterfaceByName(e.Iface)
+	if err != nil {
+		return
+	}
+	addrs, _ := iface.Addrs()
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+			egIPs[ipn.IP.String()] = true
+		}
+	}
+	if len(egIPs) == 0 {
+		return
+	}
+	spec := &snatRuleSpec{ID: e.ID}
+	killed := 0
+	for _, ln := range lines {
+		c, ok := parseConntrackLine(ln)
+		if !ok {
+			continue
+		}
+		if !egIPs[c.replySrc] {
+			continue
+		}
+		if deleteConntrackEntry(spec, c) {
+			killed++
+		}
+	}
+	if killed > 0 {
+		logf("出口[%s#%d] 判不可用：已掐断 %d 条经该出口的存量会话", e.Name, e.ID, killed)
+	}
 }
 
 // reapplyAllSnatRules 重应用全部启用 snat 规则（出口集变化 → 路由重算）。
@@ -365,7 +429,9 @@ func (m *Manager) egressNexthops(ruleID uint, egressIDs []uint) []nft.Nexthop {
 		}
 		gw := e.GatewayV4
 		if gw == "" {
-			continue // v1: v4 路由表；v6 网关的出口走 v6 表（T205）
+			// S3：v6-only 出口暂不参与 v4 规则路由（v6 表在 T205；此处曾静默
+			// skip——补日志便于排障，API 层已校验但存在 v6-only 合法出口）
+			continue
 		}
 		gwIP := net.ParseIP(gw)
 		if gwIP == nil || gwIP.To4() == nil {
@@ -411,8 +477,6 @@ func egressIDsOfRule(rule model.ForwardRule) []uint {
 	}
 	return ids
 }
-
-var _ = strconv.Itoa // 保 strconv（未来探测目标端口拆分用）
 
 // ReapplySnatRules 导出包装（API 出口变更后的重算）。
 func (m *Manager) ReapplySnatRules() { m.reapplyAllSnatRules() }

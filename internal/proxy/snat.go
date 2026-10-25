@@ -163,9 +163,26 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 			}
 		}
 		for _, m := range members {
-			if v4 := net.ParseIP(strings.TrimSpace(m)); v4 != nil && v4.To4() != nil {
-				pool = append(pool, strings.TrimSpace(m))
+			m = strings.TrimSpace(m)
+			ip := net.ParseIP(m)
+			if ip == nil || ip.To4() == nil {
+				continue
 			}
+			// S2：运行时归属复验——成员已从出口网卡移除时剔除（静默黑洞防护，
+			// 与单 IP SnatIP 的复验同语义）；全失效则退回 fixed
+			belongs := false
+			for _, v4 := range InterfaceIPv4s(rule.TargetAddr) {
+				if v4 == m {
+					belongs = true
+					break
+				}
+			}
+			if belongs {
+				pool = append(pool, m)
+			}
+		}
+		if len(pool) == 0 && len(members) > 0 {
+			logf("规则[%s#%d] SNAT 池全部成员已不归属出口网卡 %s，退回固定源", rule.Name, rule.ID, rule.TargetAddr)
 		}
 	}
 	return &snatRuleSpec{
@@ -226,8 +243,10 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		m.mu.Lock()
 		old := m.snatRules[rule.ID]
 		m.mu.Unlock()
-		// 快速路径判定：引擎记得上一代 + 转发形态参数全部一致 + tc 参数有变（或不变也幂等重做）
-		if old != nil && old.sameForwarding(spec) {
+		// 快速路径判定：引擎记得上一代 + 转发形态参数全部一致 + 无出口脏标记
+		// （B1：出口 up/down 翻转与 egress_ids 变更不在 sameForwarding 维度内，
+		//  由 egressDirty 强制全路径——否则切换/回切/分担变化全部被吞）
+		if old != nil && !m.egressDirty.Swap(false) && old.sameForwarding(spec) {
 			if err := spec.applySnatLimit(); err != nil {
 				logf("规则[%s#%d] tc 限速重建失败（保持原限速）: %v", rule.Name, rule.ID, err)
 			} else if spec.BWGroupKBps > 0 {
