@@ -76,6 +76,24 @@ type ForwardRule struct {
 	UpdatedAt         time.Time `json:"updated_at"`
 }
 
+// FwPolicy 状态防火墙策略（US3）：有序规则列表，作用于全部穿越（snat）与
+// 发布（dnat）流量。先命中先适用；全部未命中走默认拒绝（v1 白名单穿越形态）。
+// 已建会话由 pre_mark established 打标短路，不重复评估。
+type FwPolicy struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Name      string    `gorm:"size:128" json:"name"`
+	Order     int       `gorm:"uniqueIndex" json:"order"`        // 升序即评估序（1 起）
+	Action    string    `gorm:"size:8" json:"action"`            // accept / drop
+	SrcList   string    `gorm:"type:text" json:"src_list"`       // JSON 数组（IP/CIDR；空=任意）
+	DstList   string    `gorm:"type:text" json:"dst_list"`       // JSON 数组（IP/CIDR；空=任意）
+	Proto     string    `gorm:"size:8;default:tcp" json:"proto"` // tcp / udp / icmp / any
+	PortRange string    `gorm:"size:128" json:"port_range"`      // "80" / "80,443,1000-2000"（any/icmp 空）
+	Enabled   bool      `gorm:"default:true" json:"enabled"`
+	Comment   string    `gorm:"size:256" json:"comment"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // BWGroup 带宽包：多条转发规则共享的下载（出向）带宽额度。成员关系存于规则行
 // （ForwardRule.BWGroupID）；包侧"引用规则"由 API 批量改写成员规则实现。
 // 共享执行：tc 每成员网卡 htb 的 per-包 class 各自限total_kbps（同额度多卡独立满额——单卡

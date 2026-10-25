@@ -123,6 +123,12 @@ func NewRouter(d Deps, distFS fs.FS) (*gin.Engine, error) {
 		admin.DELETE("/acl-groups/:id", h.deleteAclGroup)
 
 		// 网卡列表（snat 规则表单下拉）
+		admin.GET("/fw-policies", h.listFwPolicies)
+		admin.POST("/fw-policies", h.createFwPolicy)
+		admin.PUT("/fw-policies/:id", h.updateFwPolicy)
+		admin.DELETE("/fw-policies/:id", h.deleteFwPolicy)
+		admin.PUT("/fw-policies/reorder", h.reorderFwPolicies)
+
 		admin.GET("/interfaces", h.listInterfaces)
 
 		// 带宽包（多规则共享下载额度）

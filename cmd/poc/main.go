@@ -49,6 +49,10 @@ func main() {
 		e2eDNAT()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-e2e-policy" {
+		e2ePolicy()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke-migrate" {
 		smokeMigrate()
 		return

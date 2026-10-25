@@ -282,3 +282,82 @@ func shErrStart(script string) error {
 	cmd := exec.Command("sh", "-c", script)
 	return cmd.Start()
 }
+
+// e2ePolicy 策略端到端：snat 穿越基线 → drop 策略拦新流 → established 不中断 → 拆策略恢复。
+func e2ePolicy() {
+	fmt.Println("=== M2 策略端到端验证 ===")
+	{
+		must := func(what string, err error) {
+			if err != nil {
+				fmt.Printf("FAIL %s: %v\n", what, err)
+				os.Exit(1)
+			}
+		}
+		for _, ns := range []string{"haweb-c", "haweb-t"} {
+			_, _ = run("ip", "netns", "del", ns)
+		}
+		for _, v := range []string{"veth-gw-c", "veth-gw-t", "veth-c", "veth-t"} {
+			_, _ = run("ip", "link", "del", v)
+		}
+		must("建 ns", shErr("ip netns add haweb-c; ip netns add haweb-t"))
+		must("veth", shErr("ip link add veth-c type veth peer name veth-gw-c; ip link add veth-t type veth peer name veth-gw-t"))
+		must("入 ns", shErr("ip link set veth-c netns haweb-c; ip link set veth-t netns haweb-t"))
+		must("网关地址", shErr("ip addr add 192.168.100.1/24 dev veth-gw-c; ip addr add 10.200.0.1/24 dev veth-gw-t; ip link set veth-gw-c up; ip link set veth-gw-t up"))
+		must("client", shErr("ip netns exec haweb-c ip addr add 192.168.100.2/24 dev veth-c; ip netns exec haweb-c ip link set veth-c up; ip netns exec haweb-c ip link set lo up; ip netns exec haweb-c ip route add default via 192.168.100.1"))
+		must("target", shErr("ip netns exec haweb-t ip addr add 10.200.0.2/24 dev veth-t; ip netns exec haweb-t ip link set veth-t up; ip netns exec haweb-t ip link set lo up; ip netns exec haweb-t ip route add default via 10.200.0.1"))
+		must("target http", shErr("ip netns exec haweb-t python3 -m http.server 80 >/dev/null 2>&1 &"))
+	}
+	// snat 穿越（复用 e2e 装载）
+	if err := applySnatForE2E(); err != nil {
+		fmt.Println("FAIL snat 装载:", err)
+		os.Exit(1)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err != nil {
+		fmt.Println("FAIL 基线穿越:", err, out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 基线：snat 穿越通")
+
+	// 装 drop 策略（拦 192.168.100.0/24 → 10.200.0.2:80）
+	conn, err := nft.Dial()
+	if err != nil {
+		fmt.Println("FAIL dial:", err)
+		os.Exit(1)
+	}
+	polRules, err := fw.CompilePolicies([]fw.PolicySpec{
+		{ID: 1, Order: 1, Action: "drop", SrcList: []string{"192.168.100.0/24"}, Proto: "tcp", PortRange: "80"},
+	})
+	if err != nil {
+		fmt.Println("FAIL 编译:", err)
+		os.Exit(1)
+	}
+	for _, r := range polRules {
+		conn.AddCompiled(r.Chain, r.Rule)
+	}
+	if err := conn.FlushCommit(); err != nil {
+		fmt.Println("FAIL 策略装载:", err)
+		os.Exit(1)
+	}
+	fmt.Println("PASS drop 策略装载")
+	time.Sleep(200 * time.Millisecond)
+	// 新流应被拒
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err == nil {
+		fmt.Printf("FAIL 策略后新流应被拒: %q\n", out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 策略拦截新流")
+
+	// 拆策略 → 恢复
+	if err := conn.PurgeByComment(nft.KindPolicy, 1); err != nil {
+		fmt.Println("FAIL 策略拆除:", err)
+		os.Exit(1)
+	}
+	time.Sleep(200 * time.Millisecond)
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err != nil {
+		fmt.Println("FAIL 拆策略后应恢复:", err, out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 拆策略恢复穿越")
+	fmt.Println("=== M2 策略端到端: 全过 ===")
+}

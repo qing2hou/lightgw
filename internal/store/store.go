@@ -32,7 +32,7 @@ func Open(dataDir string) (*gorm.DB, error) {
 	for _, name := range []string{"haproxyweb.db", "haproxyweb.db-wal", "haproxyweb.db-shm"} {
 		_ = os.Chmod(filepath.Join(dataDir, name), 0600)
 	}
-	if err := db.AutoMigrate(&model.User{}, &model.ForwardRule{}, &model.TrafficLog{}, &model.AuditLog{}, &model.HealthLog{}, &model.LoginFail{}, &model.AclGroup{}, &model.BWGroup{}); err != nil {
+	if err := db.AutoMigrate(&model.User{}, &model.ForwardRule{}, &model.TrafficLog{}, &model.AuditLog{}, &model.HealthLog{}, &model.LoginFail{}, &model.AclGroup{}, &model.BWGroup{}, &model.FwPolicy{}); err != nil {
 		return nil, err
 	}
 	cleanupRemovedProtocols(db)

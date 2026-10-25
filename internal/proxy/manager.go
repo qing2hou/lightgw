@@ -303,6 +303,10 @@ func (m *Manager) StartAll() error {
 		logf("[snat] 已迁移拆除 %d 条旧 iptables 形态规则（nftables 后端接管）", n)
 	}
 	m.purgeOrphanNFTRules()
+	// 策略段装载（fwd 链；重启恢复——与规则装载独立）
+	if err := m.ReinstallPolicies(); err != nil {
+		logf("[fw-policy] 策略装载失败（不阻塞规则启动）: %v", err)
+	}
 	var rules []model.ForwardRule
 	if err := m.db.Where("enabled = ?", true).Find(&rules).Error; err != nil {
 		return err
