@@ -45,6 +45,10 @@ func main() {
 		e2eTeardown()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-smoke-migrate" {
+		smokeMigrate()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke" {
 		smokeEngine()
 		return

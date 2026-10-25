@@ -107,6 +107,9 @@ func (n *Conn) TearEgressRoute(rtTable int, _ []string) error {
 		dr.Priority, dr.Table, dr.Src = r.Priority, r.Table, r.Src
 		_ = vnetlink.RuleDel(dr)
 	}
-	_ = vnetlink.RouteDel(&vnetlink.Route{Table: rtTable})
+	// QA P2-01：RouteDel 单靠 Table 匹配不到 default 路由（内核要求
+	// Dst/Src/Gw 至少其一）——显式 0.0.0.0/0
+	_, defaultNet, _ := net.ParseCIDR("0.0.0.0/0")
+	_ = vnetlink.RouteDel(&vnetlink.Route{Table: rtTable, Dst: defaultNet})
 	return nil
 }

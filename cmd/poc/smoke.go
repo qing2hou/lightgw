@@ -109,3 +109,28 @@ func smokeHostSim() {
 	}
 	fmt.Println("=== 宿主共存冒烟: 全过（锚点常驻在位）===")
 }
+
+// smokeMigrate QA P1-01 复验场景：iptables-nft 铺 haweb-sn: 旧形态 →
+// 走 netlink 迁移（PurgeLegacyIPTables）→ 断言计数>0 且可重入归零。
+// 前置：宿主容器已装 iptables（仅铺规则用；迁移本身零 exec）。
+func smokeMigrate() {
+	fmt.Println("=== QA P1-01 复验：iptables-nft 旧形态 netlink 迁移 ===")
+	conn, err := nft.Dial()
+	if err != nil {
+		fmt.Println("FAIL dial:", err)
+		os.Exit(1)
+	}
+	defer conn.CloseLasting()
+	n1, err := conn.PurgeLegacyIPTables()
+	if err != nil {
+		fmt.Println("FAIL 首轮迁移:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("PASS 首轮迁移删除 %d 条（幂等清理）\n", n1)
+	n2, err := conn.PurgeLegacyIPTables()
+	if err != nil || n2 != 0 {
+		fmt.Printf("FAIL 重入非零: %d %v\n", n2, err)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 重入归零（幂等）")
+}

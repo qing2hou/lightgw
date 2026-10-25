@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/nftables"
 	"github.com/google/nftables/expr"
+	"github.com/google/nftables/xt"
 )
 
 // 规则标记 kind 枚举（标记格式 haweb-nft:<kind>:<id>）。
@@ -207,13 +208,19 @@ type CounterSnapshot struct {
 const legacyComment = "haweb-sn:"
 
 // PurgeLegacyIPTables 把旧 iptables 形态标记的规则（经 iptables-nft 后端
-// 写入 nf_tables 的 nat 表 POSTROUTING / filter 表 FORWARD）按标记读出并删除。
+// 写入 nf_tables 的 nat 表 POSTROUTING / filter 表 FORWARD）读出并删除。
 // 零 exec（升级目标机可能已无 iptables 二进制；iptables-nft 宿主上旧规则
 // 就在 nf_tables 里，netlink 可直达）。幂等：无标记规则返回 0。
+//
+// 匹配口径（QA P1-01 修正）：iptables-nft 的 -m comment 把评论文本存在
+// **xt 表达式 blob**（NFTA_MATCH_INFO，256 字节定长 xt.Comment）而非
+// NFTA_RULE_USERDATA——两者都要匹配：
+//   - 原生 nft 规则的 comment → UserData（"\x00<len>text\x00" TLV）
+//   - iptables-nft 的 -m comment → 表达式级 Match{Name:"comment"}
+//
 // 返回删除条数与错误。
 func (n *Conn) PurgeLegacyIPTables() (int, error) {
 	removed := 0
-	// 旧形态所在：nat 表 POSTROUTING（ip 家族）+ filter 表 FORWARD（ip 家族）
 	type target struct {
 		fam   nftables.TableFamily
 		table string
@@ -243,7 +250,7 @@ func (n *Conn) PurgeLegacyIPTables() (int, error) {
 			continue
 		}
 		for _, r := range rules {
-			if !strings.Contains(string(r.UserData), legacyComment) {
+			if !ruleHasLegacyMark(string(r.UserData), r.Exprs) {
 				continue
 			}
 			if err := n.c.DelRule(r); err != nil {
@@ -260,6 +267,24 @@ func (n *Conn) PurgeLegacyIPTables() (int, error) {
 		}
 	}
 	return removed, nil
+}
+
+// ruleHasLegacyMark 旧标记判定：UserData 含 haweb-sn:（原生 nft comment TLV）
+// 或表达式级 comment match 明文含 haweb-sn:（iptables-nft -m comment）。
+func ruleHasLegacyMark(userData string, exprs []expr.Any) bool {
+	if strings.Contains(userData, legacyComment) {
+		return true
+	}
+	for _, e := range exprs {
+		m, ok := e.(*expr.Match)
+		if !ok || m.Name != "comment" {
+			continue
+		}
+		if cm, ok := m.Info.(*xt.Comment); ok && strings.Contains(string(*cm), legacyComment) {
+			return true
+		}
+	}
+	return false
 }
 
 // KindDefaultDeny 全局默认拒绝尾行（fw.CompileDefaultDeny；多规则共享，
