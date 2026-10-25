@@ -23,15 +23,16 @@ func anchorExprs() []expr.Any {
 	}
 }
 
-// SetMarkExprs 打标规则表达式：meta mark set | bits（保留其他位，OR 语义）。
-// 实现：load mark → OR bits（Bitwise Xor 充当 OR：mask 全 1 + xor=bits）→ write。
+// SetMarkExprs 打标规则表达式：meta mark set bits | 原值（幂等 OR——不翻转已置位）。
+// 实现：load → (in & ~bits) ^ bits（等价 in|bits——Bitwise 无 OR 原语；
+// 曾经的 mask 全 1 + xor=bits 是 XOR 语义：重传包二次命中会把 1 翻回 0，
+// 容器实测白名单源被拒/双行 counter 同增即此——修复为幂等 OR）→ write。
 func SetMarkExprs(bits uint32) []expr.Any {
-	ones := uint32(0xFFFFFFFF)
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
-		// Bitwise: reg1 = (reg1 & mask) ^ xor —— mask 全 1、xor=bits 即纯 OR
+		// Bitwise: reg1 = (reg1 & mask) ^ xor —— mask=~bits、xor=bits ⇒ in|bits
 		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
-			Mask: binaryutil.NativeEndian.PutUint32(ones),
+			Mask: binaryutil.NativeEndian.PutUint32(^bits),
 			Xor:  binaryutil.NativeEndian.PutUint32(bits)},
 		&expr.Meta{Key: expr.MetaKeyMARK, SourceRegister: true, Register: 1},
 	}

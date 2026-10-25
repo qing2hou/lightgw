@@ -33,9 +33,10 @@ const (
 	snatTcFtag        = "haweb_sn_rate"
 )
 
-// snatEntry 一条 SNAT 规则的运行时对象。
+// snatEntry 一条 SNAT/DNAT 规则的运行时对象（dnat 复用注册表）。
 type snatEntry struct {
 	ruleID    uint
+	dnat      bool // dnat 规则（ifIn=发布IP、ifOut=后端IP 的复用语义）
 	ifIn      string
 	ifOut     string
 	outIP     string   // 安装时的 SNAT 源地址（拆除需要完整形态匹配）

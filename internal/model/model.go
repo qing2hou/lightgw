@@ -6,6 +6,11 @@ const (
 	ProtocolTCP  = "tcp"
 	ProtocolUDP  = "udp"
 	ProtocolSNAT = "snat" // 内核 iptables/tc 三层转发（不监听端口；listen_addr=入口网卡、target_addr=出口网卡）
+	ProtocolDNAT = "dnat" // 内核 nftables 端口发布（listen_addr=公网IP:端口、target_addr=内网后端IP:端口）
+
+	// DnatRejectMode dnat 后端不可达时对公网客户端的行为。
+	DnatRejectModeReject  = "reject"  // icmp admin-prohibited / tcp reset 即时拒绝
+	DnatRejectModeTimeout = "timeout" // 静默丢弃（客户端超时）
 
 	StatusActive = "active"
 	StatusClosed = "closed"
@@ -55,6 +60,7 @@ type ForwardRule struct {
 	DstAllowList      string    `gorm:"type:text" json:"dst_allow_list"`                       // snat 目标白名单（JSON 字符串数组；whitelist 模式生效）
 	DstDenyList       string    `gorm:"type:text" json:"dst_deny_list"`                        // snat 目标黑名单（JSON 字符串数组；blacklist 模式生效）
 	SnatIP            string    `gorm:"size:64" json:"snat_ip"`                                // snat 规则显式出口源 IP；空 = 自动取出口网卡首 IPv4
+	DnatRejectMode    string    `gorm:"size:16;default:reject" json:"dnat_reject_mode"`        // dnat 规则后端不可达时对客户端行为（reject/timeout）
 	EgressGw          string    `gorm:"size:64" json:"egress_gw"`                              // snat 出口网关（可选）
 	BWGroupID         uint      `gorm:"index;default:0" json:"bw_group_id"`                    // 所属带宽包 ID（成员关系）；0 = 独立行为（自身限速）
 	MinKBps           int64     `gorm:"column:min_kbps" json:"min_kbps"`                       // 入包时可设的保底带宽 KB/s（htb rate；闲时可借用至包总额 ceil）；独立规则忽略

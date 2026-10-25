@@ -285,3 +285,50 @@ func validDst(d string) bool {
 	_, ipn, err := net.ParseCIDR(d)
 	return err == nil && ipn != nil && ipn.IP.To4() != nil
 }
+
+// CompileDefaultDenyEx 默认拒绝尾行的完整形态（dnat 后端 IP 辖区维度）。
+// dnat 的辖区 = 后端 IP：DNAT 在 prerouting(-100) 已把 daddr 改写为后端，
+// fwd 链(-10) 看到的目的即后端 IP。snat 的辖区内聚在上面的 ifaces 版
+// （CompileDefaultDeny）——两版本并存，snat_nft.go 之后统一到 Ex。
+func CompileDefaultDenyEx(ruleID uint, ifaces, dnatBackends []string) []Rule {
+	if len(ifaces) == 0 && len(dnatBackends) == 0 {
+		return nil
+	}
+	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: nft.Table}
+	ud := nft.Comment(nft.KindDefaultDeny, ruleID)
+	dropTail := func() []expr.Any {
+		return []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+				Mask: binaryutil.NativeEndian.PutUint32(nft.MarkFwdOK),
+				Xor:  binaryutil.NativeEndian.PutUint32(0)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
+			&expr.Counter{},
+			&expr.Verdict{Kind: expr.VerdictDrop},
+		}
+	}
+	var out []Rule
+	for _, ifn := range ifaces {
+		ex := append([]expr.Any{
+			&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifnameBytes(ifn)},
+		}, dropTail()...)
+		out = append(out, Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
+			Table: tbl, UserData: []byte(ud), Exprs: ex,
+		}})
+	}
+	for _, b := range dnatBackends {
+		ip := v4(b)
+		if ip == nil {
+			continue
+		}
+		ex := append([]expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}, dropTail()...)
+		out = append(out, Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
+			Table: tbl, UserData: []byte(ud), Exprs: ex,
+		}})
+	}
+	return out
+}

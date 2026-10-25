@@ -334,6 +334,8 @@ func (m *Manager) Apply(rule model.ForwardRule) error {
 			return m.applyUDP(rule)
 		case model.ProtocolSNAT:
 			return m.applySNAT(rule)
+		case model.ProtocolDNAT:
+			return m.applyDNAT(rule)
 		default:
 			return fmt.Errorf("未知协议: %s", rule.Protocol)
 		}
@@ -378,7 +380,7 @@ func (m *Manager) stopStaleProtocol(rule model.ForwardRule) {
 			delete(m.udpRules, rule.ID)
 		}
 	}
-	if rule.Protocol != model.ProtocolSNAT {
+	if rule.Protocol != model.ProtocolSNAT && rule.Protocol != model.ProtocolDNAT {
 		if e, ok := m.snatRules[rule.ID]; ok {
 			delete(m.snatRules, rule.ID)
 			staleSNAT = e.spec()

@@ -113,15 +113,27 @@ func (m *Manager) teardownSnatNFT(ruleID uint) {
 // （vanilla 语义回到全通——与"有规则才有管辖区"一致）。
 func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 	var rules []model.ForwardRule
-	if err := m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules).Error; err != nil {
+	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
 		// 复审 N5：DB 读失败时保留在位尾行（拆了装不回=漏拒绝——不保守方向）
 		logf("默认拒绝尾行重算跳过（DB 读取失败，保留在位形态）: %v", err)
 		return
 	}
 	seen := map[string]bool{}
 	ifaces := make([]string, 0, len(rules))
+	dnatBackends := make([]string, 0, len(rules))
 	denied := false
 	for _, r := range rules {
+		if r.Protocol == model.ProtocolDNAT {
+			// dnat：辖区=后端 IP；白名单语义恒真（API 强制），发布行必然依赖兜底拒绝
+			if bip, _, ok := splitHostPortOK(r.TargetAddr); ok {
+				if !seen["b:"+bip] {
+					seen["b:"+bip] = true
+					dnatBackends = append(dnatBackends, bip)
+				}
+			}
+			denied = true
+			continue
+		}
 		if !seen[r.ListenAddr] {
 			seen[r.ListenAddr] = true
 			ifaces = append(ifaces, r.ListenAddr)
@@ -141,7 +153,7 @@ func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 		return
 	}
 	if denied {
-		for _, r := range fw.CompileDefaultDeny(0, ifaces) {
+		for _, r := range fw.CompileDefaultDenyEx(0, ifaces, dnatBackends) {
 			conn.AddCompiled(r.Chain, r.Rule)
 		}
 	}
@@ -251,4 +263,13 @@ func (m *Manager) ReadSnatCountersNFT(ruleID uint, ifIn string, allowSrcs []stri
 	}
 	// 降级：老机器 exec 口径
 	return ReadSnatCounters(ruleID, ifIn, allowSrcs)
+}
+
+// splitHostPortOK "IP:port" → (ip, port, ok)。
+func splitHostPortOK(s string) (string, int, bool) {
+	ip, port, err := fw.ParseAddrPort(s)
+	if err != nil {
+		return "", 0, false
+	}
+	return ip, port, true
 }

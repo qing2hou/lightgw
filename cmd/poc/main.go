@@ -45,6 +45,10 @@ func main() {
 		e2eTeardown()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-e2e-dnat" {
+		e2eDNAT()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke-migrate" {
 		smokeMigrate()
 		return

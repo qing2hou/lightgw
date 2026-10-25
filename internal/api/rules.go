@@ -29,6 +29,7 @@ type ruleInput struct {
 	DstAllowList      string `json:"dst_allow_list"`
 	DstDenyList       string `json:"dst_deny_list"`
 	SnatIP            string `json:"snat_ip"`
+	DnatRejectMode    string `json:"dnat_reject_mode"`
 	EgressGw          string `json:"egress_gw"`
 	MinKBps           int64  `json:"min_kbps"`
 	SourceIP          string `json:"source_ip"`
@@ -54,6 +55,7 @@ func (in *ruleInput) toRule() model.ForwardRule {
 		DstAllowList:      strings.TrimSpace(in.DstAllowList),
 		DstDenyList:       strings.TrimSpace(in.DstDenyList),
 		SnatIP:            strings.TrimSpace(in.SnatIP),
+		DnatRejectMode:    strings.TrimSpace(in.DnatRejectMode),
 		EgressGw:          strings.TrimSpace(in.EgressGw),
 		MinKBps:           in.MinKBps,
 		SourceIP:          strings.TrimSpace(in.SourceIP),
@@ -73,15 +75,17 @@ func (in *ruleInput) validate(h *handlers) error {
 	}
 	switch in.Protocol {
 	case model.ProtocolTCP, model.ProtocolUDP:
-		// 目标名单仅 snat 规则支持（穿越转发的目的地址控制）；tcp/udp 的目标即后端地址
+		// 目标名单仅 snat/dnat 规则支持；tcp/udp 的目标即后端地址
 		if strings.TrimSpace(in.DstAclMode) != "" && in.DstAclMode != model.AclModeOff ||
 			strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" {
-			return fmt.Errorf("目标名单仅 SNAT 规则支持（tcp/udp 的目标就是后端地址，无需名单）")
+			return fmt.Errorf("目标名单仅 snat 规则支持（tcp/udp 的目标就是后端地址，无需名单）")
 		}
 	case model.ProtocolSNAT:
 		return h.validateSnat(in)
+	case model.ProtocolDNAT:
+		return h.validateDnat(in)
 	default:
-		return fmt.Errorf("协议必须是 tcp / udp / snat")
+		return fmt.Errorf("协议必须是 tcp / udp / snat / dnat")
 	}
 	host, portStr, err := net.SplitHostPort(in.ListenAddr)
 	if err != nil || (host != "" && net.ParseIP(host) == nil) {
@@ -179,6 +183,60 @@ func groupModeName(mode string) string {
 		return "黑名单"
 	}
 	return mode
+}
+
+// validateDnat dnat 规则专属校验（契约 API-D1）：
+// listen_addr=完整 公网IP:端口（IP 必须归属本机网卡，含一卡多址）；target_addr=完整
+// 内网后端 IP:端口；源名单复用 acl 白名单；dnat_reject_mode 二选一默认 reject；
+// 不允许：dst_* 目标名单（穿越语义）、egress_gw/snat_ip（出口语义）。
+func (h *handlers) validateDnat(in *ruleInput) error {
+	if strings.TrimSpace(in.DstAclMode) != "" && in.DstAclMode != model.AclModeOff ||
+		strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" {
+		return fmt.Errorf("dnat 规则不支持目标名单（穿越语义，仅 snat 规则可用）")
+	}
+	if strings.TrimSpace(in.EgressGw) != "" || strings.TrimSpace(in.SnatIP) != "" {
+		return fmt.Errorf("dnat 规则不支持出口网关/SNAT 源（出口语义，仅 snat 规则可用）")
+	}
+	switch strings.TrimSpace(in.DnatRejectMode) {
+	case "", model.DnatRejectModeReject, model.DnatRejectModeTimeout:
+	default:
+		return fmt.Errorf("dnat_reject_mode 只能是 reject 或 timeout")
+	}
+	// 发布地址：完整 IP:port（端口语义同 tcp/udp 主校验，这里查 IP 归属）
+	host, _, err := net.SplitHostPort(strings.TrimSpace(in.ListenAddr))
+	if err != nil || host == "" {
+		return fmt.Errorf("dnat 规则的发布地址必须是完整 IP:端口 形式（如 203.0.113.10:443）: %s", in.ListenAddr)
+	}
+	if net.ParseIP(host) == nil {
+		return fmt.Errorf("发布地址 %q 不是合法 IP", host)
+	}
+	belongs := false
+	ifaces, _ := net.Interfaces()
+	for _, ifn := range ifaces {
+		addrs, _ := ifn.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.String() == host {
+				belongs = true
+			}
+		}
+	}
+	if !belongs {
+		return fmt.Errorf("发布 IP %s 不归属任何本机网卡（可用地址见 GET /api/interfaces）", host)
+	}
+	// 后端：完整 IP:port；地址族必须一致（v1 不做 NAT64）
+	thost, _, err := net.SplitHostPort(strings.TrimSpace(in.TargetAddr))
+	if err != nil || thost == "" {
+		return fmt.Errorf("dnat 规则的后端地址必须是完整 IP:端口 形式（如 10.0.1.5:8443）: %s", in.TargetAddr)
+	}
+	tip := net.ParseIP(thost)
+	if tip == nil {
+		return fmt.Errorf("后端地址 %q 不是合法 IP", thost)
+	}
+	lip := net.ParseIP(host)
+	if (tip.To4() == nil) != (lip.To4() == nil) {
+		return fmt.Errorf("发布地址族与后端地址族不一致（v1 不做 NAT64）: %s → %s", host, thost)
+	}
+	return nil
 }
 
 // validateSnat snat 规则专属校验：网卡存在性/互异/名单语义/组引用（对齐 design-snat.md 契约）。
