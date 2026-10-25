@@ -98,10 +98,25 @@ func (m *Manager) CheckBackendsNow() {
 		rule model.ForwardRule
 	}
 	m.mu.Lock()
-	items := make([]item, 0, len(m.tcpRules))
+	items := make([]item, 0, len(m.tcpRules)+len(m.snatRules))
 	for id, e := range m.tcpRules {
 		rule := e.cfg.Load().rule
 		if !healthCheckOn(rule) {
+			continue
+		}
+		items = append(items, item{id: id, rule: rule})
+	}
+	// T104：dnat 规则的后端健康联动（后端=target_addr；探测协议 TCP——
+	// v1 发布仅 TCP/UDP，TCP 探测为通用近似，UDP 后端按 TCP 不通即 down）
+	for id, e := range m.snatRules {
+		if !e.dnat {
+			continue
+		}
+		var rule model.ForwardRule
+		if err := m.db.First(&rule, id).Error; err != nil {
+			continue // 已删除——下一轮 startup 对账清
+		}
+		if !rule.Enabled {
 			continue
 		}
 		items = append(items, item{id: id, rule: rule})
@@ -144,6 +159,11 @@ func (m *Manager) probeBackend(id uint, rule model.ForwardRule) {
 		if !prevChecked || prevUp {
 			logf("规则[%s#%d] 后端 %s 健康检查失败，标记为异常: %v", rule.Name, rule.ID, rule.TargetAddr, err)
 			go m.notifyHealthWebhook(rule, false, msg)
+			// T104 dnat 联动：后端不可达 → 卸载发布行（客户端连接拒绝由
+			// dnat_reject_mode 决定：reject 模式的拒绝路径=发布行不在=超时/拒绝）
+			if rule.Protocol == model.ProtocolDNAT {
+				m.dnatHealthToggle(rule, false)
+			}
 		}
 		return
 	}
@@ -153,6 +173,10 @@ func (m *Manager) probeBackend(id uint, rule model.ForwardRule) {
 	if prevChecked && !prevUp {
 		logf("规则[%s#%d] 后端 %s 已恢复", rule.Name, rule.ID, rule.TargetAddr)
 		go m.notifyHealthWebhook(rule, true, "")
+		// T104 dnat 联动：恢复 → 重新装载发布
+		if rule.Protocol == model.ProtocolDNAT {
+			m.dnatHealthToggle(rule, true)
+		}
 	}
 }
 

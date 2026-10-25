@@ -95,7 +95,7 @@ func (m *Manager) applyDNAT(rule model.ForwardRule) error {
 	m.teardownSnatNFT(rule.ID) // 复用：按 KindSNAT 拆——注意 dnat 规则的标记是 KindDNAT
 	m.teardownDNATNFT(rule.ID)
 	if !rule.Enabled {
-		m.killDNATSessions(rule.ID)
+		m.killDNATSessions(spec)
 		return nil
 	}
 
@@ -163,23 +163,39 @@ func (m *Manager) teardownDNATNFT(ruleID uint) {
 	m.reinstallDefaultDenyLocked(conn)
 }
 
-// killDNATSessions 停用 dnat 时掐断本规则的存量发布会话。
-// 按"orig dst = 发布地址"维度的 conntrack 精确删（四元组重建：源任意）。
-func (m *Manager) killDNATSessions(ruleID uint) {
-	e := func() *snatEntry {
-		m.mu.Lock()
-		defer m.mu.Unlock()
-		return m.snatRules[ruleID]
-	}()
-	if e == nil {
+// killDNATSessions 停用 dnat 时掐断本规则的存量发布会话（AC-2.5）。
+// 锚点：orig dst = 发布 IP:端口（本规则的发布会话唯一特征——conntrack 表项
+// 在 DNAT 前的 orig 元组）。复用 readConntrackTable/deleteConntrackEntry
+// 的解析/删除路径；源未知的会话（conntrack 工具缺失）走老化兜底。
+func (m *Manager) killDNATSessions(spec *fw.DNatSpec) {
+	if spec == nil {
 		return
 	}
-	conn, err := m.nftConn()
-	if err != nil {
+	lines := readConntrackTable()
+	if lines == nil {
+		logf("规则#%d 停用：conntrack 表不可读，存量发布会话将随老化断开", spec.ID)
 		return
 	}
-	_ = conn // conntrack 删除经 conntrack 工具路径（M2/T103 细化）——v1 先老化
-	logf("规则#%d 停用：存量发布会话将随 conntrack 老化断开", ruleID)
+	dst := net.JoinHostPort(spec.ListenIP, fmt.Sprintf("%d", spec.ListenPort))
+	host, port, _ := net.SplitHostPort(dst)
+	killed := 0
+	for _, ln := range lines {
+		c, ok := parseConntrackLine(ln)
+		if !ok {
+			continue
+		}
+		// 发布会话：orig dst == 发布 IP:端口（DNAT 前）
+		if c.origDst != host || c.origDPort != port {
+			continue
+		}
+		s := &snatRuleSpec{ID: spec.ID}
+		if deleteConntrackEntry(s, c) {
+			killed++
+		}
+	}
+	if killed > 0 {
+		logf("规则#%d 停用：已掐断 %d 条发布会话（发布 %s）", spec.ID, killed, dst)
+	}
 }
 
 // ipBelongsLocally IP 是否归属本机任一网卡。
@@ -191,4 +207,20 @@ func ipBelongsLocally(ip string) bool {
 		}
 	}
 	return false
+}
+
+// dnatHealthToggle T104 健康联动：down → 卸载发布行；up → 重装。
+// 卸载=按标记拆 dn at 全部形态（发布端口立即黑洞/拒绝——不再转发到死后端）；
+// 重装=重新走 applyDNAT（校验+装载+统计）。
+func (m *Manager) dnatHealthToggle(rule model.ForwardRule, up bool) {
+	if up {
+		if err := m.applyDNAT(rule); err != nil {
+			logf("规则[%s#%d] 后端恢复但发布重装失败: %v", rule.Name, rule.ID, err)
+		} else {
+			logf("规则[%s#%d] 后端恢复，发布已重新装载", rule.Name, rule.ID)
+		}
+		return
+	}
+	m.teardownDNATNFT(rule.ID)
+	logf("规则[%s#%d] 后端不可达，发布已卸载（存量客户端会话随 conntrack 老化）", rule.Name, rule.ID)
 }
