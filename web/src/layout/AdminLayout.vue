@@ -15,6 +15,15 @@
         <el-menu-item index="/snat-rules">
           <el-icon><Position /></el-icon><span>SNAT 穿越</span>
         </el-menu-item>
+        <el-menu-item index="/dnat-rules">
+          <el-icon><Upload /></el-icon><span>端口发布</span>
+        </el-menu-item>
+        <el-menu-item index="/fw-policies">
+          <el-icon><Lock /></el-icon><span>防火墙策略</span>
+        </el-menu-item>
+        <el-menu-item index="/sessions">
+          <el-icon><Connection /></el-icon><span>会话表</span>
+        </el-menu-item>
         <el-menu-item index="/bw-groups">
           <el-icon><Histogram /></el-icon><span>带宽包</span>
         </el-menu-item>
@@ -70,7 +79,7 @@
 <script setup>
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Odometer, Connection, Document, List, Monitor, Box, Setting, User, ArrowDown, FolderOpened, Position, Histogram } from '@element-plus/icons-vue'
+import { Odometer, Connection, Document, List, Monitor, Box, Setting, User, ArrowDown, FolderOpened, Position, Histogram, Upload, Lock } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
