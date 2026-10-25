@@ -40,6 +40,11 @@ func main() {
 		smokeHostSim()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-e2e" {
+		e2eTransit()
+		e2eTeardown()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke" {
 		smokeEngine()
 		return
