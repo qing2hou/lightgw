@@ -19,7 +19,7 @@ func TestSnatSameForwarding(t *testing.T) {
 	}
 	e := &snatEntry{ifIn: "eth0", ifOut: "eth1", outIP: "172.16.40.10", egressGw: "172.16.40.1",
 		allowSrcs: []string{"192.168.20.5", "192.168.10.0/24"}, // 顺序不同=同集合
-		dstMode: "blacklist", dstDeny: []string{"10.0.0.0/8"}}
+		dstMode:   "blacklist", dstDeny: []string{"10.0.0.0/8"}}
 
 	if !e.sameForwarding(base()) {
 		t.Fatal("形态完全一致（名单顺序不同）应走快速路径")
@@ -31,13 +31,13 @@ func TestSnatSameForwarding(t *testing.T) {
 		t.Fatal("限速参数变化不应触发 iptables 重建")
 	}
 	for name, mut := range map[string]func(*snatRuleSpec){
-		"入口网卡":   func(s *snatRuleSpec) { s.IfIn = "eth9" },
-		"出口网卡":   func(s *snatRuleSpec) { s.IfOut = "eth9" },
+		"入口网卡":    func(s *snatRuleSpec) { s.IfIn = "eth9" },
+		"出口网卡":    func(s *snatRuleSpec) { s.IfOut = "eth9" },
 		"SNAT 源":  func(s *snatRuleSpec) { s.OutIP = "172.16.40.11" },
-		"出口网关":   func(s *snatRuleSpec) { s.EgressGw = "" },
-		"源名单增条":  func(s *snatRuleSpec) { s.AllowSrcs = append(s.AllowSrcs, "1.2.3.4") },
-		"源名单减条":  func(s *snatRuleSpec) { s.AllowSrcs = s.AllowSrcs[:1] },
-		"目标模式变更": func(s *snatRuleSpec) { s.DstAclMode = "off"; s.DstDeny = nil },
+		"出口网关":    func(s *snatRuleSpec) { s.EgressGw = "" },
+		"源名单增条":   func(s *snatRuleSpec) { s.AllowSrcs = append(s.AllowSrcs, "1.2.3.4") },
+		"源名单减条":   func(s *snatRuleSpec) { s.AllowSrcs = s.AllowSrcs[:1] },
+		"目标模式变更":  func(s *snatRuleSpec) { s.DstAclMode = "off"; s.DstDeny = nil },
 		"目标黑名单增条": func(s *snatRuleSpec) { s.DstDeny = append(s.DstDeny, "11.0.0.0/8") },
 	} {
 		s := base()
@@ -168,7 +168,7 @@ func TestSnatIptablesArgs(t *testing.T) {
 func TestSnatMultiValueExpansion(t *testing.T) {
 	// 2 源 1 目标黑名单：nat2 + conntrack1 + ACCEPT2 + DROP(2×1)=2 → 7 行
 	s := &snatRuleSpec{ID: 21, IfIn: "eth0", IfOut: "eth1", OutIP: "172.16.40.10",
-		AllowSrcs: []string{"192.168.10.162", "192.168.10.2"},
+		AllowSrcs:  []string{"192.168.10.162", "192.168.10.2"},
 		DstAclMode: "blacklist", DstDeny: []string{"10.0.0.0/8"}}
 	rules := s.iptablesArgs()
 	if len(rules) != 7 {

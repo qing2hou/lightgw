@@ -108,3 +108,94 @@ func hasExpr(r *nftables.Rule, typeName string) bool {
 	}
 	return false
 }
+
+func TestCompileSNATBlacklistHasSourceDimension(t *testing.T) {
+	// 评审 M1 防回归：黑名单 DROP 行必须带源维度（v2 事故同型——无源 DROP
+	// 会误伤同网卡其他规则的源）
+	s := Spec{
+		ID: 5, IfIn: "eth0", IfOut: "ens19", OutIP: "1.2.3.4",
+		AllowSrcs: []string{"192.168.1.0/24"}, DstMode: "blacklist",
+		DstDeny: []string{"203.0.113.9"},
+	}
+	rules, err := CompileSNAT(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range rules {
+		if r.Chain != nft.ChainFwd {
+			continue
+		}
+		var hasDrop, hasSaddr bool
+		for _, e := range r.Rule.Exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+				hasDrop = true
+			}
+			if p, ok := e.(*expr.Payload); ok && p.Offset == offSaddr {
+				hasSaddr = true
+			}
+		}
+		if hasDrop && !hasSaddr {
+			t.Fatal("黑名单 DROP 行缺源维度（v2 事故同型回归）")
+		}
+	}
+}
+
+func TestCompileSNATAllRowsHaveOIF(t *testing.T) {
+	// 评审 M2 防回归：fwd 放行行与 srcnat 行必须有出口网卡维度（防多网卡机器
+	// 从第三网卡出的包被误改写/误放行）
+	s := Spec{
+		ID: 5, IfIn: "eth0", IfOut: "ens19", OutIP: "1.2.3.4",
+		AllowSrcs: []string{"10.1.1.5"}, DstMode: "off",
+	}
+	rules, err := CompileSNAT(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oifCount := 0
+	for _, r := range rules {
+		if r.Chain != nft.ChainFwd && r.Chain != nft.ChainSrcNAT {
+			continue
+		}
+		for _, e := range r.Rule.Exprs {
+			if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyOIFNAME {
+				oifCount++
+				break
+			}
+		}
+	}
+	if oifCount == 0 {
+		t.Fatal("fwd/srcnat 行全部缺失出口网卡维度")
+	}
+}
+
+func TestCompileSNATEmptyOutIPFails(t *testing.T) {
+	// 评审 M8 防回归：空 SNAT 源 fail-fast（静默装出无 SNAT 的单向黑洞）
+	s := Spec{ID: 9, IfIn: "eth0", IfOut: "ens19", OutIP: "", DstMode: "off"}
+	if _, err := CompileSNAT(s); err == nil {
+		t.Fatal("空 OutIP 应报错（旧 installSnat fail-fast 语义）")
+	}
+}
+
+func TestCompileDefaultDenyShape(t *testing.T) {
+	rules := CompileDefaultDeny(0, []string{"eth0", "ens19"})
+	if len(rules) != 2 {
+		t.Fatalf("默认拒绝行数 %d != 入口网卡数 2", len(rules))
+	}
+	for _, r := range rules {
+		if !hasExpr(r.Rule, "*expr.Counter") || !hasDropVerdict(r.Rule) {
+			t.Fatal("默认拒绝行应含 counter + drop")
+		}
+	}
+	if CompileDefaultDeny(0, nil) != nil {
+		t.Fatal("空入口集应返回 nil（vanilla 全通）")
+	}
+}
+
+func hasDropVerdict(r *nftables.Rule) bool {
+	for _, e := range r.Exprs {
+		if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+			return true
+		}
+	}
+	return false
+}

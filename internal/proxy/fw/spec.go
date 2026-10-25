@@ -18,7 +18,7 @@ type Spec struct {
 	DstMode   string   // 目标名单模式 off/whitelist/blacklist
 	DstAllow  []string
 	DstDeny   []string
-	EgGw      string // 出口网关（空=不装策略路由；v1 单出口形态）
+	EgGw      string // 出口网关（M3 多出口预留；v1 由 Manager 侧装策略路由，本层不编译）
 }
 
 // PayloadOffsets IPv4 头内偏移（payload 表达式的物理事实，独立常量防魔法数）。

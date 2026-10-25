@@ -207,7 +207,8 @@ func TestCopyTCPIdleConnectionLevel(t *testing.T) {
 	}
 }
 
-func TestCopyTCPIdleTimeout(t *testing.T) {	m := newTestManager(4096, 200*time.Millisecond)
+func TestCopyTCPIdleTimeout(t *testing.T) {
+	m := newTestManager(4096, 200*time.Millisecond)
 	srcC, srcS := dialPair(t)
 	dstC, dstS := dialPair(t)
 	go func() { _, _ = io.Copy(io.Discard, dstS) }()

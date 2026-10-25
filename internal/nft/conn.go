@@ -12,16 +12,16 @@ import (
 	"github.com/google/nftables"
 )
 
-// Conn netlink 连接包装：串行化 Flush（并发 Apply 场景下的批次互斥）+
-// 统一错误中文语义。google/nftables 的 Conn 自带锁，此处包装是为了
-// 给上层的"装-验-失败重装"流程一个统一入口与将来的人格化错误。
+// Conn netlink 连接包装：持久 netlink 连接（AsLasting——连接级复用，
+// 避免 5s 计数轮询每轮拨号）+ 统一错误中文语义。单次 Flush 原子由
+// 库内锁保证；purge-then-add 跨 Flush 序列的互斥由上层 nftApplyMu 承担。
 type Conn struct {
 	c *nftables.Conn
 }
 
 // Dial 打开 netlink 连接（进程内复用单连接）。
 func Dial() (*Conn, error) {
-	inner, err := nftables.New()
+	inner, err := nftables.New(nftables.AsLasting())
 	if err != nil {
 		return nil, fmt.Errorf("打开 nftables netlink 连接失败（需要 CAP_NET_ADMIN）: %w", err)
 	}
@@ -86,9 +86,9 @@ func (n *Conn) EnsureTable() error {
 	return n.Flush()
 }
 
-// AddCompiled 暂存一条已编译规则（链名→链对象解析；装载语义：链尾追加）。
-// 规则顺序敏感的场景（ACL 有序列）由编译层保证数组序 = 期望最终序，
-// 本方法按 append 语义逐条追加——调用方按"数组前=链上后"倒序装入。
+// AddCompiled 暂存一条已编译规则（链名→链对象解析；装载语义：链尾追加，
+// 即数组序 = 最终链上序，先装先评估——与旧 iptables 头插语义相反，
+// 语义差异已在 upgrade 文档记录）。
 func (n *Conn) AddCompiled(chain string, r *nftables.Rule) {
 	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: Table}
 	r.Table = tbl
@@ -98,3 +98,9 @@ func (n *Conn) AddCompiled(chain string, r *nftables.Rule) {
 
 // FlushCommit 提交暂存（Flush 别名——语义化：装规则后的显式提交点）。
 func (n *Conn) FlushCommit() error { return n.Flush() }
+
+// DropTable 删除自有表（legacy 冲突弃用路径；幂等）。
+func (n *Conn) DropTable() error {
+	n.c.DelTable(&nftables.Table{Family: nftables.TableFamilyINet, Name: Table})
+	return n.Flush()
+}

@@ -66,17 +66,22 @@ func (n *Conn) PurgeByComment(kind string, id uint) error {
 	removed := 0
 	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
 		rules, err := n.rulesOf(chain)
-		if err != nil {
-			return fmt.Errorf("对账读取链 %s 失败: %w", chain, err)
-		}
-		for _, r := range rules {
-			if string(r.UserData) == target {
-				if err := n.c.DelRule(r); err != nil {
-					return fmt.Errorf("删除标记规则 %s 失败: %w", target, err)
+		if err == nil {
+			for _, r := range rules {
+				if string(r.UserData) == target {
+					if err := n.c.DelRule(r); err == nil {
+						removed++
+					}
 				}
-				removed++
 			}
+			continue
 		}
+		// 中途失败：已暂存的删除先提交（删除幂等且 comment 域内，发出去无害），
+		// 绝不留在共享缓冲里被下次无关 Flush 顺带发出（评审 M7）
+		if flushErr := n.Flush(); flushErr != nil {
+			return fmt.Errorf("对账读取链 %s 失败（且暂存删除提交失败）: %w / %v", chain, err, flushErr)
+		}
+		return fmt.Errorf("对账读取链 %s 失败: %w", chain, err)
 	}
 	if removed == 0 {
 		return nil // 幂等：无残留即成功
@@ -178,9 +183,12 @@ func (n *Conn) PurgeLegacyIPTables() (int, error) {
 			if !strings.Contains(string(r.UserData), legacyComment) {
 				continue
 			}
-			if err := n.c.DelRule(r); err == nil {
-				removed++
+			if err := n.c.DelRule(r); err != nil {
+				// S4：删除失败留痕（虚报"迁移完成"比残留更坏）
+				fmt.Printf("[nft] 旧 iptables 形态规则删除失败（handle=%d）: %v\n", r.Handle, err)
+				continue
 			}
+			removed++
 		}
 	}
 	if removed > 0 {
@@ -190,3 +198,7 @@ func (n *Conn) PurgeLegacyIPTables() (int, error) {
 	}
 	return removed, nil
 }
+
+// KindDefaultDeny 全局默认拒绝尾行（fw.CompileDefaultDeny；多规则共享，
+// 拆装由 Manager 统一管理——ruleID 维度取启用规则的最小 ID，随集变化重装）。
+const KindDefaultDeny = "deny"

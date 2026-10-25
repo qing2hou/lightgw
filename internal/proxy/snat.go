@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"haproxyweb/internal/model"
+	"haproxyweb/internal/nft"
 )
 
 // timeNewTicker 时间源（独立变量便于单测注入假时钟）。
@@ -230,7 +231,8 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		s.teardownSnat()
 		m.teardownSnatNFT(rule.ID)
 		_ = s.teardownSnatLimit()
-		s.teardownEgressRoute()
+		m.teardownEgressRouteNFT(s.RtTable)
+		s.teardownEgressRoute() // exec 兜底（netlink 版失败/引擎不可用时）
 		// 停用/删除时掐断本规则的存量穿越会话：iptables 拆除后，基线的
 		// conntrack-ESTABLISHED 放行行会让已建连接继续跑到自然结束
 		// （不限速、不受名单约束——实测 3.9G 下载停用后满速跑完）。
@@ -283,11 +285,18 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		logf("规则[%s#%d] tc 入向限速未生效（降级为不限速）: %v", rule.Name, rule.ID, err)
 	}
 	// 出口策略路由（配置了出口网关时）：公网目标的出向决策强制走出口网卡
+	// T005/M6：ip rule/ip route 完全 netlink 化（无 iproute2 依赖）
 	if spec.EgressGw != "" {
 		spec.RtTable = m.snatAllocTable(rule.ID)
-		if err := spec.installEgressRoute(); err != nil {
-			// 路由失败不阻塞：iptables 仍生效（直连网段目标可达），公网目标需要网关配好
-			logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, err)
+		if conn, cerr := m.nftConn(); cerr == nil {
+			nexthops := []nft.Nexthop{{Iface: spec.IfOut, Gw: net.ParseIP(spec.EgressGw), Weight: 1}}
+			if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
+				// 路由失败不阻塞：转发规则仍生效（直连网段目标可达），公网目标需要网关配好
+				logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
+				spec.RtTable = 0
+			}
+		} else {
+			logf("规则[%s#%d] 出口策略路由未生效（引擎连接失败）: %v", rule.Name, rule.ID, cerr)
 			spec.RtTable = 0
 		}
 	}
@@ -974,9 +983,11 @@ func (m *Manager) otherSnatRuleSrcs(excludeRuleID uint) []string {
 // iptables 拆除只挡新包——已建连接靠网关基线的 conntrack-ESTABLISHED
 // 放行行继续跑到自然结束（实测：停用后 3.9G 下载不限速跑完）。
 // 按规则维度精确删表项，任一命中即属本规则：
-//   A. reply 源 = 本规则 SNAT 源（OutIP）——POSTROUTING 改写过的会话（最精确锚点）
-//   B. orig 源 ∈ 本规则源段 且不与任何其他启用 snat 规则的源段重叠
-//      （未改写直连目标的放行会话；跨规则重叠宁漏杀——老化兜底，不错杀）
+//
+//	A. reply 源 = 本规则 SNAT 源（OutIP）——POSTROUTING 改写过的会话（最精确锚点）
+//	B. orig 源 ∈ 本规则源段 且不与任何其他启用 snat 规则的源段重叠
+//	   （未改写直连目标的放行会话；跨规则重叠宁漏杀——老化兜底，不错杀）
+//
 // 其他规则的源、本机自营流量（管理面/后端连接）、无关转发——一律不碰。
 // conntrack 工具缺失或表不可读时降级（日志留痕，会话随 conntrack 老化断开）。
 func (s *snatRuleSpec) killConntrackSessions(otherRuleSrcs []string) {
@@ -1160,7 +1171,6 @@ func deleteConntrackEntry(s *snatRuleSpec, c *ctSession) bool {
 	return true
 }
 
-
 // 目标黑名单 per-目标 DROP 行，全部带本规则 comment——多行求和后返回完整计数。
 // 返回值恒非 nil（iptables 不可用时零值））。
 func readSnatDropCounters(ruleID uint) *snatCounters {
@@ -1297,8 +1307,23 @@ func (m *Manager) pollSnatCounters() {
 	}
 	m.mu.Unlock()
 
+	// M5：优先 nft counter（netlink，无外部二进制依赖）；引擎不可用
+	// （老机器/容器开发）降级旧 exec 口径（tc class + iptables DROP）。
+	m.nftMu.Lock()
+	nftConnRef := m.nft
+	m.nftMu.Unlock()
+	var counted map[string]nft.CounterSnapshot
+	if nftConnRef != nil {
+		counted, _ = nftConnRef.CountersByComment()
+	}
 	for _, e := range entries {
-		c := readSnatCounters(e.ruleID, e.ifIn, e.allowSrcs)
+		var c *snatCounters
+		if counted != nil {
+			c = countersFromNFT(counted, e.ruleID, e.allowSrcs)
+		}
+		if c == nil {
+			c = readSnatCounters(e.ruleID, e.ifIn, e.allowSrcs)
+		}
 		if c == nil {
 			continue
 		}

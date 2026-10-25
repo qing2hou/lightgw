@@ -46,6 +46,9 @@ type Manager struct {
 	nftMu          sync.Mutex
 	nft            *nft.Conn
 	nftHostProfile *nft.HostProfile
+	// nftApplyMu 装载序列互斥（purge→add→flush 跨 Flush 原子——评审 M9；
+	// 独立于 nftMu：探测/建连接不阻塞装载）
+	nftApplyMu sync.Mutex
 
 	// 带宽包共享令牌桶（ADR-9：包ID -> Limiter；tcp/udp 成员规则注入；额度变更重建）
 	bwMu       sync.Mutex
@@ -391,6 +394,7 @@ func (m *Manager) stopStaleProtocol(rule model.ForwardRule) {
 	}
 	if staleSNAT != nil {
 		staleSNAT.teardownSnat()
+		m.teardownSnatNFT(rule.ID) // nft 形态同拆（评审 M4——漏拆则残留到下次重启）
 		_ = staleSNAT.teardownSnatLimit()
 		staleSNAT.teardownEgressRoute()
 	}

@@ -24,12 +24,10 @@ type HostProfile struct {
 }
 
 // DetectHost 探测宿主形态。
-// 无法确证 policy 状态时保守假设 ForwardPolicyDrop=true（安全侧：多装锚点无害，
-// 漏装是黑洞）。iptables-legacy 只是存在性检测（policy 读取需 root netlink，
-// 保守按存在即拒）。
+// ForwardPolicyDrop 无法确证时保守假设 true（安全侧：多装锚点无害，漏装是黑洞）。
 func (n *Conn) DetectHost() (HostProfile, error) {
 	p := HostProfile{}
-	// iptables-legacy 探测：/proc/net/ip_tables_names（legacy 内核模块的注册表）。
+	// iptables-legacy 探测：/proc/net/ip_tables_names（legacy 模块注册表）。
 	if b, err := os.ReadFile("/proc/net/ip_tables_names"); err == nil {
 		for _, ln := range strings.Split(string(b), "\n") {
 			if strings.TrimSpace(ln) == "filter" {
@@ -52,18 +50,24 @@ func (n *Conn) DetectHost() (HostProfile, error) {
 		}
 	}
 
-	// FORWARD policy 精确判定：枚举 ip/inet 家族 filter 表的 FORWARD 基础链。
-	// 有 DROP policy 链 → ForwardPolicyDrop=true。读不到链（无表）时保守 true？
-	// 不——无 filter 表说明宿主零防火墙（vanilla），policy 缺省 accept，
-	// 且我们自有 fwd 链在 -10 先执行、范围内默认拒绝已覆盖，锚点无必要。
-	if p.HasFilterTable {
-		drop, err := n.forwardPolicyDrop()
-		if err != nil {
-			// 读得到表读不到链：保守装锚点（无害）
-			p.ForwardPolicyDrop = true
-		} else {
-			p.ForwardPolicyDrop = drop
+	// FORWARD policy 判定（评审 M3 修正：三条路径全覆盖，默认保守 true）。
+	switch {
+	case p.HasFilterTable:
+		// nf_tables 家族的 filter 表：枚举 FORWARD 基础链读 policy
+		p.ForwardPolicyDrop = true
+		if drop, err := n.forwardPolicyDrop(); err == nil && !drop {
+			p.ForwardPolicyDrop = false
 		}
+	case p.LegacyIPTables:
+		// 纯 legacy 宿主：x_tables policy 经 IPT_SO_GET_INFO/GET_ENTRIES
+		// sockopt 读取（legacy.go；原实现此路径不可见——漏检即整机黑洞）
+		p.ForwardPolicyDrop = true
+		if drop, _, err := legacyForwardPolicyDrop(); err == nil && !drop {
+			p.ForwardPolicyDrop = false
+		}
+	default:
+		// 无任何宿主防火墙（vanilla）：policy 缺省 accept
+		p.ForwardPolicyDrop = false
 	}
 	return p, nil
 }
@@ -99,7 +103,9 @@ func (n *Conn) EnsureAnchor(profile HostProfile) error {
 	if !profile.ForwardPolicyDrop {
 		return nil
 	}
-	for _, fam := range []nftables.TableFamily{nftables.TableFamilyIPv4, nftables.TableFamilyIPv6} {
+	// 家族列表与 forwardPolicyDrop 的探测范围一致（评审 S1：宿主 nft 原生
+	// inet filter + FORWARD DROP 时也要能装锚点）
+	for _, fam := range []nftables.TableFamily{nftables.TableFamilyIPv4, nftables.TableFamilyIPv6, nftables.TableFamilyINet} {
 		tbl := &nftables.Table{Family: fam, Name: "filter"}
 		fwd, ok, err := n.hostForwardChain(fam)
 		if err != nil || !ok {
