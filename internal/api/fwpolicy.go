@@ -289,3 +289,15 @@ func parseListOrNull(s string) []string {
 	_ = json.Unmarshal([]byte(strings.TrimSpace(s)), &out)
 	return out
 }
+
+// dnatSummaryOf dnat 行的访问统计摘要（P2-2）：KindDNAT 标记计数聚合。
+func (h *handlers) dnatSummaryOf(r model.ForwardRule) *snatSummary {
+	s := &snatSummary{IfIn: r.ListenAddr, IfOut: r.TargetAddr}
+	var allowSrcs []string
+	_ = json.Unmarshal([]byte(r.AllowList), &allowSrcs)
+	if c := h.Mgr.ReadDNATCountersNFT(r.ID, allowSrcs); c != nil {
+		s.Packets = c.PktsAccept
+		s.DeniedPk = c.PktsDrop
+	}
+	return s
+}

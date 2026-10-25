@@ -599,6 +599,11 @@ func (h *handlers) listRules(c *gin.Context) {
 		if r.Protocol == model.ProtocolSNAT {
 			w.Snat = h.snatSummaryOf(r)
 		}
+		// dnat 行注入访问统计（P2-2：前端"访问统计"列此前恒空——同 snat 摘要
+		// 通道，但计数按 KindDNAT 标记聚合）
+		if r.Protocol == model.ProtocolDNAT {
+			w.Snat = h.dnatSummaryOf(r)
+		}
 		if bg, ok := bwMap[r.BWGroupID]; ok && r.BWGroupID != 0 {
 			w.BandwidthGroup = &bwGroupBrief{ID: bg.ID, Name: bg.Name, TotalKBps: bg.TotalKBps}
 		}

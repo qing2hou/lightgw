@@ -270,3 +270,25 @@ func (m *Manager) teardownDnatSilentDrop(ruleID uint) {
 		logf("规则#%d 静默丢弃行拆除失败: %v", ruleID, err)
 	}
 }
+
+// ReadDNATCountersNFT dnat 规则计数快照（P2-2：API 摘要用；KindDNAT 标记）。
+func (m *Manager) ReadDNATCountersNFT(ruleID uint, allowSrcs []string) *snatCounters {
+	m.nftMu.Lock()
+	conn := m.nft
+	m.nftMu.Unlock()
+	if conn != nil {
+		m.nftApplyMu.Lock()
+		res, err := conn.CountersByComment()
+		m.nftApplyMu.Unlock()
+		if err == nil {
+			if pair, ok := res.ByRule[nft.Comment(nft.KindDNAT, ruleID)]; ok {
+				return &snatCounters{
+					PktsAccept: int64(pair.Accept.Packets), BytesAccept: int64(pair.Accept.Bytes),
+					PktsDrop: int64(pair.Drop.Packets), BytesDrop: int64(pair.Drop.Bytes),
+				}
+			}
+			return &snatCounters{} // 引擎在位但读不到该规则（未启用）
+		}
+	}
+	return nil // 降级：dnat 无 exec 口径，返回 nil 由调用方标注 unknown
+}
