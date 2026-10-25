@@ -39,13 +39,13 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 		return nil, fmt.Errorf("SNAT 源 %s 不是合法 IPv4", s.OutIP)
 	}
 	for _, d := range s.DstDeny {
-		if v4(d) == nil {
-			return nil, fmt.Errorf("目标黑名单 %s 不是合法 IPv4", d)
+		if !validDst(d) {
+			return nil, fmt.Errorf("目标黑名单 %s 不是合法 IPv4/CIDR", d)
 		}
 	}
 	for _, d := range s.DstAllow {
-		if v4(d) == nil {
-			return nil, fmt.Errorf("目标白名单 %s 不是合法 IPv4", d)
+		if !validDst(d) {
+			return nil, fmt.Errorf("目标白名单 %s 不是合法 IPv4/CIDR", d)
 		}
 	}
 
@@ -87,9 +87,8 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 				} else {
 					ex = iifOifExprs(s.IfIn, s.IfOut)
 				}
+				ex = append(ex, dstMatchExprs(d)...)
 				ex = append(ex,
-					&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
-					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: v4(d)},
 					&expr.Counter{},
 					&expr.Verdict{Kind: expr.VerdictDrop},
 				)
@@ -100,15 +99,24 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 		}
 	}
 
-	// ③ fwd：目标白名单放行（每 源×目标 一行 OR 语义——旧形态 -s/-d 笛卡尔积）
+	// ③ fwd：目标白名单放行（每 源×目标 一行 OR 语义——旧形态 -s/-d 笛卡尔积；
+	// 无源形态归一 srcList=[""]——旧 iptablesArgs 对该组合产出
+	// "-i in -o out -d <d> ACCEPT" 行，漏归一则 vanilla 宿主目标白名单失效
+	// 全放行/有 deny 宿主全拒绝——复审 N4）
 	if s.DstMode == "whitelist" && len(s.DstAllow) > 0 {
-		for _, src := range srcs {
+		srcList := srcs
+		if noSrc {
+			srcList = []string{""}
+		}
+		for _, src := range srcList {
 			for _, d := range s.DstAllow {
-				ex := srcMatchExprs(s.IfIn, s.IfOut, src)
-				ex = append(ex,
-					&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
-					&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: v4(d)},
-				)
+				var ex []expr.Any
+				if src != "" {
+					ex = srcMatchExprs(s.IfIn, s.IfOut, src)
+				} else {
+					ex = iifOifExprs(s.IfIn, s.IfOut)
+				}
+				ex = append(ex, dstMatchExprs(d)...)
 				out = append(out, Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
 					Table: tbl, UserData: []byte(ud), Exprs: withCounterMark(ex),
 				}})
@@ -244,4 +252,36 @@ func ifnameBytes(name string) []byte {
 	b := make([]byte, 16)
 	copy(b, name)
 	return b
+}
+
+// dstMatchExprs 目标地址匹配序列（单 IP 精确 / CIDR Bitwise 展开——与
+// 源匹配同构；旧形态 -d 支持网段，此处等价）。
+func dstMatchExprs(dst string) []expr.Any {
+	if ip := v4(dst); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if _, ipn, err := net.ParseCIDR(dst); err == nil && ipn != nil {
+		mask := make([]byte, 4)
+		copy(mask, ipn.Mask)
+		network := ipn.IP.To4()
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+				Mask: mask, Xor: binaryutil.NativeEndian.PutUint32(0)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network},
+		}
+	}
+	return nil // 非法目标（调用方已校验——防御）
+}
+
+// validDst 目标条目合法（单 IP 或 CIDR）。
+func validDst(d string) bool {
+	if v4(d) != nil {
+		return true
+	}
+	_, ipn, err := net.ParseCIDR(d)
+	return err == nil && ipn != nil && ipn.IP.To4() != nil
 }

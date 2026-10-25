@@ -1307,14 +1307,18 @@ func (m *Manager) pollSnatCounters() {
 	}
 	m.mu.Unlock()
 
-	// M5：优先 nft counter（netlink，无外部二进制依赖）；引擎不可用
-	// （老机器/容器开发）降级旧 exec 口径（tc class + iptables DROP）。
+	// M5/N3：优先 nft counter（netlink，无外部二进制依赖）。CountersByComment
+	// 与安装 Flush 共享 lasting socket——必须持 nftApplyMu 防会话交错（否则
+	// poll 的 dump 挤进安装的 send/receive 之间，安装被误判失败触发回滚）。
+	// 引擎不可用（老机器/容器开发）降级旧 exec 口径（tc class + iptables DROP）。
 	m.nftMu.Lock()
 	nftConnRef := m.nft
 	m.nftMu.Unlock()
-	var counted map[string]nft.CounterSnapshot
+	var counted *nft.CountersByCommentResult
 	if nftConnRef != nil {
+		m.nftApplyMu.Lock()
 		counted, _ = nftConnRef.CountersByComment()
+		m.nftApplyMu.Unlock()
 	}
 	for _, e := range entries {
 		var c *snatCounters

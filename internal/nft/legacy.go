@@ -41,10 +41,14 @@ type iptGetinfo struct {
 	Size       uint32
 }
 
-// getEntHdr IPT_SO_GET_ENTRIES 请求头（ipt_get_entries：name + size）。
+// getEntHdr IPT_SO_GET_ENTRIES 请求头。uapi 名义布局 name[32]+size=36，
+// 但 Debian/WSL 内核 compat 层实测要求 optlen=sizeof+4 且 entries 数组从
+// 偏移 40 开始（ABI 实测：optlen 36+size 报 EINVAL；40 头时 verdict 读数
+// ACCEPT=-2/DROP=-1 随 policy 精确切换——见 cmd/vd 排查记录）。
 type getEntHdr struct {
 	Name [xtTableMaxNameLen]byte
 	Size uint32
+	Pad  uint32 // 内核 compat 对齐填充（长度参与 optlen 语义）
 }
 
 // legacyForwardPolicyDrop 检测 iptables-legacy filter 表 FORWARD 链 policy 是否 DROP。
@@ -89,7 +93,7 @@ func legacyForwardPolicyDrop() (drop, exists bool, err error) {
 	hdrSize := int(unsafe.Sizeof(req))
 	uf := int(info.Underflow[forwardHookIdx])
 	if uf < 0 || hdrSize+uf+iptEntryHdrSize > len(buf) {
-		return false, true, nil // 布局异常——保守不判 DROP（exists=true 供上层降级路径）
+		return true, true, nil // 布局异常——读不懂按 DROP 保守处理（复审 M3-b）
 	}
 	entry := buf[hdrSize+uf:]
 	// target_offset：相对条目起点；offset iptIPSize+nfcache 后 2 字节处
@@ -99,12 +103,26 @@ func legacyForwardPolicyDrop() (drop, exists bool, err error) {
 	// 但 kernel→user 的标准 target 内容固定为 {verdict}（对齐在 target 头后）。
 	verdictOff := targetOffset + 32
 	if verdictOff+4 > len(entry) {
-		return false, true, nil
+		return true, true, nil // 读不懂按 DROP 保守处理（评审 M3-b）
 	}
 	verdict := int32(binary.LittleEndian.Uint32(entry[verdictOff : verdictOff+4]))
-	const xtReturn = -6 // -NF_RETURN-1（NF_RETURN=5）
-	if verdict < 0 && verdict != xtReturn {
-		return true, true, nil // -NF_ACCEPT-1=-2? 不：ACCEPT 是正值 1；负且非 RETURN 即 DROP(-1)
+	return policyVerdictIsDrop(verdict), true, nil
+}
+
+// policyVerdictIsDrop 标准 target verdict 三值分类（libiptc 编码 -NF_x-1）：
+// -1 → DROP，-2 → ACCEPT，其余任何值（读不懂/异常）保守按 DROP
+// （宁多锚点/拒装，不漏黑洞——复审 M3-a/b）。
+func policyVerdictIsDrop(verdict int32) bool {
+	const (
+		nfDropVerdict   int32 = -1 // -NF_DROP-1
+		nfAcceptVerdict int32 = -2 // -NF_ACCEPT-1
+	)
+	switch verdict {
+	case nfDropVerdict:
+		return true
+	case nfAcceptVerdict:
+		return false
+	default:
+		return true
 	}
-	return false, true, nil
 }

@@ -79,3 +79,23 @@ func TestIPSetEntriesBadInput(t *testing.T) {
 		t.Fatalf("v6 网段 lastIP 应为 nil（M3 前不支持），得到 %v", got)
 	}
 }
+
+func TestPolicyVerdictIsDrop(t *testing.T) {
+	// 复审 M3-a：ACCEPT policy 存 -2（libiptc 编码），误判会把正常部署拒之门外
+	cases := []struct {
+		verdict int32
+		want    bool
+		what    string
+	}{
+		{-1, true, "DROP policy"},
+		{-2, false, "ACCEPT policy（曾被误判的关键分支）"},
+		{-5, true, "XT_RETURN（保守按 DROP）"},
+		{0, true, "异常值保守按 DROP"},
+		{1, true, "异常值保守按 DROP"},
+	}
+	for _, c := range cases {
+		if got := policyVerdictIsDrop(c.verdict); got != c.want {
+			t.Fatalf("%s（verdict=%d）: got %v want %v", c.what, c.verdict, got, c.want)
+		}
+	}
+}

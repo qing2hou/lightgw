@@ -62,7 +62,25 @@ func (n *Conn) rulesOf(chain string) ([]*nftables.Rule, error) {
 // PurgeByComment 按标记盲拆：遍历自有表全部链，UserData 命中标记的
 // 规则按 Handle 精确删除（半装/漏拆兜底；幂等）。
 func (n *Conn) PurgeByComment(kind string, id uint) error {
-	target := Comment(kind, id)
+	removed, err := n.purgeByCommentTarget(Comment(kind, id))
+	if err != nil {
+		return err
+	}
+	if removed == 0 {
+		return nil // 幂等：无残留即成功
+	}
+	return n.Flush()
+}
+
+// PurgeByCommentNoFlush 暂存式拆除（返回暂存删除数，不提交——调用方在同
+// batch 追加新增后一次 FlushCommit，消掉拆装间隙窗口，复审 N6）。
+func (n *Conn) PurgeByCommentNoFlush(kind string, id uint) (int, error) {
+	return n.purgeByCommentTarget(Comment(kind, id))
+}
+
+// purgeByCommentTarget 按标记遍历四链暂存删除，返回暂存删除数
+// （错误路径：先提交已暂存部分再返回错误）。
+func (n *Conn) purgeByCommentTarget(target string) (int, error) {
 	removed := 0
 	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
 		rules, err := n.rulesOf(chain)
@@ -79,14 +97,11 @@ func (n *Conn) PurgeByComment(kind string, id uint) error {
 		// 中途失败：已暂存的删除先提交（删除幂等且 comment 域内，发出去无害），
 		// 绝不留在共享缓冲里被下次无关 Flush 顺带发出（评审 M7）
 		if flushErr := n.Flush(); flushErr != nil {
-			return fmt.Errorf("对账读取链 %s 失败（且暂存删除提交失败）: %w / %v", chain, err, flushErr)
+			return removed, fmt.Errorf("对账读取链 %s 失败（且暂存删除提交失败）: %w / %v", chain, err, flushErr)
 		}
-		return fmt.Errorf("对账读取链 %s 失败: %w", chain, err)
+		return removed, fmt.Errorf("对账读取链 %s 失败: %w", chain, err)
 	}
-	if removed == 0 {
-		return nil // 幂等：无残留即成功
-	}
-	return n.Flush()
+	return removed, nil
 }
 
 // InstalledIDs 列出自有表内已安装的 (kind, id) 集合（启动对账数据源）。
@@ -111,25 +126,82 @@ func (n *Conn) InstalledIDs() (map[string]map[uint]bool, error) {
 	return out, nil
 }
 
-// CountersByComment 按标记读规则内嵌 counter（计数轮询数据源）。
-// 返回 map[标记]counter；不含 counter 的规则跳过。
-func (n *Conn) CountersByComment() (map[string]CounterSnapshot, error) {
-	out := map[string]CounterSnapshot{}
+// CounterPair 双桶计数（复审 N1：同标记多行——放行桶与拒绝桶分开求和，
+// 不再 last-writer-wins）。
+type CounterPair struct {
+	Accept CounterSnapshot // 放行语义行（fwd 放行、srcnat 改写）
+	Drop   CounterSnapshot // 拒绝语义行（含 VerdictDrop 的行）
+}
+
+// hasDropVerdict 规则表达式序列尾部是否 VerdictDrop。
+func hasDropVerdictRule(r *nftables.Rule) bool {
+	for _, e := range r.Exprs {
+		if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+			return true
+		}
+	}
+	return false
+}
+
+// CountersByComment 按标记读规则内嵌 counter，双桶求和（复审 N1/N2）：
+// map[标记]{Accept, Drop}——同标记的放行行（fwd ③④⑤ 每源行）求和进 Accept、
+// 拒绝行（② 黑名单 DROP）求和进 Drop。注意 Accept 桶内 fwd 放行与 srcnat
+// 改写行会同包双计——调用方取 max(fwd 桶, srcnat 桶) 之前，本层按链分桶
+// 提供（fwdAccept 与 srcnat 分开，避免调用方猜）。
+type CountersByCommentResult struct {
+	ByRule map[string]CounterPair // haweb-nft:snat:<id> → 双桶
+	// FwdAccept/srcnat 分桶视图（同标记）：max 口径用
+	FwdSrcnat map[string][2]CounterSnapshot // [fwdAccept, srcnat]
+	DenyDeny  CounterSnapshot               // 全局默认拒绝尾行（deny:0）合计
+}
+
+func (n *Conn) CountersByComment() (*CountersByCommentResult, error) {
+	out := &CountersByCommentResult{
+		ByRule:    map[string]CounterPair{},
+		FwdSrcnat: map[string][2]CounterSnapshot{},
+	}
 	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
 		rules, err := n.rulesOf(chain)
 		if err != nil {
 			return nil, err
 		}
 		for _, r := range rules {
+			var ctr *expr.Counter
 			for _, e := range r.Exprs {
-				if ctr, ok := e.(*expr.Counter); ok {
-					out[string(r.UserData)] = CounterSnapshot{Bytes: ctr.Bytes, Packets: ctr.Packets}
+				if c, ok := e.(*expr.Counter); ok {
+					ctr = c
 					break
 				}
 			}
+			if ctr == nil {
+				continue
+			}
+			ud := string(r.UserData)
+			snap := CounterSnapshot{Bytes: ctr.Bytes, Packets: ctr.Packets}
+			pair := out.ByRule[ud]
+			if hasDropVerdictRule(r) {
+				pair.Drop.add(snap)
+			} else {
+				pair.Accept.add(snap)
+				fs := out.FwdSrcnat[ud]
+				if chain == ChainSrcNAT {
+					fs[1].add(snap)
+				} else if chain == ChainFwd {
+					fs[0].add(snap)
+				}
+				out.FwdSrcnat[ud] = fs
+			}
+			out.ByRule[ud] = pair
 		}
 	}
+	// 全局默认拒绝（deny:0 标记——多网卡多行同标记求和）
+	out.DenyDeny = out.ByRule[Comment(KindDefaultDeny, 0)].Drop
 	return out, nil
+}
+
+func (c *CounterSnapshot) add(o CounterSnapshot) {
+	c.Bytes += o.Bytes
+	c.Packets += o.Packets
 }
 
 // CounterSnapshot counter 读数快照（脱离 expr 包类型的稳定视图）。
@@ -202,3 +274,7 @@ func (n *Conn) PurgeLegacyIPTables() (int, error) {
 // KindDefaultDeny 全局默认拒绝尾行（fw.CompileDefaultDeny；多规则共享，
 // 拆装由 Manager 统一管理——ruleID 维度取启用规则的最小 ID，随集变化重装）。
 const KindDefaultDeny = "deny"
+
+// RulesOfForDebug/DelRuleForDebug 排查用钩子（cmd/vd；生产面禁用）。
+func (n *Conn) RulesOfForDebug(chain string) ([]*nftables.Rule, error) { return n.rulesOf(chain) }
+func (n *Conn) DelRuleForDebug(r *nftables.Rule) error                 { return n.c.DelRule(r) }

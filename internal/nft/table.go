@@ -50,24 +50,23 @@ func (n *Conn) DetectHost() (HostProfile, error) {
 		}
 	}
 
-	// FORWARD policy 判定（评审 M3 修正：三条路径全覆盖，默认保守 true）。
-	switch {
-	case p.HasFilterTable:
-		// nf_tables 家族的 filter 表：枚举 FORWARD 基础链读 policy
-		p.ForwardPolicyDrop = true
-		if drop, err := n.forwardPolicyDrop(); err == nil && !drop {
-			p.ForwardPolicyDrop = false
+	// FORWARD policy 判定（评审 M3-c：nft 与 legacy 两个 backend 独立探测，
+	// 任一 DROP 即 true——混合 backend 宿主（nft filter 在 + legacy filter 残留）
+	// 的 legacy policy 不可因 HasFilterTable 短路漏检）。
+	p.ForwardPolicyDrop = false
+	if p.HasFilterTable {
+		if drop, err := n.forwardPolicyDrop(); err == nil && drop {
+			p.ForwardPolicyDrop = true
+		} else if err != nil {
+			p.ForwardPolicyDrop = true // 读失败保守按 DROP（宁多锚点不黑洞）
 		}
-	case p.LegacyIPTables:
-		// 纯 legacy 宿主：x_tables policy 经 IPT_SO_GET_INFO/GET_ENTRIES
-		// sockopt 读取（legacy.go；原实现此路径不可见——漏检即整机黑洞）
-		p.ForwardPolicyDrop = true
-		if drop, _, err := legacyForwardPolicyDrop(); err == nil && !drop {
-			p.ForwardPolicyDrop = false
+	}
+	if p.LegacyIPTables {
+		if drop, _, err := legacyForwardPolicyDrop(); err == nil && drop {
+			p.ForwardPolicyDrop = true
+		} else if err != nil {
+			p.ForwardPolicyDrop = true
 		}
-	default:
-		// 无任何宿主防火墙（vanilla）：policy 缺省 accept
-		p.ForwardPolicyDrop = false
 	}
 	return p, nil
 }

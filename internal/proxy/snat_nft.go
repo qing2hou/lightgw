@@ -113,7 +113,11 @@ func (m *Manager) teardownSnatNFT(ruleID uint) {
 // （vanilla 语义回到全通——与"有规则才有管辖区"一致）。
 func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 	var rules []model.ForwardRule
-	m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules)
+	if err := m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules).Error; err != nil {
+		// 复审 N5：DB 读失败时保留在位尾行（拆了装不回=漏拒绝——不保守方向）
+		logf("默认拒绝尾行重算跳过（DB 读取失败，保留在位形态）: %v", err)
+		return
+	}
 	seen := map[string]bool{}
 	ifaces := make([]string, 0, len(rules))
 	denied := false
@@ -122,21 +126,24 @@ func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 			seen[r.ListenAddr] = true
 			ifaces = append(ifaces, r.ListenAddr)
 		}
+		// 复审 N5：目标白名单也依赖兜底拒绝（白名单外全拒）——与源白名单、
+		// 目标黑名单同属"指定就不通"语义族
 		if r.AclMode == model.AclModeWhitelist ||
-			(r.DstAclMode == model.AclModeBlacklist && parseIPListOrEmpty(r.DstDenyList) != nil) {
+			(r.DstAclMode == model.AclModeWhitelist && len(parseIPListOrEmpty(r.DstAllowList)) > 0) ||
+			(r.DstAclMode == model.AclModeBlacklist && len(parseIPListOrEmpty(r.DstDenyList)) > 0) {
 			denied = true
 		}
 	}
-	// 先拆旧尾行（幂等；deny 标记只能在默认拒绝行上——非 deny 标记行不碰）
-	if err := conn.PurgeByComment(nft.KindDefaultDeny, 0); err != nil {
-		logf("默认拒绝尾行拆除失败: %v", err)
+	// N6：拆除与新增同一 netlink batch（无间隙窗口）。暂存删除 → 暂存新增 →
+	// 一次提交；无 denied 时只提交删除（幂等归零）。
+	if _, err := conn.PurgeByCommentNoFlush(nft.KindDefaultDeny, 0); err != nil {
+		logf("默认拒绝尾行拆除暂存失败: %v", err)
 		return
 	}
-	if !denied {
-		return // 无"指定就不通"语义的规则——默认拒绝不适用（off 全放行）
-	}
-	for _, r := range fw.CompileDefaultDeny(0, ifaces) {
-		conn.AddCompiled(r.Chain, r.Rule)
+	if denied {
+		for _, r := range fw.CompileDefaultDeny(0, ifaces) {
+			conn.AddCompiled(r.Chain, r.Rule)
+		}
 	}
 	if err := conn.FlushCommit(); err != nil {
 		logf("默认拒绝尾行装载失败（白名单外流量将由宿主 policy 兜底或放行）: %v", err)
@@ -208,36 +215,37 @@ func (m *Manager) teardownEgressRouteNFT(rtTable int) {
 	}
 }
 
-// countersFromNFT 从 nft counter 快照聚合单规则计数（M5：pollSnatCounters 的
-// netlink 数据源；无 iptables/tc 二进制环境唯一可用口径）。
-// 口径：ACCEPT 计数 = 全部放行行（fwd ③④）+ SNAT 行 counter 之和的 max——
-// 同一包同时命中 fwd 放行与 srcnat 改写两条行会双计，取 max 保持与旧口径
-// （tc 单计数点）量纲一致；DROP 计数 = ②黑名单行 + 默认拒绝行中归属本规则
-// 入口网卡的部分不可分——v1 归入全局 deny counter（列入已知边界）。
-func countersFromNFT(counted map[string]nft.CounterSnapshot, ruleID uint, allowSrcs []string) *snatCounters {
+// countersFromNFT 从 nft counter 快照聚合单规则计数（M5/N1/N2 修正口径）。
+// Accept 口径：max(fwd 放行桶, srcnat 桶)——同一包同时命中 fwd 放行行与
+// srcnat 改写行会双计，取两桶 max 与旧 tc 单计数点量纲一致；Drop 口径：
+// 本规则 ② 黑名单行（per-rule verdict 分桶，与放行行不混）。
+// 全局默认拒绝（deny:0）不进 per-rule——避免 N 条规则 N 倍重复计 Denied
+// （调用方需要全局量时从 CountersByCommentResult.DenyDeny 单独取）。
+// 未入带宽包（无 tc class）时 allowSrcs 口径退化为 nft counter 全量。
+func countersFromNFT(res *nft.CountersByCommentResult, ruleID uint, allowSrcs []string) *snatCounters {
 	target := nft.Comment(nft.KindSNAT, ruleID)
-	accMax, drop := nft.CounterSnapshot{}, nft.CounterSnapshot{}
-	have := false
-	for ud, ctr := range counted {
-		if ud != target {
-			continue
-		}
-		have = true
-		// 区分放行/拒绝行：聚合阶段不解析表达式——按"counter 值较大集合"归并
-		// 会导致口径漂移。此处按行聚合目标：ACCEPT 桶先无条件求和，
-		// 调用方差分逻辑依赖行语义——P4 复审时以 CountersByComment 的
-		// verdict 维度扩展为准（M5 简化实现，单桶求和）。
-		accMax.Bytes += ctr.Bytes
-		accMax.Packets += ctr.Packets
-	}
-	if !have {
+	pair, ok := res.ByRule[target]
+	if !ok {
 		return nil
 	}
-	// 兜底 DROP（默认拒绝行全局聚合，ruleID=0 标记——不属于单规则）
-	deny := counted[nft.Comment(nft.KindDefaultDeny, 0)]
-	drop = deny
-	return &snatCounters{
-		PktsAccept: int64(accMax.Packets), BytesAccept: int64(accMax.Bytes),
-		PktsDrop: int64(drop.Packets), BytesDrop: int64(drop.Bytes),
+	fs := res.FwdSrcnat[target]
+	accept := fs[0]
+	if fs[1].Bytes > accept.Bytes {
+		accept = fs[1]
 	}
+	if accept.Packets > fs[0].Packets || accept.Packets > fs[1].Packets {
+		// bytes 与 packets 分别取 max（分桶粒度独立）
+		accept.Packets = maxU64(fs[0].Packets, fs[1].Packets)
+	}
+	return &snatCounters{
+		PktsAccept: int64(accept.Packets), BytesAccept: int64(accept.Bytes),
+		PktsDrop: int64(pair.Drop.Packets), BytesDrop: int64(pair.Drop.Bytes),
+	}
+}
+
+func maxU64(a, b uint64) uint64 {
+	if a > b {
+		return a
+	}
+	return b
 }

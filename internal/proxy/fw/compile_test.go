@@ -199,3 +199,37 @@ func hasDropVerdict(r *nftables.Rule) bool {
 	}
 	return false
 }
+
+func TestCompileSNATDstWhitelistNoSrc(t *testing.T) {
+	// 复审 N4 防回归：off + 目标白名单 + 无源白名单 → 必须编译出
+	// 无源(仅 iif/oif/daddr)的目标白名单放行行（旧形态 "-i in -o out -d X ACCEPT"）
+	s := Spec{ID: 3, IfIn: "eth0", IfOut: "ens19", OutIP: "1.2.3.4",
+		DstMode: "whitelist", DstAllow: []string{"10.0.1.0/24"}}
+	rules, err := CompileSNAT(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fwdAccept := 0
+	for _, r := range rules {
+		if r.Chain != nft.ChainFwd || hasDropVerdict(r.Rule) {
+			continue
+		}
+		var hasDaddr, hasSaddr bool
+		for _, e := range r.Rule.Exprs {
+			if p, ok := e.(*expr.Payload); ok {
+				if p.Offset == offDaddr {
+					hasDaddr = true
+				}
+				if p.Offset == offSaddr {
+					hasSaddr = true
+				}
+			}
+		}
+		if hasDaddr && !hasSaddr {
+			fwdAccept++
+		}
+	}
+	if fwdAccept == 0 {
+		t.Fatal("目标白名单×无源组合应有带 daddr 无 saddr 的放行行（旧形态语义）")
+	}
+}
