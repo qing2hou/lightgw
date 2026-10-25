@@ -112,39 +112,11 @@ func (m *Manager) teardownSnatNFT(ruleID uint) {
 // 入口集 = 当前 DB 启用 snat 规则的入口网卡去重集；空集时拆除尾行
 // （vanilla 语义回到全通——与"有规则才有管辖区"一致）。
 func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
-	var rules []model.ForwardRule
-	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
+	ifaces, dnatBackends, denied, err := m.computeDefaultDenySets()
+	if err != nil {
 		// 复审 N5：DB 读失败时保留在位尾行（拆了装不回=漏拒绝——不保守方向）
 		logf("默认拒绝尾行重算跳过（DB 读取失败，保留在位形态）: %v", err)
 		return
-	}
-	seen := map[string]bool{}
-	ifaces := make([]string, 0, len(rules))
-	dnatBackends := make([]string, 0, len(rules))
-	denied := false
-	for _, r := range rules {
-		if r.Protocol == model.ProtocolDNAT {
-			// dnat：辖区=后端 IP；白名单语义恒真（API 强制），发布行必然依赖兜底拒绝
-			if bip, _, ok := splitHostPortOK(r.TargetAddr); ok {
-				if !seen["b:"+bip] {
-					seen["b:"+bip] = true
-					dnatBackends = append(dnatBackends, bip)
-				}
-			}
-			denied = true
-			continue
-		}
-		if !seen[r.ListenAddr] {
-			seen[r.ListenAddr] = true
-			ifaces = append(ifaces, r.ListenAddr)
-		}
-		// 复审 N5：目标白名单也依赖兜底拒绝（白名单外全拒）——与源白名单、
-		// 目标黑名单同属"指定就不通"语义族
-		if r.AclMode == model.AclModeWhitelist ||
-			(r.DstAclMode == model.AclModeWhitelist && len(parseIPListOrEmpty(r.DstAllowList)) > 0) ||
-			(r.DstAclMode == model.AclModeBlacklist && len(parseIPListOrEmpty(r.DstDenyList)) > 0) {
-			denied = true
-		}
 	}
 	// N6：拆除与新增同一 netlink batch（无间隙窗口）。暂存删除 → 暂存新增 →
 	// 一次提交；无 denied 时只提交删除（幂等归零）。
@@ -167,16 +139,29 @@ func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 // deny 行必须保持在 fwd 链尾（fwd 链追加序 = 评估序；deny 是终结行，
 // 排在其他行前面会把后续行全部短路——评审 #1）。
 func (m *Manager) appendDefaultDenyNoFlush(conn *nft.Conn) {
-	var rules []model.ForwardRule
-	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
+	ifaces, dnatBackends, denied, err := m.computeDefaultDenySets()
+	if err != nil || !denied {
 		return // DB 读失败：不动 deny 形态（保守——拆了装不回=漏拒绝）
 	}
+	for _, r := range fw.CompileDefaultDenyEx(0, ifaces, dnatBackends) {
+		conn.AddCompiled(r.Chain, r.Rule)
+	}
+}
+
+// computeDefaultDenySets 默认拒绝尾行的辖区与豁免计算（纯读，复核建议：
+// 此前两处逐行同构的拷贝合并于此——改辖区逻辑只动这一处）。
+// 返回：snat 入口网卡集、dnat 后端 IP 集、是否存在"指定就不通"语义规则。
+func (m *Manager) computeDefaultDenySets() (ifaces, dnatBackends []string, denied bool, err error) {
+	var rules []model.ForwardRule
+	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
+		return nil, nil, false, err
+	}
 	seen := map[string]bool{}
-	ifaces := make([]string, 0, len(rules))
-	dnatBackends := make([]string, 0, len(rules))
-	denied := false
+	ifaces = make([]string, 0, len(rules))
+	dnatBackends = make([]string, 0, len(rules))
 	for _, r := range rules {
 		if r.Protocol == model.ProtocolDNAT {
+			// dnat：辖区=后端 IP；白名单语义恒真（API 强制），发布行必然依赖兜底拒绝
 			if bip, _, ok := splitHostPortOK(r.TargetAddr); ok && !seen["b:"+bip] {
 				seen["b:"+bip] = true
 				dnatBackends = append(dnatBackends, bip)
@@ -188,18 +173,15 @@ func (m *Manager) appendDefaultDenyNoFlush(conn *nft.Conn) {
 			seen[r.ListenAddr] = true
 			ifaces = append(ifaces, r.ListenAddr)
 		}
+		// 复审 N5：目标白名单也依赖兜底拒绝（白名单外全拒）——与源白名单、
+		// 目标黑名单同属"指定就不通"语义族
 		if r.AclMode == model.AclModeWhitelist ||
 			(r.DstAclMode == model.AclModeWhitelist && len(parseIPListOrEmpty(r.DstAllowList)) > 0) ||
 			(r.DstAclMode == model.AclModeBlacklist && len(parseIPListOrEmpty(r.DstDenyList)) > 0) {
 			denied = true
 		}
 	}
-	if !denied {
-		return
-	}
-	for _, r := range fw.CompileDefaultDenyEx(0, ifaces, dnatBackends) {
-		conn.AddCompiled(r.Chain, r.Rule)
-	}
+	return ifaces, dnatBackends, denied, nil
 }
 
 // migrateLegacyIPTables 启动迁移（T006）：经 netlink 拆除全部旧 haweb-sn:

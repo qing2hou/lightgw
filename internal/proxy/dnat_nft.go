@@ -211,6 +211,12 @@ func ipBelongsLocally(ip string) bool {
 // 重装=重新走 applyDNAT（校验+装载+统计）。
 func (m *Manager) dnatHealthToggle(rule model.ForwardRule, up bool) {
 	if up {
+		// 复审窄竞态：探测期间规则可能已被禁用/删除（探测用的是旧快照）——
+		// 动手前重读 DB，非启用态直接放弃重装（否则装回后无人拆卸直到重启）
+		var cur model.ForwardRule
+		if err := m.db.First(&cur, rule.ID).Error; err != nil || !cur.Enabled {
+			return
+		}
 		// 评审 #3：不能走 applyDNAT 快路径——健康卸载只拆了内核行、注册表
 		// 条目仍在，sameForwarding 恒真会直接 return（发布永不重装）。
 		// 恢复=强制拆除（含注册表 + timeout 静默丢弃行）后全量重装。

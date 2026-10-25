@@ -169,6 +169,14 @@ func (h *handlers) reorderFwPolicies(c *gin.Context) {
 		}
 	}
 	if err := h.DB.Transaction(func(tx *gorm.DB) error {
+		// 两阶段写（复审 #4）：order 是 uniqueIndex，直接写目标序会在中间态撞
+		// UNIQUE 约束（如 [2,1,3]→1,2,3 的第二步）。先把全部行序取负腾出正数域，
+		// 再写目标序——两步同一事务，回滚安全。
+		if err := tx.Model(&model.FwPolicy{}).
+			Where("`order` > 0").
+			UpdateColumn("order", gorm.Expr("-`order`")).Error; err != nil {
+			return err
+		}
 		for i, id := range in.OrderedIDs {
 			if err := tx.Model(&model.FwPolicy{}).Where("id = ?", id).Update("order", i+1).Error; err != nil {
 				return err
@@ -176,7 +184,7 @@ func (h *handlers) reorderFwPolicies(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
-		h.serverError(c, "删除后重装策略", err)
+		h.serverError(c, "重排策略", err)
 		return
 	}
 	if err := h.Mgr.ReinstallPolicies(); err != nil {

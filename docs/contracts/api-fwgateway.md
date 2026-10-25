@@ -1,6 +1,14 @@
 # API 契约 — fwgateway v1
 
-> 全局约定沿承现有 `/api`（JWT admin 组）：成功 `{ "code": 0, "data": {...} }`；失败 `{ "code": <业务码>, "message": "中文错误", "field": "<可选>" }`；列表 `page/pageSize → { items, total }`；时间 ISO 8601。新路由不加版本段（与现行 /api 无版本风格一致，记 ADR-15 附注）。
+> **实现偏差声明（M2 复审标注）**：实际实现沿用项目既有风格——成功 `200`、
+> 失败 `400 + { "error": "中文消息" }`（无 code/field 结构化字段）、列表分页参数
+> `page_size`。本文档中出现的 `422 + {code:40020.., message, field}` 为**待统一
+> 目标**，随全项目响应格式重构批次对齐（backlog）。已知的其他实现缺口：
+> P1 的 `stats.last_hit`、D2/D3 的 dnat 行 live 专属字段（active_sessions 等）、
+> C2 的显式四元组通道、AC-2.6 v6 发布（排期 M3/T210）、conntrack 掐断链依赖
+> `conntrack` 二进制（netlink 化排期 M3）。
+> 全局语义约定：**accept 策略=命中计数与策略位标记（bit1），不豁免规则白名单
+> ——放行只能来自规则例外（AND 语义，PRD 3.1/3.7）**。
 
 ## 一、出口管理（US4/US5）
 
