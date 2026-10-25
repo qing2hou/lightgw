@@ -14,6 +14,7 @@ import (
 	"gorm.io/gorm"
 
 	"haproxyweb/internal/model"
+	"haproxyweb/internal/nft"
 	"haproxyweb/internal/ratelimit"
 	"haproxyweb/internal/trafficlog"
 )
@@ -40,6 +41,11 @@ type Manager struct {
 
 	// snat 规则（内核 iptables/tc 转发，不经代理进程）
 	snatRules map[uint]*snatEntry
+
+	// nftables 引擎连接（snat/dnat 的内核面；懒加载——无相关规则的部署零开销）
+	nftMu          sync.Mutex
+	nft            *nft.Conn
+	nftHostProfile *nft.HostProfile
 
 	// 带宽包共享令牌桶（ADR-9：包ID -> Limiter；tcp/udp 成员规则注入；额度变更重建）
 	bwMu       sync.Mutex

@@ -228,6 +228,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 	if old != nil {
 		s := old.spec()
 		s.teardownSnat()
+		m.teardownSnatNFT(rule.ID)
 		_ = s.teardownSnatLimit()
 		s.teardownEgressRoute()
 		// 停用/删除时掐断本规则的存量穿越会话：iptables 拆除后，基线的
@@ -271,7 +272,10 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 	if err := ensureIPForward(); err != nil {
 		return err
 	}
-	if err := spec.installSnat(); err != nil {
+	// nftables 后端（T004）：fw 编译经 netlink 装载；旧 iptables 形态由
+	// T006 启动迁移拆除，此处双形态拆除中 iptables 拆除仅作兜底（升级过渡期）
+	spec.teardownSnatLegacy()
+	if err := m.installSnatNFT(spec); err != nil {
 		return err
 	}
 	if err := spec.applySnatLimit(); err != nil {
@@ -545,27 +549,21 @@ func runQuiet(name string, args ...string) error {
 	return nil
 }
 
-// installSnat 安装 iptables 规则（不含 tc；tc 见 applySnatLimit）。
-func (s *snatRuleSpec) installSnat() error {
-	if s.OutIP == "" {
-		return fmt.Errorf("出口网卡 %s 无 IPv4 地址", s.IfOut)
+// teardownSnatLegacy 拆除 iptables 形态（T004 迁移过渡期兜底：升级后旧形态
+// 仍在位时按标记拆除；全新部署无 iptables 二进制时静默跳过）。
+// 先按已知形态 -D，再按 comment 盲拆兜底（ResidueDrop 兜底语义沿承）。
+func (s *snatRuleSpec) teardownSnatLegacy() {
+	if _, err := exec.LookPath("iptables"); err != nil {
+		return // 无 iptables 二进制：新形态部署，无旧形态可拆
 	}
-	for _, args := range s.iptablesArgs() {
-		if err := runQuiet("iptables", args...); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// teardownSnat 拆除 iptables 规则：先按已知形态 -D，再按 comment 盲拆兜底
-// （形态不匹配的残留一行不剩——拆除必须彻底，ResidueDrop 兜底语义）。
-func (s *snatRuleSpec) teardownSnat() {
 	for _, args := range s.teardownArgs() {
 		_ = runQuiet("iptables", args...)
 	}
 	snatPurgeByComment(s.ID)
 }
+
+// teardownSnat 同 teardownSnatLegacy（旧名保留——manager.go 协议切换路径调用）。
+func (s *snatRuleSpec) teardownSnat() { s.teardownSnatLegacy() }
 
 // ---------- 启动对账：清扫孤儿（DB 无对应启用规则的 haweb-sn: 标记） ----------
 

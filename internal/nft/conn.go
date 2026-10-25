@@ -85,3 +85,16 @@ func (n *Conn) EnsureTable() error {
 	}
 	return n.Flush()
 }
+
+// AddCompiled 暂存一条已编译规则（链名→链对象解析；装载语义：链尾追加）。
+// 规则顺序敏感的场景（ACL 有序列）由编译层保证数组序 = 期望最终序，
+// 本方法按 append 语义逐条追加——调用方按"数组前=链上后"倒序装入。
+func (n *Conn) AddCompiled(chain string, r *nftables.Rule) {
+	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: Table}
+	r.Table = tbl
+	r.Chain = &nftables.Chain{Name: chain, Table: tbl}
+	n.c.AddRule(r)
+}
+
+// FlushCommit 提交暂存（Flush 别名——语义化：装规则后的显式提交点）。
+func (n *Conn) FlushCommit() error { return n.Flush() }
