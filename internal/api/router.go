@@ -128,6 +128,12 @@ func NewRouter(d Deps, distFS fs.FS) (*gin.Engine, error) {
 		admin.PUT("/fw-policies/:id", h.updateFwPolicy)
 		admin.DELETE("/fw-policies/:id", h.deleteFwPolicy)
 		admin.PUT("/fw-policies/reorder", h.reorderFwPolicies)
+		admin.GET("/egresses", h.listEgresses)
+		admin.POST("/egresses", h.createEgress)
+		admin.PUT("/egresses/:id", h.updateEgress)
+		admin.DELETE("/egresses/:id", h.deleteEgress)
+		admin.POST("/egresses/:id/probe", h.probeEgress)
+
 		admin.GET("/sessions", h.listSessions)
 		admin.POST("/sessions/kill", h.killSession)
 

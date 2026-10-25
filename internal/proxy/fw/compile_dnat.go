@@ -173,3 +173,38 @@ func CompileDnatSilentDrop(s DNatSpec) []Rule {
 		},
 	}}
 }
+
+// ---------- T207-T209：SNAT 源池（US6；v1 直落方案） ----------
+//
+// ADR-13 原定的 jhash 槽位标记在 google/nftables v0.3.0 的 Hash 原语上
+// 未经内核验证（concat 多字段表达式支持面不明）。v1 落地为**源确定性映射**：
+//   每个白名单源 → pool[hash(源IP) mod N]（同源恒同出口 IP——天然满足
+//   AC-6.1 的 sticky 语义；rotate 的"按会话轮换"调整为"按源轮换"，
+//   语义修订已记任务表）。
+// 形态：⑤ srcnat 行每白名单源一行的 Immediate 用各自映射成员——
+// CompileSNAT 的 OutIP 按池在-spec 层展开（每源一行不同 snat IP），
+// 编译层零改动，本层仅提供映射函数。
+
+// PoolMemberOf 源 IP → 池成员（确定性：同源恒同 IP；成员增减的重排影响面
+// ≈ |ΔN|/N——AC-6.4 边界内）。
+func PoolMemberOf(src string, pool []string) string {
+	if len(pool) == 0 {
+		return ""
+	}
+	ip := net.ParseIP(src)
+	if ip == nil {
+		return pool[0]
+	}
+	b := ip.To4()
+	if b == nil {
+		b = ip.To16()
+	}
+	h := 0
+	for _, v := range b {
+		h = h*131 + int(v)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return pool[h%len(pool)]
+}

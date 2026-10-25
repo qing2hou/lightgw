@@ -37,9 +37,9 @@ type Writer struct {
 
 // Options Writer 构造参数。
 type Options struct {
-	RetentionDays int // 保留天数，<=0 = 30
-	MaxDiskMB     int // 库文件轮转上限 MB，0 = 不限
-	WatermarkPct  int // 数据卷水位 %，<=0 = 90
+	RetentionDays int    // 保留天数，<=0 = 30
+	MaxDiskMB     int    // 库文件轮转上限 MB，0 = 不限
+	WatermarkPct  int    // 数据卷水位 %，<=0 = 90
 	DataDir       string // 数据目录（库文件所在；水位 + 容量观测）
 }
 
@@ -228,7 +228,7 @@ func (w *Writer) rotateToRowsCap(db *gorm.DB, capRows int64, reason string) {
 	}
 	// 定位第 del 老的边界时间，按时间删除（兼容 SQLite 的无子查询删除）
 	var bounds []time.Time
-	if err := db.Model(&model.TrafficLog{}).Order("started_at ASC").Offset(int(del - 1)).Limit(1).
+	if err := db.Model(&model.TrafficLog{}).Order("started_at ASC").Offset(int(del-1)).Limit(1).
 		Pluck("started_at", &bounds).Error; err != nil || len(bounds) == 0 {
 		return
 	}

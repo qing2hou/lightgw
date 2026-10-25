@@ -142,7 +142,8 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 		}
 	}
 
-	// ⑤ srcnat：SNAT 源改写（每源一行；off 无源=仅出入口行——均带 oif 出口维度）
+	// ⑤ srcnat：SNAT 源改写（每源一行；off 无源=仅出入口行——均带 oif 出口维度）。
+	// 池模式（T207）：每源的改写目标 = Pool 按源确定性映射（同源恒同 IP）
 	srcList := srcs
 	if noSrc {
 		srcList = []string{""}
@@ -154,8 +155,17 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 		} else {
 			nat = iifOifExprs(s.IfIn, s.IfOut)
 		}
+		outIP := s.OutIP
+		if len(s.Pool) > 0 && src != "" {
+			if m := PoolMemberOf(src, s.Pool); m != "" {
+				outIP = m
+			}
+		}
+		if v4(outIP) == nil {
+			return nil, fmt.Errorf("SNAT 源 %q 不是合法 IPv4", outIP)
+		}
 		nat = append(nat,
-			&expr.Immediate{Register: 1, Data: v4(s.OutIP)},
+			&expr.Immediate{Register: 1, Data: v4(outIP)},
 			&expr.NAT{Type: expr.NATTypeSourceNAT, Family: unix.AF_INET,
 				RegAddrMin: 1, RegAddrMax: 1},
 		)

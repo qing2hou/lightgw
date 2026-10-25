@@ -61,6 +61,9 @@ type ForwardRule struct {
 	DstDenyList       string    `gorm:"type:text" json:"dst_deny_list"`                        // snat 目标黑名单（JSON 字符串数组；blacklist 模式生效）
 	SnatIP            string    `gorm:"size:64" json:"snat_ip"`                                // snat 规则显式出口源 IP；空 = 自动取出口网卡首 IPv4
 	DnatRejectMode    string    `gorm:"size:16;default:reject" json:"dnat_reject_mode"`        // dnat 规则后端不可达时对客户端行为（reject/timeout）
+	SnatMode          string    `gorm:"size:16;default:fixed" json:"snat_mode"`                // snat 源模式：fixed（单 IP）/ rotate（会话轮换）/ sticky（源粘滞）
+	SnatPool          string    `gorm:"type:text" json:"snat_pool"`                            // SNAT 源池（JSON IP 数组；rotate/sticky 模式）
+	EgressIDs         string    `gorm:"type:text" json:"egress_ids"`                           // 出口绑定（JSON 出口 ID 数组；空 = 全部出口）
 	EgressGw          string    `gorm:"size:64" json:"egress_gw"`                              // snat 出口网关（可选）
 	BWGroupID         uint      `gorm:"index;default:0" json:"bw_group_id"`                    // 所属带宽包 ID（成员关系）；0 = 独立行为（自身限速）
 	MinKBps           int64     `gorm:"column:min_kbps" json:"min_kbps"`                       // 入包时可设的保底带宽 KB/s（htb rate；闲时可借用至包总额 ceil）；独立规则忽略
@@ -74,6 +77,27 @@ type ForwardRule struct {
 	LastError         string    `gorm:"size:512" json:"last_error"` // 最近一次启动/应用失败原因，成功时清空
 	CreatedAt         time.Time `json:"created_at"`
 	UpdatedAt         time.Time `json:"updated_at"`
+}
+
+// Egress 出口（US4/US5）：网卡 + 网关 + 优先级（层：小者主）/ 层内权重 +
+// 探测配置。运行时状态（Up/时延/最近切换）为内存原子量不入库——重启后由
+// 立即探测恢复（healthz/observability 暴露）。
+type Egress struct {
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	Name        string    `gorm:"size:128;uniqueIndex" json:"name"`
+	Iface       string    `gorm:"size:64;index" json:"iface"`                // 出口网卡名
+	GatewayV4   string    `gorm:"size:64" json:"gateway_v4"`                 // v4 网关（空=无 v4）
+	GatewayV6   string    `gorm:"size:64" json:"gateway_v6"`                 // v6 网关（空=无 v6）
+	Priority    int       `gorm:"default:10" json:"priority"`                // 层：小者优先（主备）
+	Weight      int       `gorm:"default:1" json:"weight"`                   // 层内权重 1..100
+	ProbeMode   string    `gorm:"size:16;default:icmp-gw" json:"probe_mode"` // icmp-gw / icmp-target / tcp-target / none
+	ProbeTarget string    `gorm:"size:256" json:"probe_target"`              // 探测目标（icmp-target/tcp-target 必填；tcp 为 host:port）
+	IntervalSec int       `gorm:"default:3" json:"interval_sec"`
+	FailCount   int       `gorm:"default:2" json:"fail_count"` // 判 down 阈值
+	UpCount     int       `gorm:"default:2" json:"up_count"`   // 判回 up 阈值
+	Enabled     bool      `gorm:"default:true" json:"enabled"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 // FwPolicy 状态防火墙策略（US3）：有序规则列表，作用于全部穿越（snat）与

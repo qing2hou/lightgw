@@ -13,17 +13,17 @@ import (
 // Config 应用配置，来源于 config.yaml 与环境变量（HAWEB_ 前缀优先）。
 type Config struct {
 	Web struct {
-		Listen             string   `yaml:"listen"`               // Web 后台监听地址
-		DataDir            string   `yaml:"data_dir"`             // 数据目录（SQLite、JWT 密钥）
-		LogRetentionDays   int      `yaml:"log_retention_days"`   // 流量日志保留天数
-		LogMaxDiskMB       int      `yaml:"log_max_disk_mb"`      // 流量日志库文件轮转上限（MB）：超过自动淘汰最老日志；0 = 不限
+		Listen             string   `yaml:"listen"`                      // Web 后台监听地址
+		DataDir            string   `yaml:"data_dir"`                    // 数据目录（SQLite、JWT 密钥）
+		LogRetentionDays   int      `yaml:"log_retention_days"`          // 流量日志保留天数
+		LogMaxDiskMB       int      `yaml:"log_max_disk_mb"`             // 流量日志库文件轮转上限（MB）：超过自动淘汰最老日志；0 = 不限
 		LogDiskWatermarkPc int      `yaml:"log_disk_high_watermark_pct"` // 数据卷磁盘水位（%）：超过即紧急淘汰最老日志（兜底防打爆）；0 = 默认 90
-		AuditRetentionDays int      `yaml:"audit_retention_days"` // 审计日志保留天数，0 = 永久保留
-		CertFile           string   `yaml:"cert_file"`            // TLS 证书路径；与 key_file 同时配置时管理后台启用 HTTPS
-		KeyFile            string   `yaml:"key_file"`             // TLS 私钥路径
-		TrustedProxies     []string `yaml:"trusted_proxies"`      // 可信代理（IP/CIDR）；为空时不信任任何 X-Forwarded-For 头
-		HealthWebhookURL   string   `yaml:"health_webhook_url"`   // 后端健康状态翻转时的通知地址（POST JSON）；空 = 关闭
-		AllowInsecure      bool     `yaml:"allow_insecure"`       // 允许非回环监听 + 明文 HTTP（仅限隔离内网/临时调试，生产保持 false）
+		AuditRetentionDays int      `yaml:"audit_retention_days"`        // 审计日志保留天数，0 = 永久保留
+		CertFile           string   `yaml:"cert_file"`                   // TLS 证书路径；与 key_file 同时配置时管理后台启用 HTTPS
+		KeyFile            string   `yaml:"key_file"`                    // TLS 私钥路径
+		TrustedProxies     []string `yaml:"trusted_proxies"`             // 可信代理（IP/CIDR）；为空时不信任任何 X-Forwarded-For 头
+		HealthWebhookURL   string   `yaml:"health_webhook_url"`          // 后端健康状态翻转时的通知地址（POST JSON）；空 = 关闭
+		AllowInsecure      bool     `yaml:"allow_insecure"`              // 允许非回环监听 + 明文 HTTP（仅限隔离内网/临时调试，生产保持 false）
 	} `yaml:"web"`
 	// Tuning 转发面运行参数。所有时长/数量均支持 0 或特定值表达"禁用/不限"，
 	// 语义见各字段注释；负数一律启动报错。
@@ -50,8 +50,8 @@ func defaults() *Config {
 	c.Web.Listen = "127.0.0.1:8080"
 	c.Web.DataDir = "./data"
 	c.Web.LogRetentionDays = 30
-	c.Web.LogMaxDiskMB = 2048       // 开箱防打爆：流量日志库 2GB 自动轮转最老数据
-	c.Web.LogDiskWatermarkPc = 90   // 数据卷 90% 使用率紧急淘汰
+	c.Web.LogMaxDiskMB = 2048     // 开箱防打爆：流量日志库 2GB 自动轮转最老数据
+	c.Web.LogDiskWatermarkPc = 90 // 数据卷 90% 使用率紧急淘汰
 	c.Web.AuditRetentionDays = 90
 	c.Tuning.MaxGlobalConns = 0
 	c.Tuning.TCPIdleTimeoutSec = 900
@@ -127,20 +127,20 @@ func Load(path string) (*Config, error) {
 	}
 	// 其余数值型配置：非法值启动即失败，不静默忽略
 	envInts := map[string]*int{
-		"HAWEB_AUDIT_RETENTION_DAYS":      &c.Web.AuditRetentionDays,
-		"HAWEB_LOG_MAX_DISK_MB":           &c.Web.LogMaxDiskMB,
+		"HAWEB_AUDIT_RETENTION_DAYS":        &c.Web.AuditRetentionDays,
+		"HAWEB_LOG_MAX_DISK_MB":             &c.Web.LogMaxDiskMB,
 		"HAWEB_LOG_DISK_HIGH_WATERMARK_PCT": &c.Web.LogDiskWatermarkPc,
-		"HAWEB_MAX_GLOBAL_CONNS":          &c.Tuning.MaxGlobalConns,
-		"HAWEB_TCP_IDLE_TIMEOUT_SEC":      &c.Tuning.TCPIdleTimeoutSec,
-		"HAWEB_TCP_DIAL_TIMEOUT_SEC":      &c.Tuning.TCPDialTimeoutSec,
-		"HAWEB_UDP_SESSION_IDLE_SEC":      &c.Tuning.UDPSessionIdleSec,
-		"HAWEB_UDP_LIMITER_MAX_WAIT_MS":   &c.Tuning.UDPLimiterMaxWaitMs,
-		"HAWEB_BUFFER_SIZE":               &c.Tuning.BufferSize,
-		"HAWEB_DRAIN_TIMEOUT_SEC":         &c.Tuning.DrainTimeoutSec,
-		"HAWEB_HEALTH_CHECK_INTERVAL_SEC": &c.Tuning.HealthCheckIntervalSec,
-		"HAWEB_HEALTH_LOG_RETENTION_DAYS": &c.Tuning.HealthLogRetentionDays,
-		"HAWEB_GLOBAL_UPLOAD_KBPS":        &c.Tuning.GlobalUploadKBps,
-		"HAWEB_GLOBAL_DOWNLOAD_KBPS":      &c.Tuning.GlobalDownloadKBps,
+		"HAWEB_MAX_GLOBAL_CONNS":            &c.Tuning.MaxGlobalConns,
+		"HAWEB_TCP_IDLE_TIMEOUT_SEC":        &c.Tuning.TCPIdleTimeoutSec,
+		"HAWEB_TCP_DIAL_TIMEOUT_SEC":        &c.Tuning.TCPDialTimeoutSec,
+		"HAWEB_UDP_SESSION_IDLE_SEC":        &c.Tuning.UDPSessionIdleSec,
+		"HAWEB_UDP_LIMITER_MAX_WAIT_MS":     &c.Tuning.UDPLimiterMaxWaitMs,
+		"HAWEB_BUFFER_SIZE":                 &c.Tuning.BufferSize,
+		"HAWEB_DRAIN_TIMEOUT_SEC":           &c.Tuning.DrainTimeoutSec,
+		"HAWEB_HEALTH_CHECK_INTERVAL_SEC":   &c.Tuning.HealthCheckIntervalSec,
+		"HAWEB_HEALTH_LOG_RETENTION_DAYS":   &c.Tuning.HealthLogRetentionDays,
+		"HAWEB_GLOBAL_UPLOAD_KBPS":          &c.Tuning.GlobalUploadKBps,
+		"HAWEB_GLOBAL_DOWNLOAD_KBPS":        &c.Tuning.GlobalDownloadKBps,
 	}
 	for key, dst := range envInts {
 		if v := os.Getenv(key); v != "" {

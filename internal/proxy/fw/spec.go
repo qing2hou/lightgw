@@ -18,7 +18,8 @@ type Spec struct {
 	DstMode   string   // 目标名单模式 off/whitelist/blacklist
 	DstAllow  []string
 	DstDeny   []string
-	EgGw      string // 出口网关（M3 多出口预留；v1 由 Manager 侧装策略路由，本层不编译）
+	EgGw      string   // 出口网关（M3 多出口预留；v1 由 Manager 侧装策略路由，本层不编译）
+	Pool      []string // SNAT 源池（T207：rotate/sticky 按源确定性映射；空=fixed）
 }
 
 // PayloadOffsets IPv4 头内偏移（payload 表达式的物理事实，独立常量防魔法数）。
@@ -35,4 +36,11 @@ func v4(s string) net.IP {
 		return nil
 	}
 	return ip.To4()
+}
+
+// SnatPool 一条 snat 规则的源池（T207：rotate/sticky 模式下每源映射成员）。
+// 空 = fixed 单 IP 形态（OutIP）。
+type SnatPool struct {
+	Mode string   // fixed / rotate / sticky（v1 两者同为源确定性映射——语义修订记任务表）
+	IPs  []string // 池成员（≤32）
 }

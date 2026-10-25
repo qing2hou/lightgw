@@ -50,6 +50,10 @@ type Manager struct {
 	// 独立于 nftMu：探测/建连接不阻塞装载）
 	nftApplyMu sync.Mutex
 
+	// 出口探测循环（M3/T202）
+	egressDone      chan struct{}
+	egressStartOnce sync.Once
+
 	// 带宽包共享令牌桶（ADR-9：包ID -> Limiter；tcp/udp 成员规则注入；额度变更重建）
 	bwMu       sync.Mutex
 	bwLimiters map[uint]*ratelimit.Limiter
@@ -112,6 +116,7 @@ func NewManager(db *gorm.DB, tlog *trafficlog.Writer, webPort int, opts Options)
 		health:      map[uint]*ruleHealth{},
 		healthDone:  make(chan struct{}),
 		deniedLast:  map[string]time.Time{},
+		egressDone:  make(chan struct{}),
 	}
 	m.optsStore.Store(&opts)
 	m.globalLimiter.Store(ratelimit.New(opts.GlobalUploadKBps*1024, opts.GlobalDownloadKBps*1024))
@@ -307,6 +312,8 @@ func (m *Manager) StartAll() error {
 	if err := m.ReinstallPolicies(); err != nil {
 		logf("[fw-policy] 策略装载失败（不阻塞规则启动）: %v", err)
 	}
+	// 出口探测循环启动（M3/T202：先对全部启用出口做一轮首探——立即建立初态）
+	m.StartEgressProbing()
 	var rules []model.ForwardRule
 	if err := m.db.Where("enabled = ?", true).Find(&rules).Error; err != nil {
 		return err
@@ -759,4 +766,19 @@ func logf(format string, args ...any) {
 func (m *Manager) logPanic(where string, r any) {
 	m.panics.Add(1)
 	logf("[panic] %s 发生 panic（已隔离，进程继续运行）: %v\n%s", where, r, debug.Stack())
+}
+
+// StartEgressProbing 启动出口探测循环（main 启动序列一次；升级交接时由
+// 子进程重启循环——父进程的循环随退出终止）。
+func (m *Manager) StartEgressProbing() {
+	m.egressStartOnce.Do(func() { go m.egressProbeLoop() })
+}
+
+// StopEgressProbing 停止探测循环（优雅关闭路径）。
+func (m *Manager) StopEgressProbing() {
+	select {
+	case <-m.egressDone:
+	default:
+		close(m.egressDone)
+	}
 }

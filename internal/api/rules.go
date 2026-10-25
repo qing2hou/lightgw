@@ -30,6 +30,9 @@ type ruleInput struct {
 	DstDenyList       string `json:"dst_deny_list"`
 	SnatIP            string `json:"snat_ip"`
 	DnatRejectMode    string `json:"dnat_reject_mode"`
+	SnatMode          string `json:"snat_mode"`
+	SnatPool          string `json:"snat_pool"`
+	EgressIDs         string `json:"egress_ids"`
 	EgressGw          string `json:"egress_gw"`
 	MinKBps           int64  `json:"min_kbps"`
 	SourceIP          string `json:"source_ip"`
@@ -56,6 +59,9 @@ func (in *ruleInput) toRule() model.ForwardRule {
 		DstDenyList:       strings.TrimSpace(in.DstDenyList),
 		SnatIP:            strings.TrimSpace(in.SnatIP),
 		DnatRejectMode:    strings.TrimSpace(in.DnatRejectMode),
+		SnatMode:          strings.TrimSpace(in.SnatMode),
+		SnatPool:          strings.TrimSpace(in.SnatPool),
+		EgressIDs:         strings.TrimSpace(in.EgressIDs),
 		EgressGw:          strings.TrimSpace(in.EgressGw),
 		MinKBps:           in.MinKBps,
 		SourceIP:          strings.TrimSpace(in.SourceIP),
@@ -300,6 +306,57 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 						return fmt.Errorf("出口网关 %s 不在出口网卡 %s 的直连网段内（策略路由需同网段下一跳）", gw, strings.TrimSpace(in.TargetAddr))
 					}
 				}
+			}
+		}
+	}
+	// T207：SNAT 源模式与池校验（模式合法；池成员 1-32；成员须归属本机——
+	// 绑定多网卡时按规则出口网卡校验；rotate/sticky 模式下 SnatIP 不再单独生效）
+	switch mode := strings.TrimSpace(in.SnatMode); mode {
+	case "", "fixed":
+		if strings.TrimSpace(in.SnatPool) != "" {
+			return fmt.Errorf("fixed 模式不配置 snat_pool（单 IP 用 snat_ip）")
+		}
+	case "rotate", "sticky":
+		var members []string
+		if err := json.Unmarshal([]byte(strings.TrimSpace(in.SnatPool)), &members); err != nil {
+			return fmt.Errorf("snat_pool 必须是 JSON 字符串数组")
+		}
+		if len(members) < 1 || len(members) > 32 {
+			return fmt.Errorf("snat_pool 成员数 %d 越界（1-32）", len(members))
+		}
+		outIf := strings.TrimSpace(in.TargetAddr)
+		for _, m := range members {
+			m = strings.TrimSpace(m)
+			if net.ParseIP(m) == nil || net.ParseIP(m).To4() == nil {
+				return fmt.Errorf("snat_pool 成员 %q 不是合法 IPv4", m)
+			}
+			found := false
+			for _, v4 := range proxy.InterfaceIPv4s(outIf) {
+				if v4 == m {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("snat_pool 成员 %s 不在出口网卡 %s 的地址列表中", m, outIf)
+			}
+		}
+	default:
+		return fmt.Errorf("snat_mode 只能是 fixed / rotate / sticky")
+	}
+	// T201：出口绑定校验（egress_ids 引用的出口必须存在且启用）
+	if ids := strings.TrimSpace(in.EgressIDs); ids != "" {
+		var eids []uint
+		if err := json.Unmarshal([]byte(ids), &eids); err != nil {
+			return fmt.Errorf("egress_ids 必须是 JSON 数字数组")
+		}
+		for _, eid := range eids {
+			var eg model.Egress
+			if err := h.DB.First(&eg, eid).Error; err != nil {
+				return fmt.Errorf("egress_ids 引用了不存在的出口 #%d", eid)
+			}
+			if !eg.Enabled {
+				return fmt.Errorf("egress_ids 引用了未启用的出口[%s] #%d", eg.Name, eid)
 			}
 		}
 	}

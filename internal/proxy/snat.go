@@ -151,6 +151,23 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 			logf("规则[%s#%d] 引用的带宽包#%d 失效，按无限速处理", rule.Name, rule.ID, rule.BWGroupID)
 		}
 	}
+	// T207：SNAT 源池解析（rotate/sticky 模式；成员归属出口网卡在 API 层强校验，
+	// 引擎侧降级：非法成员剔除，全部非法则退回 fixed OutIP）
+	var pool []string
+	switch strings.TrimSpace(rule.SnatMode) {
+	case "rotate", "sticky":
+		var members []string
+		if b := strings.TrimSpace(rule.SnatPool); b != "" {
+			if err := jsonUnmarshalStrings(b, &members); err != nil {
+				logf("规则[%s#%d] SNAT 池解析失败，退回固定源: %v", rule.Name, rule.ID, err)
+			}
+		}
+		for _, m := range members {
+			if v4 := net.ParseIP(strings.TrimSpace(m)); v4 != nil && v4.To4() != nil {
+				pool = append(pool, strings.TrimSpace(m))
+			}
+		}
+	}
 	return &snatRuleSpec{
 		ID:           rule.ID,
 		IfIn:         rule.ListenAddr, // snat 行复用：listen_addr=入口网卡
@@ -285,20 +302,40 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		// 限速失败不阻塞主功能：iptables 已装好，限速降级（状态里留痕）
 		logf("规则[%s#%d] tc 入向限速未生效（降级为不限速）: %v", rule.Name, rule.ID, err)
 	}
-	// 出口策略路由（配置了出口网关时）：公网目标的出向决策强制走出口网卡
-	// T005/M6：ip rule/ip route 完全 netlink 化（无 iproute2 依赖）
-	if spec.EgressGw != "" {
-		spec.RtTable = m.snatAllocTable(rule.ID)
-		if conn, cerr := m.nftConn(); cerr == nil {
-			nexthops := []nft.Nexthop{{Iface: spec.IfOut, Gw: net.ParseIP(spec.EgressGw), Weight: 1}}
-			if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
-				// 路由失败不阻塞：转发规则仍生效（直连网段目标可达），公网目标需要网关配好
-				logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
-				spec.RtTable = 0
+	// 出口策略路由（M3/T203/T204 优先走出口实体多路决策；无出口绑定时回落
+	// 旧单网关形态——EgressGw 直配，兼容既有数据）：
+	//   有 Egress 实体且规则未显式绑出口 → 全部启用出口的最大可用层 multipath
+	//   规则显式绑 egress_ids → 绑定出口集的最大可用层
+	//   无出口实体且配置 EgressGw → 单网关（v1 形态）
+	{
+		boundIDs := egressIDsOfRule(rule)
+		var egCount int64
+		m.db.Model(&model.Egress{}).Where("enabled = ?", true).Count(&egCount)
+		hasEgressEntities := egCount > 0
+		if hasEgressEntities {
+			// 出口实体存在时统一走多出口模型（显式 EgressGw 仍优先直配？——
+			// 产品语义：EgressGw 是出口实体化之前的旧字段；出口实体在场时以实体为准
+			nexthops := m.egressNexthops(rule.ID, boundIDs)
+			if len(nexthops) > 0 {
+				spec.RtTable = m.snatAllocTable(rule.ID)
+				if conn, cerr := m.nftConn(); cerr == nil {
+					if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
+						logf("规则[%s#%d] 多出口路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
+						spec.RtTable = 0
+					}
+				}
+			} else {
+				logf("规则[%s#%d] 无可用出口（全部出口 down 或无绑定出口启用）——公网目标穿越不通", rule.Name, rule.ID)
 			}
-		} else {
-			logf("规则[%s#%d] 出口策略路由未生效（引擎连接失败）: %v", rule.Name, rule.ID, cerr)
-			spec.RtTable = 0
+		} else if strings.TrimSpace(rule.EgressGw) != "" {
+			spec.RtTable = m.snatAllocTable(rule.ID)
+			if conn, cerr := m.nftConn(); cerr == nil {
+				nexthops := []nft.Nexthop{{Iface: spec.IfOut, Gw: net.ParseIP(spec.EgressGw), Weight: 1}}
+				if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
+					logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
+					spec.RtTable = 0
+				}
+			}
 		}
 	}
 	m.statsFor(rule) // 建统计条目
@@ -325,6 +362,7 @@ func ensureIPForward() error {
 // snatRuleSpec 由 ForwardRule 展开出的 iptables 规则参数（校验已在前置完成）。
 type snatRuleSpec struct {
 	ID           uint
+	Pool         []string // SNAT 源池（T207；空 = fixed）
 	IfIn         string   // 入口网卡名
 	IfOut        string   // 出口网卡名
 	OutIP        string   // 出口网卡当前主 IP（SNAT 目标）
