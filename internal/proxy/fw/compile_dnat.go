@@ -147,3 +147,29 @@ func ParseAddrPort(s string) (string, int, error) {
 	}
 	return host, port, nil
 }
+
+// CompileDnatSilentDrop timeout 模式的"静默丢弃"行（评审 #9）：后端不可达
+// 时发布已卸载，SYN 进本机 INPUT 无监听会回 RST（=reject 表现）；timeout
+// 语义要求静默丢弃——在 input 方向补 drop 行让包被丢弃（客户端超时）。
+// 行形态：iif 任意、daddr=发布IP、dport=发布端口 → counter + drop。
+func CompileDnatSilentDrop(s DNatSpec) []Rule {
+	lip := v4(s.ListenIP)
+	if lip == nil {
+		return nil
+	}
+	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: nft.Table}
+	ud := nft.Comment(nft.KindDnatDrop, s.ID)
+	return []Rule{{
+		Chain: nft.ChainInput,
+		Rule: &nftables.Rule{Table: tbl, UserData: []byte(ud),
+			Exprs: []expr.Any{
+				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: lip},
+				&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: offDport, Len: 2},
+				&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(s.ListenPort))},
+				&expr.Counter{},
+				&expr.Verdict{Kind: expr.VerdictDrop},
+			},
+		},
+	}}
+}

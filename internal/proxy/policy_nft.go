@@ -34,9 +34,10 @@ func (m *Manager) buildPolicySpecs() ([]fw.PolicySpec, error) {
 	return specs, nil
 }
 
-// ReinstallPolicies 策略全段重装（单 batch：暂存拆全部 pol 标记行 → 暂存新行 →
-// 一次提交，无间隙窗口）。策略变更/启停/重排的统一入口（T107 热更——
-// established 会话由 pre_mark 打标短路，不受重装影响）。
+// ReinstallPolicies 策略段全量重装（评审 #1 修正：**与默认拒绝尾行同 batch 重建**，
+// 保证 fwd 链序恒为 [规则放行行…, 策略行…, deny 尾行]——AddCompiled 只有链尾
+// 追加，若只重装 pol 段，旧 deny 行会留在 pol 行之前，策略行被 deny 短路全部失效）。
+// 单 batch：暂存拆（pol 全标记 + deny 全标记）→ 暂存装（pol 行 → deny 行）→ 提交。
 func (m *Manager) ReinstallPolicies() error {
 	conn, err := m.nftConn()
 	if err != nil {
@@ -53,20 +54,24 @@ func (m *Manager) ReinstallPolicies() error {
 	if err != nil {
 		return err
 	}
-	// 单 batch：暂存拆旧行（全部 pol 标记）→ 暂存新行 → 一次提交。
-	// 拆旧行需逐 ID 暂存——PurgeByCommentNoFlush 一次一类；pol 的 ID 集合
-	// 从 DB + 内核标记对账取并集（避免 DB 已删的 ID 残留）。
+	// 暂存拆旧（失败 fail-fast——评审 #15：静默跳过会双份叠加+序错乱）
 	ids, err := conn.InstalledIDs()
-	if err == nil {
-		for id := range ids[nft.KindPolicy] {
-			if _, err := conn.PurgeByCommentNoFlush(nft.KindPolicy, id); err != nil {
-				return err
-			}
+	if err != nil {
+		return err
+	}
+	for id := range ids[nft.KindPolicy] {
+		if _, err := conn.PurgeByCommentNoFlush(nft.KindPolicy, id); err != nil {
+			return err
 		}
 	}
+	if _, err := conn.PurgeByCommentNoFlush(nft.KindDefaultDeny, 0); err != nil {
+		return err
+	}
+	// 暂存装：pol 行在前、deny 尾行在后（序就是链评估序）
 	for _, r := range rules {
 		conn.AddCompiled(r.Chain, r.Rule)
 	}
+	m.appendDefaultDenyNoFlush(conn)
 	return conn.FlushCommit()
 }
 
@@ -91,10 +96,17 @@ func (m *Manager) KillPolicySessions(p model.FwPolicy) int {
 		if !ok {
 			continue
 		}
+		// 评审 #14：本机自营连接护栏——orig 与 reply 双侧目标都是本机会话
+		// （管理面/后端连接）不掐断，防 any/any 空集策略削掉管理面
+		if m.isLocalSession(c) {
+			continue
+		}
 		if len(srcs) > 0 && !ipInList(c.origSrc, srcs) {
 			continue
 		}
-		if len(dsts) > 0 && !ipInList(c.origDst, dsts) {
+		// 评审 #13：dst 维度同时接受 orig.dst（真实目标）与 reply.src
+		// （dnat 会话的 reply 源=后端 IP——策略行在 fwd 匹配的是 DNAT 后目的）
+		if len(dsts) > 0 && !ipInList(c.origDst, dsts) && !ipInList(c.replySrc, dsts) {
 			continue
 		}
 		if p.Proto != "" && p.Proto != "any" && c.proto != strings.ToLower(p.Proto) {
@@ -224,27 +236,20 @@ func (m *Manager) SnapshotSessions() []CTSnapshot {
 			State:    stateOfConntrackLine(ln),
 		}
 		s.ID = encodeCTID(c)
+		// 归属判定（评审 Nit#22 简化，顺序判断）：
+		//   snat：reply.src = SNAT 出口 IP；dnat：orig.dst = 发布 IP
 		switch {
 		case snatOutIPs[c.replySrc] != "":
 			s.Router = snatOutIPs[c.replySrc]
-		case dnatListenIPs[replyDstIsClient(c)]: // dnat：orig.dst=发布IP
-			if dnatListenIPs[c.origDst] {
-				s.Router = "dnat:" + c.origDst
-			}
+		case dnatListenIPs[c.origDst]:
+			s.Router = "dnat:" + c.origDst
 		default:
-			if dnatListenIPs[c.origDst] {
-				s.Router = "dnat:" + c.origDst
-			} else {
-				s.Router = "other"
-			}
+			s.Router = "other"
 		}
 		out = append(out, s)
 	}
 	return out
 }
-
-// replyDstIsClient 占位（归属分支可读性；返回空串）。
-func replyDstIsClient(c *ctSession) string { return "" }
 
 // stateOfConntrackLine 从行内提取状态（ESTABLISHED/TIME_WAIT 等）。
 func stateOfConntrackLine(ln string) string {
@@ -286,4 +291,25 @@ func (m *Manager) KillSessionByID(id string) (int, error) {
 		return 1, nil
 	}
 	return 0, nil
+}
+
+// isLocalSession 本机自营会话判定（orig/reply 目标侧均落在本机地址上——
+// 管理面 Web/API、DB、后端探测连接；防策略掐断误杀管理面，评审 #14）。
+func (m *Manager) isLocalSession(c *ctSession) bool {
+	local := map[string]bool{}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok {
+				local[ipn.IP.String()] = true
+			}
+		}
+	}
+	// 会话的"目标侧"：orig.dst（客户端视角目标）与 reply.dst（服务端视角回程目标）。
+	// 双侧都是本机 = 本机发起且本机接收的自营连接
+	return local[c.origDst] && local[c.replyDst]
 }

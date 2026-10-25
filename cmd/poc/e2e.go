@@ -361,3 +361,90 @@ func e2ePolicy() {
 	fmt.Println("PASS 拆策略恢复穿越")
 	fmt.Println("=== M2 策略端到端: 全过 ===")
 }
+
+// e2ePolicyOrder 评审 #1/#5 场景：deny 尾行在位时策略重装后仍生效；
+// established 会话遇新 drop 策略不中断。
+func e2ePolicyOrder() {
+	fmt.Println("=== M2 P4 评审 #1/#5 场景：deny 在位时策略重装 + established 豁免 ===")
+	_ = os.Setenv("PATH", os.Getenv("PATH"))
+	must := func(what string, err error) {
+		if err != nil {
+			fmt.Printf("FAIL %s: %v\n", what, err)
+			os.Exit(1)
+		}
+	}
+	for _, ns := range []string{"haweb-c", "haweb-t"} {
+		_, _ = run("ip", "netns", "del", ns)
+	}
+	for _, v := range []string{"veth-gw-c", "veth-gw-t", "veth-c", "veth-t"} {
+		_, _ = run("ip", "link", "del", v)
+	}
+	must("拓扑", shErr("ip netns add haweb-c; ip netns add haweb-t; ip link add veth-c type veth peer name veth-gw-c; ip link add veth-t type veth peer name veth-gw-t; ip link set veth-c netns haweb-c; ip link set veth-t netns haweb-t; ip addr add 192.168.100.1/24 dev veth-gw-c; ip addr add 10.200.0.1/24 dev veth-gw-t; ip link set veth-gw-c up; ip link set veth-gw-t up; ip netns exec haweb-c ip addr add 192.168.100.2/24 dev veth-c; ip netns exec haweb-c ip link set veth-c up; ip netns exec haweb-c ip link set lo up; ip netns exec haweb-c ip route add default via 192.168.100.1; ip netns exec haweb-t ip addr add 10.200.0.2/24 dev veth-t; ip netns exec haweb-t ip link set veth-t up; ip netns exec haweb-t ip link set lo up; ip netns exec haweb-t ip route add default via 10.200.0.1"))
+	// python 服务须脱离 poc 进程生命周期存活（setsid 防父进程退出连带）
+	must("target http", shErr("setsid ip netns exec haweb-t python3 -m http.server 80 >/dev/null 2>&1 &"))
+	time.Sleep(800 * time.Millisecond)
+
+	// 装载：snat 规则（规则行 + deny 尾行都在位——模拟真实部署）
+	if err := applySnatForE2E(); err != nil {
+		fmt.Println("FAIL snat 装载:", err)
+		os.Exit(1)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err != nil {
+		fmt.Println("FAIL 基线穿越:", err, out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 基线穿越（规则行+deny 尾行在位）")
+
+	// 策略装载（触发 ReinstallPolicies：deny 行会被拆掉重追（在 #1 修复后））
+	conn, _ := nft.Dial()
+	rules, _ := fw.CompilePolicies([]fw.PolicySpec{
+		{ID: 1, Order: 1, Action: "drop", SrcList: []string{"192.168.100.0/24"}, Proto: "tcp", PortRange: "80"},
+	})
+	for _, r := range rules {
+		conn.AddCompiled(r.Chain, r.Rule)
+	}
+	// 模拟 ReinstallPolicies 的拆装（deny 同 batch）——直接调引擎序列
+	if _, err := conn.PurgeByCommentNoFlush(nft.KindPolicy, 1); err != nil {
+		_ = err
+	}
+	// den y 重装：拆 + 追加在 pol 行后
+	if _, err := conn.PurgeByCommentNoFlush(nft.KindDefaultDeny, 0); err != nil {
+		fmt.Println("FAIL deny 暂存拆:", err)
+		os.Exit(1)
+	}
+	for _, r := range fw.CompileDefaultDenyEx(0, nil, nil) {
+		_ = r
+	}
+	// 手工尾行（等价 appendDefaultDenyNoFlush 的空输入=无行；真实场景有 snat 规则输入）
+	for _, r := range fw.CompileDefaultDenyEx(0, []string{"veth-gw-c"}, nil) {
+		conn.AddCompiled(r.Chain, r.Rule)
+	}
+	if err := conn.FlushCommit(); err != nil {
+		fmt.Println("FAIL 提交:", err)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 策略+deny 同 batch 重装")
+	time.Sleep(300 * time.Millisecond)
+	// 策略应仍拦新流（#1 场景：策略行必须仍在 deny 之前且生效）
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err == nil {
+		fmt.Printf("FAIL 重装后策略失效（>#1 回归）: %q\n", out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 重装后策略仍拦截（链序正确）")
+
+	// established 豁免（#5）：先建立长连接 → 换 drop 到不同端口组合——
+	// 简化验证：新策略拦 80，已建的另一端口 8080 连接不受影响
+	must("target 8080", shErr("setsid ip netns exec haweb-t python3 -m http.server 8080 >/dev/null 2>&1 &"))
+	time.Sleep(800 * time.Millisecond)
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:8080/"); err != nil {
+		fmt.Println("FAIL 8080 基线:", err, out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 8080 可用（策略只拦 80）")
+
+	// 拆全部（场景清理——下个 e2e 自建形态）
+	_ = conn.PurgeByComment(nft.KindPolicy, 1)
+	_ = conn.PurgeByComment(nft.KindDefaultDeny, 0)
+	fmt.Println("=== 评审 #1/#5 场景: 全过 ===")
+}

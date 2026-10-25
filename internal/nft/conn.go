@@ -55,6 +55,8 @@ const (
 	ChainFwd = "fwd"
 	// ChainSrcNAT 源改写链（postrouting +100）：SNAT（固定/池）。
 	ChainSrcNAT = "srcnat"
+	// ChainInput 本机入向链（input +0；dnat timeout 模式的静默丢弃行）。
+	ChainInput = "input"
 )
 
 // EnsureTable 确保自有表与四条基础链在位（幂等：缺失补建，在位不动）。
@@ -75,6 +77,7 @@ func (n *Conn) EnsureTable() error {
 		{ChainDstNAT, nftables.ChainTypeNAT, *nftables.ChainHookPrerouting, *nftables.ChainPriorityNATDest},
 		{ChainFwd, nftables.ChainTypeFilter, *nftables.ChainHookForward, *nftables.ChainPriorityRef(-10)},
 		{ChainSrcNAT, nftables.ChainTypeNAT, *nftables.ChainHookPostrouting, *nftables.ChainPriorityNATSource},
+		{ChainInput, nftables.ChainTypeFilter, *nftables.ChainHookInput, *nftables.ChainPriorityFilter},
 	}
 	for _, bc := range baseChains {
 		hook, prio := bc.hook, bc.prio

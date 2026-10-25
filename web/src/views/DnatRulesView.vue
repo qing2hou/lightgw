@@ -90,7 +90,6 @@
         </el-form-item>
         <el-form-item label="发布地址" required>
           <el-select v-model="form.listen_ip" filterable placeholder="公网 IP（本机网卡上的地址）" style="width: 55%" class="mono-input">
-            <el-option v-for="i in ifaces" :key="i.name" :label="i.name" :value="i.name" :disabled="true" v-show="false" />
             <el-option v-for="ip in allIPs" :key="ip.ip" :value="ip.ip" :label="`${ip.ip}（${ip.iface}）`" />
           </el-select>
           <el-input-number v-model="form.listen_port" :min="1" :max="65535" placeholder="端口" style="width: 40%; margin-left: 5%" />
@@ -154,7 +153,7 @@ const form = ref(emptyForm())
 async function load() {
   loading.value = true
   try {
-    const res = await api.get('/rules', { params: { protocol: 'dnat', page: page.value, pageSize } })
+    const res = await api.get('/rules', { params: { protocol: 'dnat', page: page.value, page_size: pageSize } })
     rules.value = res.items || []
     total.value = res.total || 0
   } catch (e) {

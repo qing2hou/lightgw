@@ -83,7 +83,7 @@ func (n *Conn) PurgeByCommentNoFlush(kind string, id uint) (int, error) {
 // （错误路径：先提交已暂存部分再返回错误）。
 func (n *Conn) purgeByCommentTarget(target string) (int, error) {
 	removed := 0
-	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
+	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT, ChainInput} {
 		rules, err := n.rulesOf(chain)
 		if err == nil {
 			for _, r := range rules {
@@ -108,7 +108,7 @@ func (n *Conn) purgeByCommentTarget(target string) (int, error) {
 // InstalledIDs 列出自有表内已安装的 (kind, id) 集合（启动对账数据源）。
 func (n *Conn) InstalledIDs() (map[string]map[uint]bool, error) {
 	out := map[string]map[uint]bool{}
-	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
+	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT, ChainInput} {
 		rules, err := n.rulesOf(chain)
 		if err != nil {
 			return nil, err
@@ -159,7 +159,7 @@ func (n *Conn) CountersByComment() (*CountersByCommentResult, error) {
 	out := &CountersByCommentResult{
 		ByRule: map[string]CounterPair{},
 	}
-	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
+	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT, ChainInput} {
 		rules, err := n.rulesOf(chain)
 		if err != nil {
 			return nil, err
@@ -294,3 +294,6 @@ const KindDefaultDeny = "deny"
 // RulesOfForDebug/DelRuleForDebug 排查用钩子（cmd/vd；生产面禁用）。
 func (n *Conn) RulesOfForDebug(chain string) ([]*nftables.Rule, error) { return n.rulesOf(chain) }
 func (n *Conn) DelRuleForDebug(r *nftables.Rule) error                 { return n.c.DelRule(r) }
+
+// KindDnatDrop dnat timeout 模式的静默丢弃行（input 链；健康卸载时随装随拆）。
+const KindDnatDrop = "dnatdrop"

@@ -97,8 +97,12 @@ func (m *Manager) CheckBackendsNow() {
 		id   uint
 		rule model.ForwardRule
 	}
+	// 评审 #11：锁内只摘轻量快照（id + dnat 位），DB 查询与判定在锁外——
+	// 锁内做 IO 违反"阻塞操作不进锁"纪律
+	type dnatRef struct{ id uint }
+	var dnatRefs []dnatRef
 	m.mu.Lock()
-	items := make([]item, 0, len(m.tcpRules)+len(m.snatRules))
+	items := make([]item, 0, len(m.tcpRules))
 	for id, e := range m.tcpRules {
 		rule := e.cfg.Load().rule
 		if !healthCheckOn(rule) {
@@ -106,22 +110,23 @@ func (m *Manager) CheckBackendsNow() {
 		}
 		items = append(items, item{id: id, rule: rule})
 	}
-	// T104：dnat 规则的后端健康联动（后端=target_addr；探测协议 TCP——
-	// v1 发布仅 TCP/UDP，TCP 探测为通用近似，UDP 后端按 TCP 不通即 down）
 	for id, e := range m.snatRules {
-		if !e.dnat {
-			continue
+		if e.dnat {
+			dnatRefs = append(dnatRefs, dnatRef{id: id})
 		}
-		var rule model.ForwardRule
-		if err := m.db.First(&rule, id).Error; err != nil {
-			continue // 已删除——下一轮 startup 对账清
-		}
-		if !rule.Enabled {
-			continue
-		}
-		items = append(items, item{id: id, rule: rule})
 	}
 	m.mu.Unlock()
+	// T104：dnat 规则的后端健康联动（锁外查 DB + healthCheckOn 判定）
+	for _, ref := range dnatRefs {
+		var rule model.ForwardRule
+		if err := m.db.First(&rule, ref.id).Error; err != nil {
+			continue // 已删除——下一轮 startup 对账清
+		}
+		if !rule.Enabled || !healthCheckOn(rule) {
+			continue // 评审 #11：显式关闭检测的发布规则不探测不卸载
+		}
+		items = append(items, item{id: ref.id, rule: rule})
+	}
 
 	var wg sync.WaitGroup
 	for _, it := range items {

@@ -53,6 +53,10 @@ func main() {
 		e2ePolicy()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-e2e-policy-order" {
+		e2ePolicyOrder()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke-migrate" {
 		smokeMigrate()
 		return

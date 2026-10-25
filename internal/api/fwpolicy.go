@@ -78,7 +78,7 @@ func (h *handlers) createFwPolicy(c *gin.Context) {
 		Comment: strings.TrimSpace(in.Comment),
 	}
 	if err := h.DB.Create(&pol).Error; err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "创建策略", err)
 		return
 	}
 	h.applyFwPolicies(c, &pol, in.KillEstablished, fmt.Sprintf("创建策略[%s]（%s）", pol.Name, pol.Action))
@@ -111,7 +111,7 @@ func (h *handlers) updateFwPolicy(c *gin.Context) {
 	}
 	pol.Comment = strings.TrimSpace(in.Comment)
 	if err := h.DB.Save(&pol).Error; err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "保存策略", err)
 		return
 	}
 	h.applyFwPolicies(c, &pol, in.KillEstablished, fmt.Sprintf("更新策略[%s]（%s）", pol.Name, pol.Action))
@@ -125,11 +125,11 @@ func (h *handlers) deleteFwPolicy(c *gin.Context) {
 		return
 	}
 	if err := h.DB.Delete(&pol).Error; err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "删除策略", err)
 		return
 	}
 	if err := h.Mgr.ReinstallPolicies(); err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "删除后重装策略", err)
 		return
 	}
 	h.Audit.Record(h.username(c), "fw_policy_delete", fmt.Sprintf("删除策略[%s]", pol.Name), h.clientIP(c))
@@ -176,11 +176,11 @@ func (h *handlers) reorderFwPolicies(c *gin.Context) {
 		}
 		return nil
 	}); err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "删除后重装策略", err)
 		return
 	}
 	if err := h.Mgr.ReinstallPolicies(); err != nil {
-		h.serverError(c, "查询策略", err)
+		h.serverError(c, "重装策略", err)
 		return
 	}
 	h.Audit.Record(h.username(c), "fw_policy_reorder", fmt.Sprintf("策略新序: %v", in.OrderedIDs), h.clientIP(c))
@@ -252,7 +252,8 @@ func validateFwPolicy(in *fwPolicyInput) error {
 	return nil
 }
 
-// validateIPListJSON JSON 字符串数组 + 每条 IP/CIDR 校验（空串合法=任意）。
+// validateIPListJSON JSON 字符串数组 + 每条 IPv4/CIDR 校验（空串合法=任意；
+// v6 支持在 M3/T210——评审 #8：v6 进编译层会产出畸形规则）。
 func validateIPListJSON(s, field string) error {
 	s = strings.TrimSpace(s)
 	if s == "" {
@@ -263,11 +264,13 @@ func validateIPListJSON(s, field string) error {
 		return fmt.Errorf("%s 必须是 JSON 字符串数组: %w", field, err)
 	}
 	for _, e := range entries {
-		if net.ParseIP(e) == nil {
-			if _, _, err := net.ParseCIDR(e); err != nil {
-				return fmt.Errorf("%s 条目 %q 不是合法的 IP 或网段", field, e)
-			}
+		if ip := net.ParseIP(e); ip != nil && ip.To4() != nil {
+			continue
 		}
+		if _, ipn, err := net.ParseCIDR(e); err == nil && ipn.IP.To4() != nil {
+			continue
+		}
+		return fmt.Errorf("%s 条目 %q 不是合法的 IPv4 或 v4 网段（v6 支持将在后续版本提供）", field, e)
 	}
 	return nil
 }

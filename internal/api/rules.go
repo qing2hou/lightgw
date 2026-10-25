@@ -197,6 +197,11 @@ func (h *handlers) validateDnat(in *ruleInput) error {
 	if strings.TrimSpace(in.EgressGw) != "" || strings.TrimSpace(in.SnatIP) != "" {
 		return fmt.Errorf("dnat 规则不支持出口网关/SNAT 源（出口语义，仅 snat 规则可用）")
 	}
+	// 评审 #6：dnat 仅支持白名单语义——blacklist 会被引擎静默丢弃变"全放行"
+	// （安全反转），创建即拒绝
+	if in.AclMode == model.AclModeBlacklist {
+		return fmt.Errorf("dnat 规则不支持黑名单模式（仅 off / whitelist），黑名单语义不适用于端口发布")
+	}
 	switch strings.TrimSpace(in.DnatRejectMode) {
 	case "", model.DnatRejectModeReject, model.DnatRejectModeTimeout:
 	default:
@@ -459,6 +464,16 @@ func (h *handlers) checkConflict(rule model.ForwardRule) error {
 	for _, o := range others {
 		_, oPort, _ := net.SplitHostPort(o.ListenAddr)
 		if oPort != portStr {
+			continue
+		}
+		// 评审 #10：dnat 的发布地址是完整 IP:端口——同端口不同 IP（一卡多址）
+		// 不冲突；同 IP:端口 无论协议（都吃进本机 INPUT/DNAT）冲突
+		if rule.Protocol == model.ProtocolDNAT || o.Protocol == model.ProtocolDNAT {
+			if strings.EqualFold(strings.TrimSpace(o.ListenAddr), strings.TrimSpace(rule.ListenAddr)) &&
+				(o.Protocol == model.ProtocolDNAT && rule.Protocol == model.ProtocolDNAT ||
+					o.Protocol == rule.Protocol) {
+				return fmt.Errorf("发布地址 %s 已被规则[%s]占用", rule.ListenAddr, o.Name)
+			}
 			continue
 		}
 		if o.Protocol == rule.Protocol {

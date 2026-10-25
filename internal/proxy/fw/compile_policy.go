@@ -63,21 +63,38 @@ func CompilePolicies(ps []PolicySpec) ([]Rule, error) {
 
 // compilePolicyRow 单行策略编译（已展开：每条件至多一条目）。
 func compilePolicyRow(tbl *nftables.Table, p PolicySpec) (Rule, error) {
-	{
-		exprs, err := policyMatchExprs(p)
-		if err != nil {
-			return Rule{}, err
-		}
-		ud := nft.Comment(nft.KindPolicy, p.ID)
-		if p.Action == "drop" {
-			exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
-		} else {
-			// accept：打标放行（counter + mark；不终结——链尾默认拒绝兜底 AND 语义）
-			exprs = withCounterMark(exprs)
-		}
-		return Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
-			Table: tbl, UserData: []byte(ud), Exprs: exprs,
-		}}, nil
+	exprs, err := policyMatchExprs(p)
+	if err != nil {
+		return Rule{}, err
+	}
+	ud := nft.Comment(nft.KindPolicy, p.ID)
+	if p.Action == "drop" {
+		exprs = append(newFlowGuard(), exprs...)
+		exprs = append(exprs, &expr.Counter{}, &expr.Verdict{Kind: expr.VerdictDrop})
+	} else {
+		// accept：打策略位标记（bit1，计数+可观测；**不豁免规则白名单**——
+		// 默认拒绝行只查规则位 bit0，策略放行与规则白名单 AND 语义，评审 #2）
+		exprs = append(newFlowGuard(), exprs...)
+		exprs = append(exprs, &expr.Counter{})
+		exprs = append(exprs, nft.SetMarkExprs(nft.MarkPolicyOK)...)
+	}
+	return Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
+		Table: tbl, UserData: []byte(ud), Exprs: exprs,
+	}}, nil
+}
+
+// newFlowGuard 仅新建流进行策略评估（评审 #5：ct state established,related 的
+// 会话——含回程反向包——不重复评估策略）。实现为正向白名单匹配
+// state ∈ {new, invalid, untracked}（nftables 无行内 NOT）：
+// established/related 包不命中本行 → 评估继续到下一规则（规则行/deny 行）。
+func newFlowGuard() []expr.Any {
+	return []expr.Any{
+		&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+			Mask: binaryutil.NativeEndian.PutUint32(
+				expr.CtStateBitNEW | expr.CtStateBitINVALID | expr.CtStateBitUNTRACKED),
+			Xor: binaryutil.NativeEndian.PutUint32(0)},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
 	}
 }
 
@@ -178,6 +195,10 @@ func parsePortGroups(s string) ([][]expr.Any, error) {
 
 // ExpandPolicySpec 多条目策略的笛卡尔展开（src×dst×port 单条件行集，OR 语义）。
 // 展开后的每一行 Spec 单独编译；它们的 Order/ID 相同（同策略，计数各行合计）。
+// MaxPolicyExpansion 单策略展开行数上限（PRD 边界"规则数上限默认 1000"的
+// 单策略切片；超限编译报错——评审 #16）。
+const MaxPolicyExpansion = 256
+
 func ExpandPolicySpec(p PolicySpec) ([]PolicySpec, error) {
 	srcs := p.SrcList
 	if len(srcs) == 0 {
@@ -190,6 +211,10 @@ func ExpandPolicySpec(p PolicySpec) ([]PolicySpec, error) {
 	portGroups, err := parsePortGroups(p.PortRange)
 	if err != nil {
 		return nil, err
+	}
+	if len(srcs)*len(dsts)*max(1, len(portGroups)) > MaxPolicyExpansion {
+		return nil, fmt.Errorf("策略条件展开行数 %d 超上限 %d（请缩小来源/目标/端口列表）",
+			len(srcs)*len(dsts)*max(1, len(portGroups)), MaxPolicyExpansion)
 	}
 	var out []PolicySpec
 	for _, s := range srcs {
@@ -206,7 +231,7 @@ func ExpandPolicySpec(p PolicySpec) ([]PolicySpec, error) {
 				n.DstList = nil
 			}
 			// 端口维度：每组一行（把 PortRange 重写为单组形态的串——编译层
-			// parsePortGroups 再解析一次；省 структура 改动，直接传 spec 串）
+			// parsePortGroups 再解析一次；直接传单组串省结构改动）
 			if len(portGroups) <= 1 {
 				out = append(out, n)
 				continue

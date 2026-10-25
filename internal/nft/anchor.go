@@ -6,8 +6,14 @@ import (
 	"github.com/google/nftables/expr"
 )
 
-// MarkFwdOK 放行标记位（fwmark bit0；位段规划见 design-fwgateway.md ADR-11）。
-const MarkFwdOK uint32 = 0x1
+// fwmark 位段（design-fwgateway.md ADR-11）：
+const (
+	// MarkFwdOK bit0：规则放行位（snat/dnat 规则白名单命中；默认拒绝尾行只查它）
+	MarkFwdOK uint32 = 0x1
+	// MarkPolicyOK bit1：策略放行位（accept 策略命中——仅计数/标记用途，
+	// 不参与默认拒绝判定：策略 accept 不豁免规则白名单，AND 语义——评审 #2）
+	MarkPolicyOK uint32 = 0x2
+)
 
 // anchorExprs 锚点规则表达式：meta mark & 0x1 == 0x1 → accept。
 // 形态与 PoC #7 位测试一致（load → Bitwise AND → Cmp neq 0 → Accept）。

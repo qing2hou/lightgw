@@ -81,19 +81,16 @@ func (m *Manager) applyDNAT(rule model.ForwardRule) error {
 		}
 	}
 
-	// 拆旧（snat 注册表共用 + nft 标记盲拆）
+	// 拆旧（注册表注销 + 两个 kind 标记盲拆——KindSNAT 复用是协议切换
+	// 场景的兜底：从 snat 改成 dnat 时旧 KindSNAT 行残留）
 	m.mu.Lock()
-	old, hadOld := m.snatRules[rule.ID]
-	if hadOld || !rule.Enabled {
+	if _, hadOld := m.snatRules[rule.ID]; hadOld || !rule.Enabled {
 		delete(m.snatRules, rule.ID)
 	}
 	m.mu.Unlock()
-	if old != nil {
-		s := old.spec()
-		_ = s
-	}
-	m.teardownSnatNFT(rule.ID) // 复用：按 KindSNAT 拆——注意 dnat 规则的标记是 KindDNAT
+	m.teardownSnatNFT(rule.ID)
 	m.teardownDNATNFT(rule.ID)
+	m.teardownDnatSilentDrop(rule.ID)
 	if !rule.Enabled {
 		m.killDNATSessions(spec)
 		return nil
@@ -214,13 +211,56 @@ func ipBelongsLocally(ip string) bool {
 // 重装=重新走 applyDNAT（校验+装载+统计）。
 func (m *Manager) dnatHealthToggle(rule model.ForwardRule, up bool) {
 	if up {
+		// 评审 #3：不能走 applyDNAT 快路径——健康卸载只拆了内核行、注册表
+		// 条目仍在，sameForwarding 恒真会直接 return（发布永不重装）。
+		// 恢复=强制拆除（含注册表 + timeout 静默丢弃行）后全量重装。
+		spec := m.buildDNATSpec(rule)
+		m.mu.Lock()
+		delete(m.snatRules, rule.ID)
+		m.mu.Unlock()
+		m.teardownDnatSilentDrop(spec.ID)
 		if err := m.applyDNAT(rule); err != nil {
 			logf("规则[%s#%d] 后端恢复但发布重装失败: %v", rule.Name, rule.ID, err)
-		} else {
-			logf("规则[%s#%d] 后端恢复，发布已重新装载", rule.Name, rule.ID)
+			return
 		}
+		logf("规则[%s#%d] 后端恢复，发布已重新装载", rule.Name, rule.ID)
+		_ = spec
 		return
 	}
+	m.mu.Lock()
+	delete(m.snatRules, rule.ID) // down 时同步注销（评审 #3：up 侧 sameForwarding 判定的前提）
+	m.mu.Unlock()
 	m.teardownDNATNFT(rule.ID)
+	// 评审 #9：timeout 模式的静默丢弃——发布卸载后 SYN 进 INPUT 会回 RST
+	// （=reject 表现）；timeout 语义要求丢弃，补 input 方向 drop 行
+	spec := m.buildDNATSpec(rule)
+	if spec.RejectMode == model.DnatRejectModeTimeout {
+		if conn, err := m.nftConn(); err == nil {
+			m.nftApplyMu.Lock()
+			dropRules := fw.CompileDnatSilentDrop(*spec)
+			for _, r := range dropRules {
+				conn.AddCompiled(r.Chain, r.Rule)
+			}
+			if err := conn.FlushCommit(); err != nil {
+				logf("规则[%s#%d] timeout 模式静默丢弃行装载失败: %v", rule.Name, rule.ID, err)
+			}
+			m.nftApplyMu.Unlock()
+		}
+	}
 	logf("规则[%s#%d] 后端不可达，发布已卸载（存量客户端会话随 conntrack 老化）", rule.Name, rule.ID)
+}
+
+// teardownDnatSilentDrop 拆 timeout 模式静默丢弃行（按 KindDnatDrop 标记）。
+func (m *Manager) teardownDnatSilentDrop(ruleID uint) {
+	m.nftApplyMu.Lock()
+	defer m.nftApplyMu.Unlock()
+	m.nftMu.Lock()
+	conn := m.nft
+	m.nftMu.Unlock()
+	if conn == nil {
+		return
+	}
+	if err := conn.PurgeByComment(nft.KindDnatDrop, ruleID); err != nil {
+		logf("规则#%d 静默丢弃行拆除失败: %v", ruleID, err)
+	}
 }

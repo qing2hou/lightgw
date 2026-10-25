@@ -176,7 +176,7 @@ async function save() {
 
 async function toggle(row, v) {
   try {
-    await api.put(`/fw-policies/${row.id}`, { enabled: v, name: row.name, action: row.action, proto: row.proto, port_range: row.port_range, src_list: JSON.stringify(row.src_list || []), dst_list: JSON.stringify(row.dst_list || []) })
+    await api.put(`/fw-policies/${row.id}`, { enabled: v, name: row.name, action: row.action, proto: row.proto, port_range: row.port_range, comment: row.comment || '', src_list: JSON.stringify(row.src_list || []), dst_list: JSON.stringify(row.dst_list || []) })
     row.enabled = v
     load()
   } catch (e) {

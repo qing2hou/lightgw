@@ -162,6 +162,46 @@ func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 	}
 }
 
+// appendDefaultDenyNoFlush 默认拒绝尾行的集计算 + 暂存追加（不提交、不拆旧——
+// 调用方在同 batch 中控制顺序：先暂存拆旧，再追加本函数的行，最后 FlushCommit）。
+// deny 行必须保持在 fwd 链尾（fwd 链追加序 = 评估序；deny 是终结行，
+// 排在其他行前面会把后续行全部短路——评审 #1）。
+func (m *Manager) appendDefaultDenyNoFlush(conn *nft.Conn) {
+	var rules []model.ForwardRule
+	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
+		return // DB 读失败：不动 deny 形态（保守——拆了装不回=漏拒绝）
+	}
+	seen := map[string]bool{}
+	ifaces := make([]string, 0, len(rules))
+	dnatBackends := make([]string, 0, len(rules))
+	denied := false
+	for _, r := range rules {
+		if r.Protocol == model.ProtocolDNAT {
+			if bip, _, ok := splitHostPortOK(r.TargetAddr); ok && !seen["b:"+bip] {
+				seen["b:"+bip] = true
+				dnatBackends = append(dnatBackends, bip)
+			}
+			denied = true
+			continue
+		}
+		if !seen[r.ListenAddr] {
+			seen[r.ListenAddr] = true
+			ifaces = append(ifaces, r.ListenAddr)
+		}
+		if r.AclMode == model.AclModeWhitelist ||
+			(r.DstAclMode == model.AclModeWhitelist && len(parseIPListOrEmpty(r.DstAllowList)) > 0) ||
+			(r.DstAclMode == model.AclModeBlacklist && len(parseIPListOrEmpty(r.DstDenyList)) > 0) {
+			denied = true
+		}
+	}
+	if !denied {
+		return
+	}
+	for _, r := range fw.CompileDefaultDenyEx(0, ifaces, dnatBackends) {
+		conn.AddCompiled(r.Chain, r.Rule)
+	}
+}
+
 // migrateLegacyIPTables 启动迁移（T006）：经 netlink 拆除全部旧 haweb-sn:
 // iptables 形态。连接失败（无权限/无内核 nftables）返回错误由调用方降级。
 func (m *Manager) migrateLegacyIPTables() (int, error) {
@@ -192,18 +232,21 @@ func (m *Manager) purgeOrphanNFTRules() {
 	}
 	live := map[uint]bool{}
 	var rules []model.ForwardRule
-	m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules)
+	m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules)
 	for _, r := range rules {
 		live[r.ID] = true
 	}
-	ids := installed[nft.KindSNAT]
 	var purged []uint
-	for id := range ids {
-		if live[id] {
-			continue
-		}
-		if err := conn.PurgeByComment(nft.KindSNAT, id); err == nil {
-			purged = append(purged, id)
+	// 评审 #7：两个 kind 都对账（dnat 孤儿残留=发布地址流量被永久改写到
+	// 已删除的后端）
+	for _, kind := range []string{nft.KindSNAT, nft.KindDNAT} {
+		for id := range installed[kind] {
+			if live[id] {
+				continue
+			}
+			if err := conn.PurgeByComment(kind, id); err == nil {
+				purged = append(purged, id)
+			}
 		}
 	}
 	if len(purged) > 0 {
