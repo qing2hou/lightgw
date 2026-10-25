@@ -14,15 +14,15 @@
 
 ## M2 DNAT + 状态策略（US2、US3）
 
-- [ ] T101 [US2] DNAT 规则形态：规则模型、API 契约、前端表单（协议 dnat）（depends: M1 全部）
-- [ ] T102 [US2] DNAT 内核规则编译：PREROUTING preroute 链 DNAT/FORWARD 放行/回程 conntrack，含源名单与计数（depends: T101, T003）
-- [ ] T103 [US2] DNAT 会话掐断（停用/删除即断存量）与拒绝模式（拒绝/超时可配）（depends: T102）
-- [ ] T104 [US2] DNAT 与后端健康检查联动（复用 health；不可达时拒绝新建）（depends: T102）
-- [ ] T105 [US3] 策略（ACL）实体：有序规则模型、字段校验、审计联动（depends: M1 全部）[P]
-- [ ] T106 [US3] 策略内核编译：有序链、默认拒绝、established/related 放行、命中计数（depends: T105, T003）
-- [ ] T107 [US3] 策略变更热更新（不中断既有转发）与"新增拒绝立即掐断"选项（depends: T106）
-- [ ] T108 [US3] 策略命中计数与趋势（Web 可视化：每规则包/字节计数、最近命中）（depends: T107）
-- [ ] T109 [US3] 会话可视化：conntrack 表 netlink 读取 → live 会话列表 API + 前端页（depends: T002）[P]
+- [x] T101 [US2] DNAT 规则形态：规则模型、API 契约、前端表单（协议 dnat）（depends: M1 全部）
+- [x] T102 [US2] DNAT 内核规则编译：PREROUTING preroute 链 DNAT/FORWARD 放行/回程 conntrack，含源名单与计数（depends: T101, T003）
+- [x] T103 [US2] DNAT 会话掐断（停用/删除即断存量）与拒绝模式（拒绝/超时可配）（depends: T102）
+- [x] T104 [US2] DNAT 与后端健康检查联动（复用 health；不可达时拒绝新建）（depends: T102）
+- [x] T105 [US3] 策略（ACL）实体：有序规则模型、字段校验、审计联动（depends: M1 全部）[P]
+- [x] T106 [US3] 策略内核编译：有序链、默认拒绝、established/related 放行、命中计数（depends: T105, T003）
+- [x] T107 [US3] 策略变更热更新（不中断既有转发）与"新增拒绝立即掐断"选项（depends: T106）
+- [x] T108 [US3] 策略命中计数与趋势（Web 可视化：每规则包/字节计数、最近命中）（depends: T107）
+- [x] T109 [US3] 会话可视化：conntrack 表 netlink 读取 → live 会话列表 API + 前端页（depends: T002）[P]
 
 ## M3 多出口 + SNAT 池 + 双栈（US4–US7）
 
