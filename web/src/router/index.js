@@ -15,6 +15,7 @@ const routes = [
       { path: 'dashboard', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '总览' } },
       { path: 'rules', name: 'rules', component: () => import('../views/RulesView.vue'), meta: { title: '端口映射' } },
       { path: 'snat-rules', name: 'snat-rules', component: () => import('../views/SnatRulesView.vue'), meta: { title: 'SNAT 穿越' } },
+      { path: 'egresses', name: 'egresses', component: () => import('../views/EgressesView.vue'), meta: { title: '出口管理' } },
       { path: 'dnat-rules', name: 'dnat-rules', component: () => import('../views/DnatRulesView.vue'), meta: { title: '端口发布' } },
       { path: 'fw-policies', name: 'fw-policies', component: () => import('../views/FwPoliciesView.vue'), meta: { title: '防火墙策略' } },
       { path: 'sessions', name: 'sessions', component: () => import('../views/SessionsView.vue'), meta: { title: '会话表' } },
