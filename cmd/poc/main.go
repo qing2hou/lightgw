@@ -57,6 +57,10 @@ func main() {
 		e2ePolicyOrder()
 		return
 	}
+	if len(os.Args) > 1 && os.Args[1] == "-e2e-kill" {
+		e2eKillEstablished()
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "-smoke-migrate" {
 		smokeMigrate()
 		return

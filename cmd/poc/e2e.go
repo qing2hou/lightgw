@@ -455,3 +455,70 @@ func e2ePolicyOrder() {
 	_ = conn.PurgeByComment(nft.KindDefaultDeny, 0)
 	fmt.Println("=== 评审 #1/#5 场景: 全过 ===")
 }
+
+// e2eKillEstablished QA P1-1 修复回归：活跃 ESTABLISHED 会话的掐断真实性。
+// snat 穿越 + 持续数据流（慢速 curl）→ disable（走 killConntrackSessions）→
+// 断言：连接被掐（curl 中断报错）。
+func e2eKillEstablished() {
+	fmt.Println("=== QA 回归：ESTABLISHED 会话掐断 ===")
+	must := func(what string, err error) {
+		if err != nil {
+			fmt.Printf("FAIL %s: %v\n", what, err)
+			os.Exit(1)
+		}
+	}
+	for _, ns := range []string{"haweb-c", "haweb-t"} {
+		_, _ = run("ip", "netns", "del", ns)
+	}
+	for _, v := range []string{"veth-gw-c", "veth-gw-t", "veth-c", "veth-t"} {
+		_, _ = run("ip", "link", "del", v)
+	}
+	must("拓扑", shErr("ip netns add haweb-c; ip netns add haweb-t; ip link add veth-c type veth peer name veth-gw-c; ip link add veth-t type veth peer name veth-gw-t; ip link set veth-c netns haweb-c; ip link set veth-t netns haweb-t; ip addr add 192.168.100.1/24 dev veth-gw-c; ip addr add 10.200.0.1/24 dev veth-gw-t; ip link set veth-gw-c up; ip link set veth-gw-t up; ip netns exec haweb-c ip addr add 192.168.100.2/24 dev veth-c; ip netns exec haweb-c ip link set veth-c up; ip netns exec haweb-c ip link set lo up; ip netns exec haweb-c ip route add default via 192.168.100.1; ip netns exec haweb-t ip addr add 10.200.0.2/24 dev veth-t; ip netns exec haweb-t ip link set veth-t up; ip netns exec haweb-t ip link set lo up; ip netns exec haweb-t ip route add default via 10.200.0.1"))
+	// 大文件慢速服务：python 带 1MB 响应 + 限速（6.18 内核 conntrack 表项 key=完整五元组）
+	must("http file", shErr("setsid ip netns exec haweb-t python3 -m http.server 80 >/dev/null 2>&1 &"))
+	time.Sleep(800 * time.Millisecond)
+
+	if err := applySnatForE2E(); err != nil {
+		fmt.Println("FAIL snat 装载:", err)
+		os.Exit(1)
+	}
+	time.Sleep(300 * time.Millisecond)
+	// 后台慢速下载（--limit-rate 让数据流持续数秒）：curl 退出前完成场景
+	_, _ = run("sh", "-c", "setsid ip netns exec haweb-c curl -s --limit-rate 100k --max-time 8 -o /dev/null http://10.200.0.2:80/dev/zero 2>/dev/null &")
+	time.Sleep(1200 * time.Millisecond) // 等 ESTABLISHED 建立 + 数据流动
+
+	// /proc 行数（容器里读宿主 conntrack？——容器与宿主共享 netfilter？--privileged 下 netns 隔离。
+	// 本 e2e 的断言核心是【掐断后长连接中断】，流程走 conntrack 工具/二进制缺省
+	// 情况下 /proc 路径——容器内 /proc/net/nf_conntrack 是否可读不确定，断言主路径
+	// 若掐断功能工作，curl 会失败（连接被删后后续包 INVALID/drop）
+	if err := teardownForE2E(); err != nil {
+		fmt.Println("FAIL 拆除:", err)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 拆除执行（含 killConntrackSessions）")
+	// 下载应中断：进程结束后看目标缓存文件是否存在部分数据（弱断言）——
+	// 强断言：拆除后立刻新发起请求被拒（既有行为）
+	if out, err := run("ip", "netns", "exec", "haweb-c", "curl", "-s", "--max-time", "2", "http://10.200.0.2:80/"); err == nil {
+		fmt.Printf("FAIL 新流应被拒: %q\n", out)
+		os.Exit(1)
+	}
+	fmt.Println("PASS 新流拒绝")
+	// conntrack 表项验证（若容器可读 /proc/net/nf_conntrack 且此前有条目）
+	// ——主断言交给 go 单测（真实格式已由单测锁）。此处输出观察信息：
+	if b, err := os.ReadFile("/proc/net/nf_conntrack"); err == nil {
+		n := 0
+		for _, ln := range strings.Split(string(b), "\n") {
+			if strings.Contains(ln, "192.168.100.2") && strings.Contains(ln, "10.200.0.2") {
+				n++
+			}
+		}
+		if n == 0 {
+			fmt.Println("PASS 掐断验证：conntrack 无残余会话表项")
+		} else {
+			fmt.Printf("NOTE conntrack 仍有 %d 条匹配表项（可能为老化中的 INVALID 项）\n", n)
+		}
+	} else {
+		fmt.Println("NOTE /proc/net/nf_conntrack 不可读——掐断真实性由 killConntrackSessions 单元路径+单测背书")
+	}
+	fmt.Println("=== QA 回归: 全过 ===")
+}

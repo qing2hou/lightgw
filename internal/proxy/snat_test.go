@@ -468,3 +468,37 @@ func TestSnatSpecExplicitIP(t *testing.T) {
 		t.Fatalf("不存在的出口网卡自动档应为空串: %q", s2.OutIP)
 	}
 }
+
+// TestReadConntrackTableNewKernelFormat QA P1-1 回归：新内核（6.x，实测 6.18）
+// 的 /proc/net/nf_conntrack 带 L3 层名前缀（ipv4 2 tcp 6 ...），老过滤
+// HasPrefix("tcp ") 恒不匹配 → 表恒空（会话表/停用掐断/kill_established 全废）。
+func TestReadConntrackTableNewKernelFormat(t *testing.T) {
+	oldRead := osReadFile
+	defer func() { osReadFile = oldRead }()
+	osReadFile = func(name string) ([]byte, error) {
+		return []byte("ipv4     2 tcp      6 431999 ESTABLISHED src=192.168.100.2 dst=10.200.0.1 sport=56386 dport=80 src=10.200.0.2 dst=192.168.100.2 sport=80 dport=56386 [ASSURED] mark=0 use=2\n" +
+			"ipv4     2 udp      17 30 src=192.168.100.2 dst=8.8.8.8 sport=5353 dport=53 src=8.8.8.8 dst=10.200.0.1 sport=53 dport=5353 mark=0 use=2\n" +
+			"ipv4     2 icmp     1 29 src=192.168.100.2 dst=10.200.0.2 type=8 code=0 id=718 src=10.200.0.2 dst=10.200.0.1 type=0 code=0 id=718 mark=0 use=1\n" +
+			"tcp 6 431997 ESTABLISHED src=192.168.100.3 dst=10.200.0.1 sport=40000 dport=443 src=10.200.0.2 dst=192.168.100.3 sport=443 dport=40000 [ASSURED] mark=0 use=1\n"), nil
+	}
+	lines := readConntrackTable()
+	if len(lines) != 3 {
+		t.Fatalf("新旧双格式共应解析出 3 条 tcp/udp 表项，得到 %d: %v", len(lines), lines)
+	}
+	for i, want := range []string{"tcp", "udp", "tcp"} {
+		if !strings.HasPrefix(lines[i], want+" ") {
+			t.Fatalf("第 %d 行应以 %s 开头（归一化后）: %q", i, want, lines[i])
+		}
+	}
+	// icmp 行被跳过（v1 会话掐断仅 tcp/udp 语义）
+	for _, ln := range lines {
+		if strings.Contains(ln, "icmp") {
+			t.Fatalf("icmp 行不应进入会话表: %q", ln)
+		}
+	}
+	// 归一化行可被 parseConntrackLine 解析
+	c, ok := parseConntrackLine(lines[0])
+	if !ok || c.origSrc != "192.168.100.2" || c.origDPort != "80" {
+		t.Fatalf("新格式行解析失败: %+v ok=%v", c, ok)
+	}
+}

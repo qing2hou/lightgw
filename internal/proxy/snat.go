@@ -1075,29 +1075,56 @@ func ipInList(ip string, list []string) bool {
 // Ubuntu 22.05 内核即如此）降级 conntrack -L（netlink，格式同为 key=value）。
 // 两种来源都不可用返回 nil（调用方降级老化）。
 func readConntrackTable() []string {
-	if b, err := osReadFile("/proc/net/nf_conntrack"); err == nil {
-		out := []string{}
-		for _, ln := range strings.Split(string(b), "\n") {
+	// 行格式兼容两种内核形态（QA P1-1）：
+	//   老格式（≤6.x 早期）："tcp 6 431997 ESTABLISHED src=..."
+	//   新格式（6.x/6.18 实测）：  "ipv4     2 tcp      6 431999 ESTABLISHED src=..."
+	//     —— L3 层名作前缀。老过滤 HasPrefix("tcp ") 在新格式下永不匹配 → 表恒空。
+	// 统一剥离：先按空白分列，找到 tcp/udp 列的位置，去掉其前的 L3 前缀列。
+	var out []string
+	read := func(text string, forProc bool) []string {
+		var lines []string
+		for _, ln := range strings.Split(text, "\n") {
 			ln = strings.TrimSpace(ln)
-			if strings.HasPrefix(ln, "tcp ") || strings.HasPrefix(ln, "udp ") {
-				out = append(out, ln)
+			if ln == "" {
+				continue
 			}
+			fields := strings.Fields(ln)
+			// 老格式：fields[0] 即 l4 proto；新格式：fields[2]（ipv4/ipv6 层名 + 号 + l4）
+			start := -1
+			for i, f := range fields {
+				if f == "tcp" || f == "udp" {
+					start = i
+					break
+				}
+			}
+			if start == -1 {
+				continue // 非 tcp/udp 表项（如 DCCP/SCTP/ICMP——icmP 有 v4/v6 行且无端口语义，跳过）
+			}
+			if forProc && start > 2 {
+				continue // 异常态：层前缀超过 ipv4/ipv6+号两列——防御
+			}
+			lines = append(lines, strings.Join(fields[start:], " "))
 		}
-		return out
+		return lines
 	}
-	out, err := exec.Command("conntrack", "-L").Output()
+	if b, err := osReadFile("/proc/net/nf_conntrack"); err == nil {
+		out = read(string(b), true)
+		// /proc 可读但空表（无任何表项）时返回空切片——与不可读（nil）语义不同，
+		// 调用方据 nil 判降级；但空表可能是 conntrack 模块列表为空——继续降级
+		// conntrack -L 拿 netlink 全量（/proc 有 max 条数截断的老坑）
+		if len(out) > 0 {
+			return out
+		}
+	}
+	out2, err := exec.Command("conntrack", "-L").Output()
 	if err != nil {
-		return nil
+		return out // /proc 读到的哪怕为空也优于 nil（conntrack 二进制缺失/失败）
 	}
-	lines := []string{}
-	for _, ln := range strings.Split(string(out), "\n") {
-		ln = strings.TrimSpace(ln)
-		// conntrack -L 尾行 "conntrack v1.4.x ... flow entries have been shown." 是汇总——跳过
-		if strings.HasPrefix(ln, "tcp ") || strings.HasPrefix(ln, "udp ") {
-			lines = append(lines, ln)
-		}
+	lines := read(string(out2), false)
+	if len(lines) > 0 {
+		return lines
 	}
-	return lines
+	return out
 }
 
 // parseConntrackLine 解析单条 nf_conntrack 行（/proc/net/nf_conntrack 等号连写格式：
