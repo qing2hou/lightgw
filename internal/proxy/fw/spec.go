@@ -22,12 +22,18 @@ type Spec struct {
 	Pool      []string // SNAT 源池（T207：rotate/sticky 按源确定性映射；空=fixed）
 }
 
-// PayloadOffsets IPv4 头内偏移（payload 表达式的物理事实，独立常量防魔法数）。
+// IPv4 头内偏移（payload 表达式的物理事实，独立常量防魔法数）。
 const (
 	offSaddr = 12 // IPv4 saddr
 	offDaddr = 16 // IPv4 daddr
 	offDport = 2  // TCP/UDP dport（传输层头内）
 	offSport = 0  // TCP/UDP sport
+)
+
+// IPv6 头内偏移。
+const (
+	offSaddr6 = 8  // IPv6 saddr
+	offDaddr6 = 24 // IPv6 daddr
 )
 
 func v4(s string) net.IP {
@@ -36,6 +42,29 @@ func v4(s string) net.IP {
 		return nil
 	}
 	return ip.To4()
+}
+
+// ipLen 地址族的字节长度（匹配序列长度参数用；0=非法地址）。
+func ipLen(ip net.IP) int {
+	if ip.To4() != nil {
+		return 4
+	}
+	if ip.To16() != nil {
+		return 16
+	}
+	return 0
+}
+
+// v4OrV6 解析出网络序地址字节（v4/v6 均可；nil=非法）。
+func v4OrV6(s string) net.IP {
+	ip := net.ParseIP(s)
+	if ip == nil {
+		return nil
+	}
+	if ip.To4() != nil {
+		return ip.To4()
+	}
+	return ip.To16() // v6（16B）
 }
 
 // SnatPool 一条 snat 规则的源池（T207：rotate/sticky 模式下每源映射成员）。

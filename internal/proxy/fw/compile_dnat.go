@@ -37,12 +37,22 @@ type DNatSpec struct {
 
 // CompileDNAT 编译 dnat 规则。
 func CompileDNAT(s DNatSpec) ([]Rule, error) {
-	lip, bip := v4(s.ListenIP), v4(s.BackendIP)
+	// T210 双栈：发布/后端地址族由地址形态推断；两者必须同族（无 NAT64）
+	lip, bip := v4OrV6(s.ListenIP), v4OrV6(s.BackendIP)
 	if lip == nil {
-		return nil, fmt.Errorf("发布 IP %s 不是合法 IPv4", s.ListenIP)
+		return nil, fmt.Errorf("发布 IP %s 不是合法 IP", s.ListenIP)
 	}
 	if bip == nil {
-		return nil, fmt.Errorf("后端 IP %s 不是合法 IPv4", s.BackendIP)
+		return nil, fmt.Errorf("后端 IP %s 不是合法 IP", s.BackendIP)
+	}
+	if (len(lip) == 4) != (len(bip) == 4) {
+		return nil, fmt.Errorf("发布与后端地址族不一致（v1 不做 NAT64）: %s → %s", s.ListenIP, s.BackendIP)
+	}
+	natFamily := unix.AF_INET
+	daddrOff, daddrLen := uint32(offDaddr), uint32(4)
+	if len(lip) == 16 {
+		natFamily = unix.AF_INET6
+		daddrOff, daddrLen = offDaddr6, 16
 	}
 	if s.ListenPort < 1 || s.ListenPort > 65535 || s.BackendPort < 1 || s.BackendPort > 65535 {
 		return nil, fmt.Errorf("端口无效：发布 %d 后端 %d", s.ListenPort, s.BackendPort)
@@ -53,7 +63,7 @@ func CompileDNAT(s DNatSpec) ([]Rule, error) {
 
 	// 发布匹配序列（三处共用）：daddr=公网IP && TCP/UDP dport=发布端口
 	match := []expr.Any{
-		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: daddrOff, Len: daddrLen},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: lip},
 		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: offDport, Len: 2},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(s.ListenPort))},
@@ -77,7 +87,7 @@ func CompileDNAT(s DNatSpec) ([]Rule, error) {
 	dnat := append(append([]expr.Any{}, match...),
 		&expr.Immediate{Register: 1, Data: bip},
 		&expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(uint16(s.BackendPort))},
-		&expr.NAT{Type: expr.NATTypeDestNAT, Family: unix.AF_INET,
+		&expr.NAT{Type: expr.NATTypeDestNAT, Family: uint32(natFamily),
 			RegAddrMin: 1, RegAddrMax: 1, RegProtoMin: 2, RegProtoMax: 2},
 	)
 	out = append(out, Rule{Chain: nft.ChainDstNAT, Rule: &nftables.Rule{
@@ -88,7 +98,7 @@ func CompileDNAT(s DNatSpec) ([]Rule, error) {
 	// dport=后端端口 + saddr∈白名单 → counter + mark）
 	backendMatch := func() []expr.Any {
 		return []expr.Any{
-			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: daddrOff, Len: daddrLen},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: bip},
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: offDport, Len: 2},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(s.BackendPort))},
@@ -130,6 +140,30 @@ func srcMatchPayloadOnly(src string) []expr.Any {
 		}
 	}
 	return []expr.Any{&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0, 0, 0, 0}}}
+}
+
+// dstMatchExprsD 目的地址匹配（v4 offset16/4B；v6 offset24/16B）。
+func dstMatchExprsD(dst string) []expr.Any {
+	if ip := v4(dst); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if ip := v4OrV6(dst); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr6, Len: 16},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if _, ipn, err := net.ParseCIDR(dst); err == nil && ipn != nil {
+		off := uint32(offDaddr)
+		if ipn.IP.To4() == nil {
+			off = offDaddr6
+		}
+		return cidrMatchExprs(ipn, off)
+	}
+	return nil
 }
 
 // ParseAddrPort "IP:port" → (ip, port, err)（dnat spec 构建用）。

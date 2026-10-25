@@ -222,30 +222,52 @@ func iifOifExprs(ifin, ifout string) []expr.Any {
 	}
 }
 
-// srcMatchExprs 入口+出口+源 IP/CIDR 匹配序列。
+// srcMatchExprs 入口+出口+源 IP/CIDR 匹配序列（T210：v4/v6 双栈按族分支）。
 func srcMatchExprs(ifin, ifout, src string) []expr.Any {
-	ex := iifOifExprs(ifin, ifout)
-	_, ipn, err := net.ParseCIDR(src)
-	if err == nil && ipn != nil {
-		// CIDR：saddr & mask == network（Bitwise + Cmp；掩码字节序与包字节一致）
-		mask := make([]byte, 4)
-		copy(mask, ipn.Mask)
-		network := ipn.IP.To4()
-		return append(ex,
-			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offSaddr, Len: 4},
-			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
-				Mask: mask, Xor: binaryutil.NativeEndian.PutUint32(0)},
-			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network},
-		)
-	}
+	return append(iifOifExprs(ifin, ifout), addrMatchExprsSrc(src)...)
+}
+
+// addrMatchExprsSrc 源地址匹配（v4 offset12/4B；v6 offset8/16B）。
+func addrMatchExprsSrc(src string) []expr.Any {
 	if ip := v4(src); ip != nil {
-		return append(ex,
+		return []expr.Any{
 			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offSaddr, Len: 4},
 			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
-		)
+		}
+	}
+	if ip := v4OrV6(src); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offSaddr6, Len: 16},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if _, ipn, err := net.ParseCIDR(src); err == nil && ipn != nil {
+		off := uint32(offSaddr)
+		if ipn.IP.To4() == nil {
+			off = offSaddr6
+		}
+		return cidrMatchExprs(ipn, off)
 	}
 	// 非法源：永不匹配（防御——上游已校验）
-	return append(ex, &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0, 0, 0, 0}})
+	return []expr.Any{&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{0, 0, 0, 0}}}
+}
+
+// cidrMatchExprs CIDR 网段匹配（Bitwise+网络序；v4/v6 由 ipn 派生长度与偏移）。
+func cidrMatchExprs(ipn *net.IPNet, offset uint32) []expr.Any {
+	mask := make([]byte, len(ipn.Mask))
+	copy(mask, ipn.Mask)
+	network := ipn.IP
+	if network.To4() != nil && len(mask) == net.IPv6len {
+		// v4 IP 带 /24 等 v4 掩码——归一
+		network = network.To4()
+		mask = mask[12:]
+	}
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: uint32(len(mask))},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: uint32(len(mask)),
+			Mask: mask, Xor: make([]byte, len(mask))},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: network.To16()[:len(mask)]},
+	}
 }
 
 // withCounterMark 放行行尾随：counter + 打放行标记（不修改入参切片）。
