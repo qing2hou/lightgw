@@ -125,10 +125,14 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 		}
 	}
 	// 出口 SNAT 源地址：显式 snat_ip 优先（一卡多址下固化选择）；
-	// 空 = 自动跟随出口网卡首个 IPv4（热重载/重应用时跟随网卡地址变化）
+	// 空 = 自动跟随出口网卡首个 IPv4，v6-only 网卡回落首个非 link-local v6
+	// （v6 自动档——v6-only 出口的常见路径，复审 B8 缺口修复）
 	outIP := strings.TrimSpace(rule.SnatIP)
 	if outIP == "" {
 		outIP = ipv4Of(rule.TargetAddr)
+	}
+	if outIP == "" {
+		outIP = ipv6Of(rule.TargetAddr)
 	}
 	// 安全默认（API 已强校验，这里是直改库/导入的兜底）：无源名单的 snat
 	// 不放行任何流量（AllowSrcs 为空时 iptables 形态退化为仅 conntrack 回程行
@@ -164,17 +168,25 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 		}
 		for _, m := range members {
 			m = strings.TrimSpace(m)
-			ip := net.ParseIP(m)
-			if ip == nil || ip.To4() == nil {
+			if net.ParseIP(m) == nil {
 				continue
 			}
 			// S2：运行时归属复验——成员已从出口网卡移除时剔除（静默黑洞防护，
-			// 与单 IP SnatIP 的复验同语义）；全失效则退回 fixed
+			// 与单 IP SnatIP 的复验同语义）；v4/v6 双族（v6 池走 NAT66）；
+			// 全失效则退回 fixed
 			belongs := false
 			for _, v4 := range InterfaceIPv4s(rule.TargetAddr) {
 				if v4 == m {
 					belongs = true
 					break
+				}
+			}
+			if !belongs {
+				for _, v6 := range InterfaceIPv6s(rule.TargetAddr) {
+					if v6 == m {
+						belongs = true
+						break
+					}
 				}
 			}
 			if belongs {
@@ -475,6 +487,14 @@ func ListInterfaces() []IfaceInfo {
 		out = append(out, IfaceInfo{Name: i.Name, IPS: ips, IP: first, Status: status})
 	}
 	return out
+}
+
+// ipv6Of 返回网卡的第一个非 link-local IPv6（v6 自动档；无则空串）。
+func ipv6Of(ifName string) string {
+	for _, v6 := range InterfaceIPv6s(ifName) {
+		return v6
+	}
+	return ""
 }
 
 // InterfaceIPv6s 返回网卡全部 IPv6（v6 SNAT 源/池归属校验用；T210/B8）。

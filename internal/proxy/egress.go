@@ -351,12 +351,21 @@ func (m *Manager) killEgressSessions(e model.Egress) {
 		}
 		if ip := strings.TrimSpace(r.SnatIP); ip != "" {
 			egIPs[ip] = true
+		} else {
+			// 自动档：规则出口网卡的实际 SNAT 源也入锚点（跨网卡自动档残余——
+			// 复审 B4 场景 3 同源）
+			if ip := ipv4Of(r.TargetAddr); ip != "" {
+				egIPs[ip] = true
+			}
+			if ip := ipv6Of(r.TargetAddr); ip != "" {
+				egIPs[ip] = true
+			}
 		}
 		var members []string
 		_ = jsonUnmarshalStrings(strings.TrimSpace(r.SnatPool), &members)
 		for _, mm := range members {
-			if ip := net.ParseIP(strings.TrimSpace(mm)); ip != nil && ip.To4() != nil {
-				egIPs[strings.TrimSpace(mm)] = true
+			if net.ParseIP(strings.TrimSpace(mm)) != nil {
+				egIPs[strings.TrimSpace(mm)] = true // v4/v6 双族（v6 NAT66 会话的 reply 源）
 			}
 		}
 	}

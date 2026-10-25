@@ -483,7 +483,15 @@ func ifaceAddrStrings(iface *net.Interface) []string {
 	if err != nil {
 		return nil
 	}
+	// v4 全量 + v6 全量（v6 EgressGw 的同网段检查——复审：v4-only 时
+	// v6 网关永远被 Contains 拒，与引擎层放行形成倒挂）
 	out := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() == nil && ipn.IP.To16() != nil &&
+			!ipn.IP.IsLinkLocalUnicast() {
+			out = append(out, ipn.String())
+		}
+	}
 	for _, a := range addrs {
 		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
 			out = append(out, ipn.String())
