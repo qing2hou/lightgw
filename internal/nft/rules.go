@@ -132,3 +132,61 @@ type CounterSnapshot struct {
 	Bytes   uint64
 	Packets uint64
 }
+
+// ---------- T006：旧 iptables 形态（haweb-sn: 标记）启动迁移 ----------
+
+// legacyComment 旧 iptables 时代的 comment 标记前缀（snat v1 形态）。
+const legacyComment = "haweb-sn:"
+
+// PurgeLegacyIPTables 把旧 iptables 形态标记的规则（经 iptables-nft 后端
+// 写入 nf_tables 的 nat 表 POSTROUTING / filter 表 FORWARD）按标记读出并删除。
+// 零 exec（升级目标机可能已无 iptables 二进制；iptables-nft 宿主上旧规则
+// 就在 nf_tables 里，netlink 可直达）。幂等：无标记规则返回 0。
+// 返回删除条数与错误。
+func (n *Conn) PurgeLegacyIPTables() (int, error) {
+	removed := 0
+	// 旧形态所在：nat 表 POSTROUTING（ip 家族）+ filter 表 FORWARD（ip 家族）
+	type target struct {
+		fam   nftables.TableFamily
+		table string
+		chain string
+	}
+	for _, tg := range []target{
+		{nftables.TableFamilyIPv4, "nat", "POSTROUTING"},
+		{nftables.TableFamilyIPv4, "filter", "FORWARD"},
+	} {
+		tbl := &nftables.Table{Family: tg.fam, Name: tg.table}
+		chains, err := n.c.ListChainsOfTableFamily(tg.fam)
+		if err != nil {
+			continue // 家族/表不存在（全新部署）——无旧形态
+		}
+		var fwd *nftables.Chain
+		for _, ch := range chains {
+			if ch.Table != nil && ch.Table.Name == tg.table && ch.Name == tg.chain {
+				fwd = ch
+				break
+			}
+		}
+		if fwd == nil {
+			continue
+		}
+		rules, err := n.c.GetRules(tbl, fwd)
+		if err != nil {
+			continue
+		}
+		for _, r := range rules {
+			if !strings.Contains(string(r.UserData), legacyComment) {
+				continue
+			}
+			if err := n.c.DelRule(r); err == nil {
+				removed++
+			}
+		}
+	}
+	if removed > 0 {
+		if err := n.Flush(); err != nil {
+			return removed, fmt.Errorf("旧 iptables 形态删除提交失败: %w", err)
+		}
+	}
+	return removed, nil
+}

@@ -5,6 +5,7 @@ package proxy
 import (
 	"fmt"
 
+	"haproxyweb/internal/model"
 	"haproxyweb/internal/nft"
 	"haproxyweb/internal/proxy/fw"
 )
@@ -85,5 +86,47 @@ func (m *Manager) teardownSnatNFT(ruleID uint) {
 	}
 	if err := conn.PurgeByComment(nft.KindSNAT, ruleID); err != nil {
 		logf("规则#%d nft 形态拆除失败（启动对账将兜底清理）: %v", ruleID, err)
+	}
+}
+
+// migrateLegacyIPTables 启动迁移（T006）：经 netlink 拆除全部旧 haweb-sn:
+// iptables 形态。连接失败（无权限/无内核 nftables）返回错误由调用方降级。
+func (m *Manager) migrateLegacyIPTables() (int, error) {
+	conn, err := m.nftConn()
+	if err != nil {
+		return 0, err
+	}
+	return conn.PurgeLegacyIPTables()
+}
+
+// purgeOrphanNFTRules nft 形态启动对账：haweb 表内 haweb-nft:snat:<id> 标记
+// 规则、DB 无对应启用 snat 规则的，按标记拆除（进程崩溃残留归零）。
+func (m *Manager) purgeOrphanNFTRules() {
+	conn, err := m.nftConn()
+	if err != nil {
+		return // 无内核权限（如容器内 API 开发）零动作
+	}
+	installed, err := conn.InstalledIDs()
+	if err != nil || len(installed) == 0 {
+		return
+	}
+	live := map[uint]bool{}
+	var rules []model.ForwardRule
+	m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules)
+	for _, r := range rules {
+		live[r.ID] = true
+	}
+	ids := installed[nft.KindSNAT]
+	var purged []uint
+	for id := range ids {
+		if live[id] {
+			continue
+		}
+		if err := conn.PurgeByComment(nft.KindSNAT, id); err == nil {
+			purged = append(purged, id)
+		}
+	}
+	if len(purged) > 0 {
+		logf("[snat] nft 启动对账：已拆除 %d 条孤儿规则: %v", len(purged), purged)
 	}
 }

@@ -291,6 +291,15 @@ func (m *Manager) StartAll() error {
 	if purged := m.PurgeOrphanSnatRules(); len(purged) > 0 {
 		logf("[snat] 已清扫 %d 条孤儿 iptables 规则: %v", len(purged), purged)
 	}
+	// T006 旧形态迁移：haweb-sn: iptables 规则整体拆除（双份叠加防除——
+	// nft 新形态装在位前先清旧形态；iptables-legacy 直写的规则此路径够不到，
+	// 由 DetectHost 的 legacy fail-fast 拦截）
+	if n, err := m.migrateLegacyIPTables(); err != nil {
+		logf("[snat] 旧 iptables 形态迁移检查失败（不阻塞启动）: %v", err)
+	} else if n > 0 {
+		logf("[snat] 已迁移拆除 %d 条旧 iptables 形态规则（nftables 后端接管）", n)
+	}
+	m.purgeOrphanNFTRules()
 	var rules []model.ForwardRule
 	if err := m.db.Where("enabled = ?", true).Find(&rules).Error; err != nil {
 		return err
