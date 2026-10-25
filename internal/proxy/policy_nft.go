@@ -2,6 +2,9 @@
 package proxy
 
 import (
+	"encoding/base64"
+	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -132,4 +135,155 @@ func portInGroups(portStr, groups string) bool {
 		}
 	}
 	return false
+}
+
+// PolicyCounters 策略命中计数快照（pol 标记聚合；drop/accept 桶分别语义）。
+func (m *Manager) PolicyCounters() map[uint]struct {
+	Packets uint64
+	Bytes   uint64
+} {
+	out := map[uint]struct {
+		Packets uint64
+		Bytes   uint64
+	}{}
+	m.nftMu.Lock()
+	conn := m.nft
+	m.nftMu.Unlock()
+	if conn == nil {
+		return out
+	}
+	m.nftApplyMu.Lock()
+	res, err := conn.CountersByComment()
+	m.nftApplyMu.Unlock()
+	if err != nil {
+		return out
+	}
+	for ud, pair := range res.ByRule {
+		kind, id, ok := nft.ParseComment(ud)
+		if !ok || kind != nft.KindPolicy {
+			continue
+		}
+		e := out[id]
+		e.Packets += pair.Accept.Packets + pair.Drop.Packets
+		e.Bytes += pair.Accept.Bytes + pair.Drop.Bytes
+		out[id] = e
+	}
+	return out
+}
+
+// ---------- T109 会话可视化：conntrack dump 聚合 + 按 ID 掐断 ----------
+
+// CTSnapshot 单条会话的稳定视图。
+type CTSnapshot struct {
+	ID       string // base64(proto|src|sport|dst|dport)（orig 四元组）
+	Proto    string
+	Src      string // ip:port
+	Dst      string // ip:port（DNAT 前）
+	SrcAfter string // reply.dst NAT 改写后的源（SNAT 出口 IP；dnat 会话为空）
+	Router   string // snat:<egress出口IP> / dnat:<发布IP> / policy / other
+	State    string
+}
+
+// SnapshotSessions conntrack 表全量快照（读 /proc 或 conntrack -L 兜底——
+// 复用 readConntrackTable；归属判定按 reply 元组反查引擎注册表）。
+func (m *Manager) SnapshotSessions() []CTSnapshot {
+	lines := readConntrackTable()
+	if lines == nil {
+		return nil
+	}
+	m.mu.Lock()
+	entries := make([]*snatEntry, 0, len(m.snatRules))
+	for _, e := range m.snatRules {
+		entries = append(entries, e)
+	}
+	m.mu.Unlock()
+	// 出口 SNAT IP 集合（snat 归属判定）与发布 IP 集合（dnat 归属）
+	snatOutIPs := map[string]string{} // outIP -> 规则标识
+	dnatListenIPs := map[string]bool{}
+	for _, e := range entries {
+		if e.dnat {
+			dnatListenIPs[e.ifIn] = true // ifIn 复用为发布 IP
+		} else if e.outIP != "" {
+			snatOutIPs[e.outIP] = fmt.Sprintf("snat:%s", e.outIP)
+		}
+	}
+	out := make([]CTSnapshot, 0, len(lines))
+	for _, ln := range lines {
+		c, ok := parseConntrackLine(ln)
+		if !ok {
+			continue
+		}
+		s := CTSnapshot{
+			Proto: c.proto,
+			// orig：客户端/目标真实四元组
+			Src: net.JoinHostPort(c.origSrc, c.origSPort),
+			Dst: net.JoinHostPort(c.origDst, c.origDPort),
+			// reply 元组：SNAT 后的会话形态——reply.src=SNAT出口、
+			// reply.dst=SNAT出口:客户端（回程视角）。src_after 取 reply.src
+			SrcAfter: net.JoinHostPort(c.replySrc, c.replySPort),
+			State:    stateOfConntrackLine(ln),
+		}
+		s.ID = encodeCTID(c)
+		switch {
+		case snatOutIPs[c.replySrc] != "":
+			s.Router = snatOutIPs[c.replySrc]
+		case dnatListenIPs[replyDstIsClient(c)]: // dnat：orig.dst=发布IP
+			if dnatListenIPs[c.origDst] {
+				s.Router = "dnat:" + c.origDst
+			}
+		default:
+			if dnatListenIPs[c.origDst] {
+				s.Router = "dnat:" + c.origDst
+			} else {
+				s.Router = "other"
+			}
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// replyDstIsClient 占位（归属分支可读性；返回空串）。
+func replyDstIsClient(c *ctSession) string { return "" }
+
+// stateOfConntrackLine 从行内提取状态（ESTABLISHED/TIME_WAIT 等）。
+func stateOfConntrackLine(ln string) string {
+	for _, f := range strings.Fields(ln) {
+		if v, ok := strings.CutPrefix(f, "state="); ok {
+			return v
+		}
+	}
+	// /proc 格式：字段三位置（tcp 6 116 ESTABLISHED src=...）
+	fs := strings.Fields(ln)
+	if len(fs) >= 4 && (fs[0] == "tcp" || fs[0] == "udp") {
+		return fs[3]
+	}
+	return ""
+}
+
+// encodeCTID orig 四元组稳定编码（掐断接口引用）。
+func encodeCTID(c *ctSession) string {
+	raw := fmt.Sprintf("%s|%s|%s|%s|%s", c.proto, c.origSrc, c.origSPort, c.origDst, c.origDPort)
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// KillSessionByID 按 ID 掐断（base64 解码回四元组 → conntrack -D）。
+func (m *Manager) KillSessionByID(id string) (int, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(id))
+	if err != nil {
+		return 0, fmt.Errorf("会话 id 格式错误")
+	}
+	parts := strings.SplitN(string(raw), "|", 5)
+	if len(parts) != 5 {
+		return 0, fmt.Errorf("会话 id 内容无效")
+	}
+	proto, src, sport, dst, dport := parts[0], parts[1], parts[2], parts[3], parts[4]
+	if proto != "tcp" && proto != "udp" {
+		return 0, fmt.Errorf("会话协议 %q 不支持掐断", proto)
+	}
+	c := &ctSession{proto: proto, origSrc: src, origSPort: sport, origDst: dst, origDPort: dport}
+	if deleteConntrackEntry(&snatRuleSpec{}, c) {
+		return 1, nil
+	}
+	return 0, nil
 }

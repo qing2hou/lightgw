@@ -36,13 +36,18 @@ func (h *handlers) listFwPolicies(c *gin.Context) {
 		h.serverError(c, "查询策略", err)
 		return
 	}
-	// 命中计数注入（nft counter 快照——5s 轮询内可能滞后）
+	// T108 命中计数注入（Manager 快照：nft counter 按 pol 标记聚合——drop 桶为
+	// 拒绝量、accept 桶为放行量；计数滞后 5s 轮询内可接受）
+	stats := h.Mgr.PolicyCounters()
 	var out []gin.H
 	for _, p := range pols {
 		row := gin.H{
 			"id": p.ID, "name": p.Name, "order": p.Order, "action": p.Action,
 			"src_list": parseListOrNull(p.SrcList), "dst_list": parseListOrNull(p.DstList),
 			"proto": p.Proto, "port_range": p.PortRange, "enabled": p.Enabled, "comment": p.Comment,
+		}
+		if st, ok := stats[p.ID]; ok {
+			row["stats"] = gin.H{"pkts": st.Packets, "bytes": st.Bytes}
 		}
 		out = append(out, row)
 	}
