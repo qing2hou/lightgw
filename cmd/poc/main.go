@@ -32,6 +32,14 @@ import (
 const pocTable = "haweb-poc"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "-smoke-hostsim" {
+		smokeHostSim()
+		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "-smoke" {
+		smokeEngine()
+		return
+	}
 	checks := []struct {
 		name string
 		fn   func() (string, error)

@@ -1,0 +1,87 @@
+// Package nft 提供 nftables 内核面的 netlink 引擎层：表/链/规则/set 的
+// 生命周期、宿主探测、标记对账。全部经 google/nftables 直连内核，
+// 零 exec、零 iptables 依赖（设计见 docs/design-fwgateway.md，PoC 见 docs/poc-nftables.md）。
+//
+// 分层纪律：本包只做 I/O 与内核形态操作；规则语义编译（什么规则序列
+// 表达一条转发规则/防火墙策略）在 internal/proxy/fw（纯函数、离线可测）。
+package nft
+
+import (
+	"fmt"
+
+	"github.com/google/nftables"
+)
+
+// Conn netlink 连接包装：串行化 Flush（并发 Apply 场景下的批次互斥）+
+// 统一错误中文语义。google/nftables 的 Conn 自带锁，此处包装是为了
+// 给上层的"装-验-失败重装"流程一个统一入口与将来的人格化错误。
+type Conn struct {
+	c *nftables.Conn
+}
+
+// Dial 打开 netlink 连接（进程内复用单连接）。
+func Dial() (*Conn, error) {
+	inner, err := nftables.New()
+	if err != nil {
+		return nil, fmt.Errorf("打开 nftables netlink 连接失败（需要 CAP_NET_ADMIN）: %w", err)
+	}
+	return &Conn{c: inner}, nil
+}
+
+// CloseLasting 关闭持久连接（进程退出路径）。
+func (n *Conn) CloseLasting() error { return n.c.CloseLasting() }
+
+// Flush 冲刷暂存区（见 PoC 坑 10：失败实测无残留，但上层仍按
+// "失败即拆段重装"防御，不依赖该行为）。
+func (n *Conn) Flush() error {
+	if err := n.c.Flush(); err != nil {
+		return fmt.Errorf("nftables 规则下发失败: %w", err)
+	}
+	return nil
+}
+
+// inner 暴露原始连接（同包内编排水层的表/链/规则操作用）。
+func (n *Conn) inner() *nftables.Conn { return n.c }
+
+// 表与链名（内核内名字空间，自有表隔离一切变更——设计支柱 1）。
+const (
+	// Table 自有表名：全部 haweb 规则的唯一容器。
+	Table = "haweb"
+	// ChainPreMark 预标记链（prerouting -150）：established 短路/发布命中打标。
+	ChainPreMark = "pre_mark"
+	// ChainDstNAT 目的改写链（prerouting -100）：端口发布 DNAT。
+	ChainDstNAT = "dstnat"
+	// ChainFwd 转发裁决链（forward -10）：ACL 有序策略 + 范围内默认拒绝。
+	ChainFwd = "fwd"
+	// ChainSrcNAT 源改写链（postrouting +100）：SNAT（固定/池）。
+	ChainSrcNAT = "srcnat"
+)
+
+// EnsureTable 确保自有表与四条基础链在位（幂等：缺失补建，在位不动）。
+// 返回错误时内核面可能零变更（补建表失败）或部分变更（链补建部分成功——
+// 调用方按"失败即 EnsureTable 重试"处理，幂等保证收敛）。
+func (n *Conn) EnsureTable() error {
+	tbl := &nftables.Table{Family: nftables.TableFamilyINet, Name: Table}
+	n.c.AddTable(tbl)
+
+	// hook/priority 常量是指针（PoC 坑 6），取值后取址。
+	baseChains := []struct {
+		name string
+		typ  nftables.ChainType
+		hook nftables.ChainHook
+		prio nftables.ChainPriority
+	}{
+		{ChainPreMark, nftables.ChainTypeFilter, *nftables.ChainHookPrerouting, *nftables.ChainPriorityMangle},
+		{ChainDstNAT, nftables.ChainTypeNAT, *nftables.ChainHookPrerouting, *nftables.ChainPriorityNATDest},
+		{ChainFwd, nftables.ChainTypeFilter, *nftables.ChainHookForward, *nftables.ChainPriorityRef(-10)},
+		{ChainSrcNAT, nftables.ChainTypeNAT, *nftables.ChainHookPostrouting, *nftables.ChainPriorityNATSource},
+	}
+	for _, bc := range baseChains {
+		hook, prio := bc.hook, bc.prio
+		n.c.AddChain(&nftables.Chain{
+			Name: bc.name, Table: tbl, Type: bc.typ,
+			Hooknum: &hook, Priority: &prio,
+		})
+	}
+	return n.Flush()
+}
