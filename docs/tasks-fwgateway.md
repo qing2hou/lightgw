@@ -26,17 +26,17 @@
 
 ## M3 多出口 + SNAT 池 + 双栈（US4–US7）
 
-- [ ] T201 [US4] 出口（egress）实体：网卡+网关+优先级+权重+探测配置、API、前端管理页（depends: M1 全部）
-- [ ] T202 [US4] 出口探测循环：ICMP/TCP 探测、状态翻转去抖、事件审计（depends: T201）
-- [ ] T203 [US4] 出口选择：优先级层+层内权重；每流确定性分配（PoC 不通过则按源哈希，ADR 记录）（depends: T202）
-- [ ] T204 [US4] 主备切换：路由改写、存量会话掐断/老化可配、回切策略（depends: T203）
-- [ ] T205 [US4] IPv6 出口独立探测与切换（depends: T204）
-- [ ] T206 [US5] 会话—出口分配记录与应用（整合 T203，作为正式能力交付：权重分担+亲和）+ 每出口统计（depends: T203）
-- [ ] T207 [US6] SNAT 源池：规则级池配置、轮换/粘滞分配、池成员运行时校验（depends: T201）
-- [ ] T208 [US6] 同源粘滞哈希：池成员增减时的重分配范围控制（depends: T207）
-- [ ] T209 [US6] SNAT 池成员下线的会话处理（默认老化/可配掐断）（depends: T207）
-- [ ] T210 [US7] IPv6 贯穿：snat/dnat/acl/名单/限速/统计的 v6 分支与表单校验（depends: T101, T105, T204）
-- [ ] T211 [US7] v4/v6 双栈混合部署不互相干扰验证（depends: T210）
+- [x] T201 [US4] 出口（egress）实体：网卡+网关+优先级+权重+探测配置、API、前端管理页（depends: M1 全部）
+- [x] T202 [US4] 出口探测循环：ICMP/TCP 探测、状态翻转去抖、事件审计（depends: T201）
+- [x] T203 [US4] 出口选择：优先级层+层内权重；每流确定性分配（PoC 不通过则按源哈希，ADR 记录）（depends: T202）
+- [x] T204 [US4] 主备切换：路由改写、存量会话掐断/老化可配、回切策略（depends: T203）
+- [x] T205 [US4] IPv6 出口独立探测与切换（depends: T204）
+- [x] T206 [US5] 会话—出口分配记录与应用（整合 T203，作为正式能力交付：权重分担+亲和）+ 每出口统计（depends: T203）
+- [x] T207 [US6] SNAT 源池：规则级池配置、轮换/粘滞分配、池成员运行时校验（depends: T201）
+- [x] T208 [US6] 同源粘滞哈希：池成员增减时的重分配范围控制（depends: T207）
+- [x] T209 [US6] SNAT 池成员下线的会话处理（默认老化/可配掐断）（depends: T207）
+- [x] T210 [US7] IPv6 贯穿：snat/dnat/acl/名单/限速/统计的 v6 分支与表单校验（depends: T101, T105, T204）
+- [x] T211 [US7] v4/v6 双栈混合部署不互相干扰验证（depends: T210）
 
 ## M4 性能 + 交付（US8）
 
@@ -53,3 +53,12 @@
 →3. 编码规范：遵循项目 AGENTS.md 与 vibecoding-best-practices
 4. 已提交 git（Conventional Commits，一卡一 commit）
 5. 文档/契约同步（API 文档、ADR、使用手册增量更新）
+
+
+## M3 收官台账（QA P2 项去向）
+- P2-1 snat 表单 M3 字段（snat_mode/snat_pool/egress_ids）→ M4 交付前收敛（T301 附属）
+- P2-2 /healthz 出口状态 → M4 收敛
+- P2-3 自然老化可配 + per-出口统计 → v1.1（AC 语义降级记录）
+- P2-4 PoolMemberOf 连续源重排面 74%（注释与实测定量不符）→ v1.1 改跳一致哈希或修注释
+- P2-5 e2e 脚本 fwd 保留字噪音 → M4 顺手
+- AC-4.6 v6 出口独立切换（gateway_v6 进 nexthop）→ T205（v1.1）
