@@ -41,20 +41,26 @@ type iptGetinfo struct {
 	Size       uint32
 }
 
-// getEntHdr IPT_SO_GET_ENTRIES 请求头。uapi 名义布局 name[32]+size=36，
-// 但 Debian/WSL 内核 compat 层实测要求 optlen=sizeof+4 且 entries 数组从
-// 偏移 40 开始（ABI 实测：optlen 36+size 报 EINVAL；40 头时 verdict 读数
-// ACCEPT=-2/DROP=-1 随 policy 精确切换——见 cmd/vd 排查记录）。
-type getEntHdr struct {
-	Name [xtTableMaxNameLen]byte
-	Size uint32
-	Pad  uint32 // 内核 compat 对齐填充（长度参与 optlen 语义）
+// getEntries IPT_SO_GET_ENTRIES 请求（头长 hdrLen：64 位 ABI=40——36 字节
+// 字段 + 4 字节尾部填充，柔性数组 ipt_entry 对齐 8 拉出填充（C sizeof 语义），
+// arm64 同；32 位 ABI=36）。内核严格校验 optlen == 内核 sizeof + size——
+// 头长不匹配报 EINVAL，调用方据此降级重试。返回 buf 含头，entries 从
+// buf[hdrLen:] 起（调用方按 buf 长-声明 size 反推实际头长）。
+func getEntries(fd int, size uint32, hdrLen int) ([]byte, syscall.Errno) {
+	buf := make([]byte, hdrLen+int(size))
+	copy(buf[0:xtTableMaxNameLen], "filter")
+	binary.LittleEndian.PutUint32(buf[xtTableMaxNameLen:xtTableMaxNameLen+4], size)
+	bufLen := uint32(len(buf))
+	_, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd),
+		uintptr(unix.IPPROTO_IP), uintptr(iptSoGetEntries),
+		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bufLen)), 0)
+	return buf, errno
 }
 
 // legacyForwardPolicyDrop 检测 iptables-legacy filter 表 FORWARD 链 policy 是否 DROP。
 // 返回 (drop, tableExists, err)。表不存在 → (false, false, nil)。
 // 判定：FORWARD underflow 条目（policy 行）的 xt_standard_target.verdict：
-// verdict 为负且非 -NF_RETURN-1（-6）即 -NF_DROP-1（DROP policy）。
+// -1（-NF_DROP-1）→ DROP；-2（-NF_ACCEPT-1）→ ACCEPT；其余保守按 DROP。
 func legacyForwardPolicyDrop() (drop, exists bool, err error) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_RAW, unix.IPPROTO_RAW)
 	if err != nil {
@@ -77,22 +83,20 @@ func legacyForwardPolicyDrop() (drop, exists bool, err error) {
 		return false, true, nil // FORWARD 未挂钩（无 policy 语义）
 	}
 
-	// 读全量 entries（解析 underflow 行的 target verdict）
-	req := getEntHdr{Size: info.Size}
-	copy(req.Name[:], "filter")
-	buf := make([]byte, int(unsafe.Sizeof(req))+int(info.Size))
-	*(*getEntHdr)(unsafe.Pointer(&buf[0])) = req
-	bufLen := uint32(len(buf))
-	if _, _, errno := syscall.Syscall6(syscall.SYS_GETSOCKOPT, uintptr(fd),
-		uintptr(unix.IPPROTO_IP), uintptr(iptSoGetEntries),
-		uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&bufLen)), 0); errno != 0 {
-		return false, true, fmt.Errorf("IPT_SO_GET_ENTRIES(filter): %w", errno)
+	// 读全量 entries：64 位 ABI 40 头优先，EINVAL（32 位平台内核 sizeof=36）
+	// 降级 36 头重试（两次 EINVAL 才报错——错误侧保守，评审附注）
+	buf, errno := getEntries(fd, info.Size, 40)
+	if errno == unix.EINVAL {
+		buf, errno = getEntries(fd, info.Size, 36)
+	}
+	if errno != 0 {
+		return false, false, fmt.Errorf("IPT_SO_GET_ENTRIES(filter): %w", errno)
 	}
 
-	// underflow 条目：entries 数组从请求头结束处开始
-	hdrSize := int(unsafe.Sizeof(req))
+	// underflow 条目：entries 数组紧接请求头（实际头长 = buf 长 - 声明 size）
 	uf := int(info.Underflow[forwardHookIdx])
-	if uf < 0 || hdrSize+uf+iptEntryHdrSize > len(buf) {
+	hdrSize := len(buf) - int(info.Size)
+	if hdrSize < 0 || hdrSize+uf+iptEntryHdrSize > len(buf) {
 		return true, true, nil // 布局异常——读不懂按 DROP 保守处理（复审 M3-b）
 	}
 	entry := buf[hdrSize+uf:]

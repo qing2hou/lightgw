@@ -215,37 +215,40 @@ func (m *Manager) teardownEgressRouteNFT(rtTable int) {
 	}
 }
 
-// countersFromNFT 从 nft counter 快照聚合单规则计数（M5/N1/N2 修正口径）。
-// Accept 口径：max(fwd 放行桶, srcnat 桶)——同一包同时命中 fwd 放行行与
-// srcnat 改写行会双计，取两桶 max 与旧 tc 单计数点量纲一致；Drop 口径：
-// 本规则 ② 黑名单行（per-rule verdict 分桶，与放行行不混）。
-// 全局默认拒绝（deny:0）不进 per-rule——避免 N 条规则 N 倍重复计 Denied
-// （调用方需要全局量时从 CountersByCommentResult.DenyDeny 单独取）。
-// 未入带宽包（无 tc class）时 allowSrcs 口径退化为 nft counter 全量。
+// countersFromNFT 从 nft counter 快照聚合单规则计数（M5/N1/N2/三轮定案）。
+// 单计数点口径：Accept = fwd 放行行（③④）之和（fwd hook 每 Derby 包计一次，
+// 与旧 tc 单点量纲一致；srcnat 行不加 counter——NAT 链仅每连接首包求值）；
+// Drop = 本规则 ② 黑名单行。全局默认拒绝（deny:0）不进 per-rule——N 条规则
+// 不可 N 倍重复计（全局面走 CountersByCommentResult.DenyDeny）。
 func countersFromNFT(res *nft.CountersByCommentResult, ruleID uint, allowSrcs []string) *snatCounters {
-	target := nft.Comment(nft.KindSNAT, ruleID)
-	pair, ok := res.ByRule[target]
+	pair, ok := res.ByRule[nft.Comment(nft.KindSNAT, ruleID)]
 	if !ok {
 		return nil
 	}
-	fs := res.FwdSrcnat[target]
-	accept := fs[0]
-	if fs[1].Bytes > accept.Bytes {
-		accept = fs[1]
-	}
-	if accept.Packets > fs[0].Packets || accept.Packets > fs[1].Packets {
-		// bytes 与 packets 分别取 max（分桶粒度独立）
-		accept.Packets = maxU64(fs[0].Packets, fs[1].Packets)
-	}
 	return &snatCounters{
-		PktsAccept: int64(accept.Packets), BytesAccept: int64(accept.Bytes),
+		PktsAccept: int64(pair.Accept.Packets), BytesAccept: int64(pair.Accept.Bytes),
 		PktsDrop: int64(pair.Drop.Packets), BytesDrop: int64(pair.Drop.Bytes),
 	}
 }
 
-func maxU64(a, b uint64) uint64 {
-	if a > b {
-		return a
+// ReadSnatCountersNFT API 摘要用的规则计数快照（三轮复审建议 3：nft 优先，
+// 不可读降级 exec 旧口径，两者皆不可读返回 nil——调用方展示 unknown）。
+// 与 pollSnatCounters 同源（CountersByComment），持 nftApplyMu 防会话交错。
+func (m *Manager) ReadSnatCountersNFT(ruleID uint, ifIn string, allowSrcs []string) *snatCounters {
+	m.nftMu.Lock()
+	conn := m.nft
+	m.nftMu.Unlock()
+	if conn != nil {
+		m.nftApplyMu.Lock()
+		res, err := conn.CountersByComment()
+		m.nftApplyMu.Unlock()
+		if err == nil {
+			if c := countersFromNFT(res, ruleID, allowSrcs); c != nil {
+				return c
+			}
+			return &snatCounters{} // 引擎在位但读不到（未启用）——零值语义
+		}
 	}
-	return b
+	// 降级：老机器 exec 口径
+	return ReadSnatCounters(ruleID, ifIn, allowSrcs)
 }

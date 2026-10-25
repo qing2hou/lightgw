@@ -143,22 +143,20 @@ func hasDropVerdictRule(r *nftables.Rule) bool {
 	return false
 }
 
-// CountersByComment 按标记读规则内嵌 counter，双桶求和（复审 N1/N2）：
-// map[标记]{Accept, Drop}——同标记的放行行（fwd ③④⑤ 每源行）求和进 Accept、
-// 拒绝行（② 黑名单 DROP）求和进 Drop。注意 Accept 桶内 fwd 放行与 srcnat
-// 改写行会同包双计——调用方取 max(fwd 桶, srcnat 桶) 之前，本层按链分桶
-// 提供（fwdAccept 与 srcnat 分开，避免调用方猜）。
+// CountersByComment 按标记读规则内嵌 counter，双桶求和（复审 N1/N2/三轮）：
+// 同标记的放行行（fwd ③④，每源/每目标行）求和进 Accept、拒绝行（② 黑名单
+// DROP）求和进 Drop。单一计数点语义（fwd hook）——评审三轮定案：**不采纳**
+// fwd/srcnat 分桶 max 口径，因为 nftables NAT 链只对每连接首包求值（srcnat
+// 行加 counter 也只计连接数），fwd 桶天然 ≥ srcnat 桶且语义正确（与旧 tc
+// 单点口径一致）。srcnat 行因此不加 counter（compile.go ⑤）。
 type CountersByCommentResult struct {
-	ByRule map[string]CounterPair // haweb-nft:snat:<id> → 双桶
-	// FwdAccept/srcnat 分桶视图（同标记）：max 口径用
-	FwdSrcnat map[string][2]CounterSnapshot // [fwdAccept, srcnat]
-	DenyDeny  CounterSnapshot               // 全局默认拒绝尾行（deny:0）合计
+	ByRule   map[string]CounterPair // haweb-nft:<kind>:<id> → 双桶
+	DenyDeny CounterSnapshot        // 全局默认拒绝尾行（deny:0）合计（多网卡同标记求和）
 }
 
 func (n *Conn) CountersByComment() (*CountersByCommentResult, error) {
 	out := &CountersByCommentResult{
-		ByRule:    map[string]CounterPair{},
-		FwdSrcnat: map[string][2]CounterSnapshot{},
+		ByRule: map[string]CounterPair{},
 	}
 	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT} {
 		rules, err := n.rulesOf(chain)
@@ -183,13 +181,6 @@ func (n *Conn) CountersByComment() (*CountersByCommentResult, error) {
 				pair.Drop.add(snap)
 			} else {
 				pair.Accept.add(snap)
-				fs := out.FwdSrcnat[ud]
-				if chain == ChainSrcNAT {
-					fs[1].add(snap)
-				} else if chain == ChainFwd {
-					fs[0].add(snap)
-				}
-				out.FwdSrcnat[ud] = fs
 			}
 			out.ByRule[ud] = pair
 		}

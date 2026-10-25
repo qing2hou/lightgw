@@ -680,7 +680,7 @@ func (h *handlers) snatSummaryOf(r model.ForwardRule) *snatSummary {
 	}
 	var allowSrcs []string
 	_ = json.Unmarshal([]byte(r.AllowList), &allowSrcs)
-	if c := proxy.ReadSnatCounters(r.ID, r.ListenAddr, allowSrcs); c != nil {
+	if c := h.Mgr.ReadSnatCountersNFT(r.ID, r.ListenAddr, allowSrcs); c != nil {
 		s.Packets = c.PktsAccept
 		s.DeniedPk = c.PktsDrop
 	}
