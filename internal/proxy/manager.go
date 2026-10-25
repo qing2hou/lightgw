@@ -773,10 +773,13 @@ func (m *Manager) logPanic(where string, r any) {
 	logf("[panic] %s 发生 panic（已隔离，进程继续运行）: %v\n%s", where, r, debug.Stack())
 }
 
-// StartEgressProbing 启动出口探测循环（main 启动序列一次；升级交接时由
-// 子进程重启循环——父进程的循环随退出终止）。
+// StartEgressProbing 启动出口探测循环与翻转重算 worker（main 启动序列一次；
+// 升级交接时由子进程重启循环——父进程的循环随退出终止）。
 func (m *Manager) StartEgressProbing() {
-	m.egressStartOnce.Do(func() { go m.egressProbeLoop() })
+	m.egressStartOnce.Do(func() {
+		go m.egressProbeLoop()
+		go m.egressReapplyWorker()
+	})
 }
 
 // StopEgressProbing 停止探测循环（优雅关闭路径）。

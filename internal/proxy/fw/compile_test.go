@@ -268,3 +268,37 @@ func TestCIDRMatchDataBytes(t *testing.T) {
 		t.Fatal("未在 srcnat 行找到 CIDR Bitwise+Cmp 对")
 	}
 }
+
+func TestCIDRMatchDataBytesV6(t *testing.T) {
+	// 复审建议：v6 CIDR 的 Cmp Data 锁字节（To16 路径——将来最易改坏的行）
+	rules, err := CompileSNAT(Spec{
+		ID: 2, IfIn: "e0", IfOut: "e1", OutIP: "fd00::1",
+		AllowSrcs: []string{"fd00:ab::/64"}, DstMode: "off",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, r := range rules {
+		if r.Chain != nft.ChainSrcNAT {
+			continue
+		}
+		for i := 0; i+1 < len(r.Rule.Exprs); i++ {
+			bw, ok1 := r.Rule.Exprs[i].(*expr.Bitwise)
+			cm, ok2 := r.Rule.Exprs[i+1].(*expr.Cmp)
+			if !ok1 || !ok2 || len(bw.Mask) != 16 {
+				continue
+			}
+			// 网络 fd00:00ab:: → 前 8 字节 [fd 00 00 ab 00..]，后 8 字节零
+			want := make([]byte, 16)
+			want[0], want[1], want[2], want[3] = 0xfd, 0x00, 0x00, 0xab
+			if string(cm.Data) != string(want) {
+				t.Fatalf("v6 CIDR Cmp Data = % x，期望 % x", cm.Data, want)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("未在 srcnat 行找到 v6 CIDR Bitwise+Cmp（16B）对")
+	}
+}

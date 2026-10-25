@@ -287,8 +287,8 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 	// 出口网关（可选）：策略路由的下一跳，必须可从出口网卡直达（与出口网卡同网段）
 	if gw := strings.TrimSpace(in.EgressGw); gw != "" {
 		gwIP := net.ParseIP(gw)
-		if gwIP == nil || gwIP.To4() == nil {
-			return fmt.Errorf("出口网关 %q 不是合法的 IPv4 地址", gw)
+		if gwIP == nil {
+			return fmt.Errorf("出口网关 %q 不是合法的 IP 地址", gw)
 		}
 		if strings.TrimSpace(in.TargetAddr) != "" {
 			outIP := proxy.IPv4OfInterface(strings.TrimSpace(in.TargetAddr))
@@ -327,12 +327,18 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 		outIf := strings.TrimSpace(in.TargetAddr)
 		for _, m := range members {
 			m = strings.TrimSpace(m)
-			if net.ParseIP(m) == nil || net.ParseIP(m).To4() == nil {
-				return fmt.Errorf("snat_pool 成员 %q 不是合法 IPv4", m)
+			if !isV4OrV6Addr(m) {
+				return fmt.Errorf("snat_pool 成员 %q 不是合法 IP", m)
 			}
 			found := false
 			for _, v4 := range proxy.InterfaceIPv4s(outIf) {
 				if v4 == m {
+					found = true
+					break
+				}
+			}
+			for _, v6 := range proxy.InterfaceIPv6s(outIf) {
+				if v6 == m {
 					found = true
 					break
 				}
@@ -360,14 +366,21 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 			}
 		}
 	}
-	// 显式 SNAT 源 IP：必须是合法 IPv4 且当前绑定在出口网卡上（一卡多址中选一个）
+	// 显式 SNAT 源 IP：合法 IP 且当前绑定在出口网卡上（B8：v4/v6 双族——
+	// v6 源走 NAT66 编译路径；一卡多址中选一个）
 	if ip := strings.TrimSpace(in.SnatIP); ip != "" {
-		if net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil {
-			return fmt.Errorf("SNAT 源 IP %q 不是合法的 IPv4 地址", ip)
+		if !isV4OrV6Addr(ip) {
+			return fmt.Errorf("SNAT 源 IP %q 不是合法 IP 地址", ip)
 		}
 		found := false
 		for _, v4 := range proxy.InterfaceIPv4s(strings.TrimSpace(in.TargetAddr)) {
 			if v4 == ip {
+				found = true
+				break
+			}
+		}
+		for _, v6 := range proxy.InterfaceIPv6s(strings.TrimSpace(in.TargetAddr)) {
+			if v6 == ip {
 				found = true
 				break
 			}
@@ -479,15 +492,22 @@ func ifaceAddrStrings(iface *net.Interface) []string {
 	return out
 }
 
-// isCIDROrIP IPv4 地址或 IPv4 CIDR（IPv6 落库会让 iptables -s 安装失败——snat 白名单只认 v4）。
+// isCIDROrIP 合法 IP 或 CIDR（B8：v4/v6 双族——nftables 后端（M1 起）对 v6
+// 白名单有完整编译路径，旧 iptables 时代的 v4-only 理由已过时；v6 源匹配仅
+// 对 v6 出口规则生效（v4 OutIP 的规则配 v6 源在编译层自然不匹配，无害）。
 func isCIDROrIP(s string) bool {
 	s = strings.TrimSpace(s)
 	if strings.Contains(s, "/") {
 		ip, _, err := net.ParseCIDR(s)
-		return err == nil && ip != nil && ip.To4() != nil
+		return err == nil && ip != nil
 	}
 	ip := net.ParseIP(s)
-	return ip != nil && ip.To4() != nil
+	return ip != nil
+}
+
+// isV4OrV6Addr 合法单 IP（无 CIDR；双族）。
+func isV4OrV6Addr(s string) bool {
+	return net.ParseIP(strings.TrimSpace(s)) != nil
 }
 
 func validateTarget(target string) error {

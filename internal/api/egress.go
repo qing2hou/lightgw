@@ -213,8 +213,6 @@ func (h *handlers) deleteEgress(c *gin.Context) {
 		return
 	}
 	// 引用检查：规则绑定该出口的需先解绑（契约 40007）
-	var refCnt int64
-	h.DB.Model(&model.ForwardRule{}).Where("protocol = ? AND enabled = ?", "snat", true).Find(&[]model.ForwardRule{}).Count(&refCnt)
 	var rules []model.ForwardRule
 	h.DB.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules)
 	affected := []uint{}

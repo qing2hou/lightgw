@@ -246,7 +246,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		// 快速路径判定：引擎记得上一代 + 转发形态参数全部一致 + 无出口脏标记
 		// （B1：出口 up/down 翻转与 egress_ids 变更不在 sameForwarding 维度内，
 		//  由 egressDirty 强制全路径——否则切换/回切/分担变化全部被吞）
-		if old != nil && !m.egressDirty.Swap(false) && old.sameForwarding(spec) {
+		if old != nil && !m.egressDirty.Load() && old.sameForwarding(spec) {
 			if err := spec.applySnatLimit(); err != nil {
 				logf("规则[%s#%d] tc 限速重建失败（保持原限速）: %v", rule.Name, rule.ID, err)
 			} else if spec.BWGroupKBps > 0 {
@@ -347,12 +347,18 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 				logf("规则[%s#%d] 无可用出口（全部出口 down 或无绑定出口启用）——公网目标穿越不通", rule.Name, rule.ID)
 			}
 		} else if strings.TrimSpace(rule.EgressGw) != "" {
-			spec.RtTable = m.snatAllocTable(rule.ID)
-			if conn, cerr := m.nftConn(); cerr == nil {
-				nexthops := []nft.Nexthop{{Iface: spec.IfOut, Gw: net.ParseIP(spec.EgressGw), Weight: 1}}
-				if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
-					logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
-					spec.RtTable = 0
+			// v6 出口网关：v6 策略路由表在 T205（v6 multipath/request 表）——
+			// v4 表装不下 v6 nexthop，错误配置比没有更坏；SNAT66 本身照装
+			if gwIP := net.ParseIP(strings.TrimSpace(rule.EgressGw)); gwIP != nil && gwIP.To4() == nil {
+				logf("规则[%s#%d] v6 出口网关 %s 的策略路由将在后续版本支持（SNAT66 本身不受影响）", rule.Name, rule.ID, rule.EgressGw)
+			} else {
+				spec.RtTable = m.snatAllocTable(rule.ID)
+				if conn, cerr := m.nftConn(); cerr == nil {
+					nexthops := []nft.Nexthop{{Iface: spec.IfOut, Gw: net.ParseIP(spec.EgressGw), Weight: 1}}
+					if rerr := conn.EnsureEgressRoute(spec.RtTable, spec.AllowSrcs, nexthops); rerr != nil {
+						logf("规则[%s#%d] 出口策略路由未生效（公网目标穿越可能不通）: %v", rule.Name, rule.ID, rerr)
+						spec.RtTable = 0
+					}
 				}
 			}
 		}
@@ -467,6 +473,27 @@ func ListInterfaces() []IfaceInfo {
 			first = ips[0]
 		}
 		out = append(out, IfaceInfo{Name: i.Name, IPS: ips, IP: first, Status: status})
+	}
+	return out
+}
+
+// InterfaceIPv6s 返回网卡全部 IPv6（v6 SNAT 源/池归属校验用；T210/B8）。
+func InterfaceIPv6s(ifName string) []string {
+	iface, err := net.InterfaceByName(ifName)
+	if err != nil {
+		return nil
+	}
+	addrs, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, 2)
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip := ipn.IP; ip != nil && ip.To4() == nil && ip.To16() != nil && !ip.IsLinkLocalUnicast() {
+				out = append(out, ip.String())
+			}
+		}
 	}
 	return out
 }

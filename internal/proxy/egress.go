@@ -317,7 +317,9 @@ func (m *Manager) onEgressStateChange(e model.Egress) {
 }
 
 // killEgressSessions 掐断经指定出口的存量穿越会话（conntrack reply 源 =
-// SNAT 后源——匹配该出口网卡的全部 v4 地址）。
+// SNAT 后源）。锚点集 = 出口网卡全部 v4 地址 ∪ 引用该出口的规则的
+// OutIP/SnatPool 成员（复审 B4 场景 3：规则出口网卡与实体网卡不一致时
+// reply-src 是规则的 OutIP——仅按网卡地址集匹配会漏杀，存量黑洞残留）。
 func (m *Manager) killEgressSessions(e model.Egress) {
 	lines := readConntrackTable()
 	if lines == nil {
@@ -325,13 +327,37 @@ func (m *Manager) killEgressSessions(e model.Egress) {
 	}
 	egIPs := map[string]bool{}
 	iface, err := net.InterfaceByName(e.Iface)
-	if err != nil {
-		return
+	if err == nil {
+		addrs, _ := iface.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
+				egIPs[ipn.IP.String()] = true
+			}
+		}
 	}
-	addrs, _ := iface.Addrs()
-	for _, a := range addrs {
-		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil {
-			egIPs[ipn.IP.String()] = true
+	// 引用该出口的规则的 SNAT 源 IP（显式 SnatIP / 池成员）
+	var rules []model.ForwardRule
+	m.db.Where("protocol = ? AND enabled = ?", model.ProtocolSNAT, true).Find(&rules)
+	for _, r := range rules {
+		bound := false
+		for _, id := range egressIDsOfRule(r) {
+			if id == e.ID {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			continue
+		}
+		if ip := strings.TrimSpace(r.SnatIP); ip != "" {
+			egIPs[ip] = true
+		}
+		var members []string
+		_ = jsonUnmarshalStrings(strings.TrimSpace(r.SnatPool), &members)
+		for _, mm := range members {
+			if ip := net.ParseIP(strings.TrimSpace(mm)); ip != nil && ip.To4() != nil {
+				egIPs[strings.TrimSpace(mm)] = true
+			}
 		}
 	}
 	if len(egIPs) == 0 {
@@ -424,8 +450,8 @@ func (m *Manager) egressNexthops(ruleID uint, egressIDs []uint) []nft.Nexthop {
 		if len(enabled) > 0 && !enabled[e.ID] {
 			continue
 		}
-		if !EgressUp(e.ID) && e.ProbeMode != "none" {
-			continue // 探测配置的出口才有 up/down 语义；none 常开
+		if !EgressUp(e.ID) {
+			continue // none 出口的链路状态门也在 ProbeEgressOnce（S4：拔除即退出）
 		}
 		gw := e.GatewayV4
 		if gw == "" {
@@ -480,3 +506,35 @@ func egressIDsOfRule(rule model.ForwardRule) []uint {
 
 // ReapplySnatRules 导出包装（API 出口变更后的重算）。
 func (m *Manager) ReapplySnatRules() { m.reapplyAllSnatRules() }
+
+// egressReapplyWorker 出口翻转重算的聚批 worker（S1：探测 goroutine 只发
+// 信号不阻塞；100ms 聚批窗口合并翻转风暴；dirty 消费收敛于此——applySNAT
+// 快路径只 Load 不 Swap，避免无关规则的编辑偷走脏标记导致其他规则的切换丢失）。
+func (m *Manager) egressReapplyWorker() {
+	for {
+		select {
+		case <-m.egressDone:
+			return
+		case <-m.egressReapply:
+			time.Sleep(100 * time.Millisecond) // 聚批窗口
+			for {
+				select {
+				case <-m.egressReapply:
+					continue
+				default:
+				}
+				break
+			}
+			m.reapplyAllSnatRules()
+			// 重算结束统一清脏标记；清理前 100ms 内若又有翻转，信号位仍占——
+			// 下一轮 worker 会再跑（有界收敛，不丢翻转）
+			m.egressDirty.Store(false)
+			select {
+			case <-m.egressReapply:
+				// 聚批后新信号：立即处理下一轮（不清标记先跑都是全路径——
+				// reapplyAllSnatRules 走 applySNAT Load 检查）
+			default:
+			}
+		}
+	}
+}
