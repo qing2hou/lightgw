@@ -99,8 +99,10 @@ func (m *Manager) CheckBackendsNow() {
 	}
 	// 评审 #11：锁内只摘轻量快照（id + dnat 位），DB 查询与判定在锁外——
 	// 锁内做 IO 违反"阻塞操作不进锁"纪律
-	type dnatRef struct{ id uint }
-	var dnatRefs []dnatRef
+	// T104 + DEFECT-2 修复：dnat 探测集直接查 DB（启用中的 dnat 规则全集）。
+	// 此前从 m.snatRules 注册表收集——健康下线会把注册表条目删除（down 语义），
+	// 下轮探测集随之空掉 → 后端恢复后无人探测 → 发布永不重装（实测缺陷）。
+	// DB 是唯一权威源：规则启用即在探测集，与装载状态无关。
 	m.mu.Lock()
 	items := make([]item, 0, len(m.tcpRules))
 	for id, e := range m.tcpRules {
@@ -110,22 +112,14 @@ func (m *Manager) CheckBackendsNow() {
 		}
 		items = append(items, item{id: id, rule: rule})
 	}
-	for id, e := range m.snatRules {
-		if e.dnat {
-			dnatRefs = append(dnatRefs, dnatRef{id: id})
-		}
-	}
 	m.mu.Unlock()
-	// T104：dnat 规则的后端健康联动（锁外查 DB + healthCheckOn 判定）
-	for _, ref := range dnatRefs {
-		var rule model.ForwardRule
-		if err := m.db.First(&rule, ref.id).Error; err != nil {
-			continue // 已删除——下一轮 startup 对账清
-		}
-		if !rule.Enabled || !healthCheckOn(rule) {
+	var dnatRules []model.ForwardRule
+	m.db.Where("protocol = ? AND enabled = ?", model.ProtocolDNAT, true).Find(&dnatRules)
+	for _, r := range dnatRules {
+		if !healthCheckOn(r) {
 			continue // 评审 #11：显式关闭检测的发布规则不探测不卸载
 		}
-		items = append(items, item{id: ref.id, rule: rule})
+		items = append(items, item{rule: r})
 	}
 
 	var wg sync.WaitGroup

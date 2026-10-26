@@ -70,22 +70,40 @@ func (n *Conn) EnsureEgressRoute(rtTable int, srcs []string, nexthops []Nexthop)
 		return fmt.Errorf("路由表 %d 建立（multipath %d 跳）失败: %w", rtTable, len(mp), err)
 	}
 	for _, src := range srcs {
-		r := vnetlink.NewRule() // PoC 坑 2：必须 NewRule()，裸字面量零值即 EINVAL
-		r.Family = unix.AF_INET
-		r.Table, r.Priority = rtTable, RulePref
+		var srcNet *net.IPNet
 		if ip, ipn, err := net.ParseCIDR(src); err == nil {
-			r.Src = &net.IPNet{IP: ip, Mask: ipn.Mask}
+			srcNet = &net.IPNet{IP: ip, Mask: ipn.Mask}
 		} else if ip := net.ParseIP(src); ip != nil {
-			r.Src = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
+			srcNet = &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)}
 		} else {
 			return fmt.Errorf("策略路由源 %s 不是合法 IP/CIDR", src)
 		}
+		// DEFECT-4：DNAT 发布流量豁免——带 DNAT 位的包先回 main 表直连内网后端
+		//（否则源在白名单的客户端访问发布地址时，改写后的流量被 from 源 lookup 出口表
+		//  拉去外网网卡绕行）。pref 0（先于本规则的 pref 1）；幂等：先删同 pref 再装。
+		exempt := vnetlink.NewRule()
+		exempt.Family = unix.AF_INET
+		exempt.Priority = 0
+		exempt.Mark = MarkDNAT
+		exempt.Mask = uint32Ptr(MarkDNAT)
+		exempt.Table = unix.RT_TABLE_MAIN
+		exempt.Src = srcNet
+		_ = vnetlink.RuleDel(exempt) // 幂等
+		if err := vnetlink.RuleAdd(exempt); err != nil {
+			return fmt.Errorf("DNAT 直连豁免路由（from %s mark %#x lookup main）安装失败: %w", src, MarkDNAT, err)
+		}
+		r := vnetlink.NewRule() // PoC 坑 2：必须 NewRule()，裸字面量零值即 EINVAL
+		r.Family = unix.AF_INET
+		r.Table, r.Priority = rtTable, RulePref
+		r.Src = srcNet
 		if err := vnetlink.RuleAdd(r); err != nil {
 			return fmt.Errorf("策略路由（from %s lookup %d）安装失败: %w", src, rtTable, err)
 		}
 	}
 	return nil
 }
+
+func uint32Ptr(v uint32) *uint32 { return &v }
 
 // TearEgressRoute 拆除 per-规则策略路由。
 // 只删"lookup 本表"的规则（表号 per-规则分配，同表只可能属于本规则——
@@ -106,6 +124,17 @@ func (n *Conn) TearEgressRoute(rtTable int, _ []string) error {
 		dr.Family = unix.AF_INET
 		dr.Priority, dr.Table, dr.Src = r.Priority, r.Table, r.Src
 		_ = vnetlink.RuleDel(dr)
+		// DEFECT-4：同步清理该源的 DNAT 直连豁免行（pref 0 mark lookup main）
+		if r.Src != nil {
+			ex := vnetlink.NewRule()
+			ex.Family = unix.AF_INET
+			ex.Priority = 0
+			ex.Mark = MarkDNAT
+			ex.Mask = uint32Ptr(MarkDNAT)
+			ex.Table = unix.RT_TABLE_MAIN
+			ex.Src = r.Src
+			_ = vnetlink.RuleDel(ex)
+		}
 	}
 	// QA P2-01：RouteDel 单靠 Table 匹配不到 default 路由（内核要求
 	// Dst/Src/Gw 至少其一）——显式 0.0.0.0/0

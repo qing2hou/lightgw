@@ -9,6 +9,8 @@ import (
 	"net"
 	"strings"
 
+	vnetlink "github.com/vishvananda/netlink"
+
 	"haproxyweb/internal/model"
 	"haproxyweb/internal/nft"
 	"haproxyweb/internal/proxy/fw"
@@ -55,8 +57,16 @@ func (m *Manager) buildDNATSpec(rule model.ForwardRule) *fw.DNatSpec {
 	if rm != model.DnatRejectModeReject && rm != model.DnatRejectModeTimeout {
 		rm = model.DnatRejectModeReject
 	}
+	// DEFECT-5：hairpin SNAT 源 = 后端路由出口网卡的 IP
+	hairpin := ""
+	if bip != "" {
+		if ifn, _, err := routeIfaceOf(bip); err == nil && ifn != "" {
+			hairpin = ipv4Of(ifn)
+		}
+	}
 	return &fw.DNatSpec{
-		ID: rule.ID, ListenIP: lip, ListenPort: lport,
+		ID: rule.ID, IfIn: ifInOf(lip), HairpinIP: hairpin,
+		ListenIP: lip, ListenPort: lport,
 		BackendIP: bip, BackendPort: bport,
 		AllowSrcs: srcs, RejectMode: rm,
 	}
@@ -291,4 +301,64 @@ func (m *Manager) ReadDNATCountersNFT(ruleID uint, allowSrcs []string) *snatCoun
 		}
 	}
 	return nil // 降级：dnat 无 exec 口径，返回 nil 由调用方标注 unknown
+}
+
+// localIfacesOf 持有指定 IP 的网卡名列表（发布地址归属查找）。
+func localIfacesOf(ip string) []string {
+	var out []string
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	for _, i := range ifaces {
+		addrs, _ := i.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP.String() == ip {
+				out = append(out, i.Name)
+			}
+		}
+	}
+	return out
+}
+
+// ifInOf 发布 IP 所在的首个网卡名（无则空）。
+func ifInOf(ip string) string {
+	if l := localIfacesOf(ip); len(l) > 0 {
+		return l[0]
+	}
+	return ""
+}
+
+// routeIfaceOf 目标 IP 从本机出发的路由出口网卡名（hairpin IP 计算用——DEFECT-5）。
+// 取后端真实转发出口（而非发布地址所在网卡），保证对端回程同段直达本机。
+func routeIfaceOf(dstIP string) (string, net.IP, error) {
+	ip := net.ParseIP(dstIP)
+	if ip == nil {
+		return "", nil, fmt.Errorf("非法 IP %q", dstIP)
+	}
+	routes, err := vnetlink.RouteList(nil, vnetlink.FAMILY_V4)
+	if err != nil {
+		return "", nil, err
+	}
+	var best *vnetlink.Route
+	for i := range routes {
+		r := &routes[i]
+		if r.Dst != nil && !r.Dst.IP.Equal(net.IPv4zero) && r.Dst.Contains(ip) {
+			best = r // 最长前缀已由内核排好序（RouteList 返回内核序）
+			break
+		}
+		if r.Dst == nil || r.Dst.IP.Equal(net.IPv4zero) {
+			if best == nil {
+				best = r // default 兜底
+			}
+		}
+	}
+	if best == nil {
+		return "", nil, fmt.Errorf("无到 %s 的路由", dstIP)
+	}
+	ifn, err := vnetlink.LinkByIndex(best.LinkIndex)
+	if err != nil {
+		return "", nil, err
+	}
+	return ifn.Attrs().Name, best.Src, nil
 }

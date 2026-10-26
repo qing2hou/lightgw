@@ -27,6 +27,8 @@ import (
 // DNatSpec dnat 规则的内核面参数。
 type DNatSpec struct {
 	ID          uint
+	IfIn        string   // 发布地址所在网卡名（展示用）
+	HairpinIP   string   // hairpin SNAT 源（入口网卡 IP；DEFECT-5——空则不装）
 	ListenIP    string   // 发布公网 IP（v4）
 	ListenPort  int      // 发布端口
 	BackendIP   string   // 内网后端 IP（v4）
@@ -69,18 +71,15 @@ func CompileDNAT(s DNatSpec) ([]Rule, error) {
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(uint16(s.ListenPort))},
 	}
 
-	// ① pre_mark：established/related 且目的为发布地址 → 打标（回程与后续包的
-	// 锚点/默认拒绝放行位；**新包不打**——新包由 fwd 行的源白名单裁决，
-	// 否则名单外源新包在 pre_mark 就拿标、绕过白名单）
+	// ① pre_mark：命中发布地址 → 打 FwdOK|DNAT 位（DEFECT-4：DNAT 位豁免策略路由与
+	// srcnat——否则源在 snat 白名单内的客户端访问发布地址时，改写后的后端流量被该源的
+	// 出口策略路由拉去外网网卡绕行并误 SNAT）。
+	// 新包同样打 DNAT 位（首包路由决策就需要豁免）；FwdOK 的白名单裁决仍在 fwd 行——
+	// 名单外新包 DNAT 位在但 FwdOK 无 → 默认拒绝行照拒（白名单语义不变）。
+	both := nft.MarkFwdOK | nft.MarkDNAT
 	out = append(out, Rule{Chain: nft.ChainPreMark, Rule: &nftables.Rule{
 		Table: tbl, UserData: []byte(ud),
-		Exprs: append(append([]expr.Any{
-			&expr.Ct{Key: expr.CtKeySTATE, Register: 1},
-			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
-				Mask: binaryutil.NativeEndian.PutUint32(expr.CtStateBitESTABLISHED | expr.CtStateBitRELATED),
-				Xor:  binaryutil.NativeEndian.PutUint32(0)},
-			&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
-		}, match...), nft.SetMarkExprs(nft.MarkFwdOK)...),
+		Exprs: append(append([]expr.Any{}, match...), nft.SetMarkExprs(both)...),
 	}})
 
 	// ② dstnat：DNAT 到后端（NAT 链仅每连接首包求值——counter 计连接而非包）
@@ -93,6 +92,26 @@ func CompileDNAT(s DNatSpec) ([]Rule, error) {
 	out = append(out, Rule{Chain: nft.ChainDstNAT, Rule: &nftables.Rule{
 		Table: tbl, UserData: []byte(ud), Exprs: dnat,
 	}})
+
+	// ②b srcnat：hairpin SNAT（DEFECT-5）：DNAT 改写后的流量源改写为【后端出口网卡 IP】——
+	// 强制回程经本网关（对端与本网关不同段/回程直连路由绕过网关时，反 DNAT 失配，
+	// 客户端收到陌生五元组的 SYN-ACK 直接 RST——发布不可用）。
+	// 匹配：mark 含 DNAT 位（① 已对发布命中流打标）→ snat to <后端出口网卡 IP>。
+	if ifIP := v4(s.HairpinIP); ifIP != nil {
+		out = append(out, Rule{Chain: nft.ChainSrcNAT, Rule: &nftables.Rule{
+			Table: tbl, UserData: []byte(ud),
+			Exprs: []expr.Any{
+				&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+				&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+					Mask: binaryutil.NativeEndian.PutUint32(nft.MarkDNAT),
+					Xor:  binaryutil.NativeEndian.PutUint32(0)},
+				&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
+				&expr.Immediate{Register: 1, Data: ifIP},
+				&expr.NAT{Type: expr.NATTypeSourceNAT, Family: uint32(natFamily),
+					RegAddrMin: 1, RegAddrMax: 1},
+			},
+		}})
+	}
 
 	// ③ fwd：入向放行（每源一行：daddr=后端（DNAT 改写后 fwd 看到的目的）+
 	// dport=后端端口 + saddr∈白名单 → counter + mark）

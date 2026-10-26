@@ -230,17 +230,19 @@ func (m *Manager) SnapshotSessions() []CTSnapshot {
 			// orig：客户端/目标真实四元组
 			Src: net.JoinHostPort(c.origSrc, c.origSPort),
 			Dst: net.JoinHostPort(c.origDst, c.origDPort),
-			// reply 元组：SNAT 后的会话形态——reply.src=SNAT出口、
-			// reply.dst=SNAT出口:客户端（回程视角）。src_after 取 reply.src
-			SrcAfter: net.JoinHostPort(c.replySrc, c.replySPort),
+			// NAT 后源（DEFECT-3 修正）：conntrack 的 reply tuple[::-1]——
+			// reply.src 是对端服务器、reply.dst 才是本机 SNAT 后的源。
+			// NAT 后源:port = reply.dst:reply.dport
+			SrcAfter: net.JoinHostPort(c.replyDst, c.replyDPort),
 			State:    stateOfConntrackLine(ln),
 		}
 		s.ID = encodeCTID(c)
-		// 归属判定（评审 Nit#22 简化，顺序判断）：
-		//   snat：reply.src = SNAT 出口 IP；dnat：orig.dst = 发布 IP
+		// 归属判定（DEFECT-3 修正）：
+		//   snat：reply.dst = SNAT 出口 IP（回程目的地即被改写的源）；
+		//   dnat：orig.dst = 发布 IP
 		switch {
-		case snatOutIPs[c.replySrc] != "":
-			s.Router = snatOutIPs[c.replySrc]
+		case snatOutIPs[c.replyDst] != "":
+			s.Router = snatOutIPs[c.replyDst]
 		case dnatListenIPs[c.origDst]:
 			s.Router = "dnat:" + c.origDst
 		default:

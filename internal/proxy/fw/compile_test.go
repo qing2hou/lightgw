@@ -251,10 +251,11 @@ func TestCIDRMatchDataBytes(t *testing.T) {
 		for i := 0; i+1 < len(r.Rule.Exprs); i++ {
 			bw, ok1 := r.Rule.Exprs[i].(*expr.Bitwise)
 			cm, ok2 := r.Rule.Exprs[i+1].(*expr.Cmp)
-			if !ok1 || !ok2 {
+			if !ok1 || !ok2 || len(bw.Mask) != 4 {
 				continue
 			}
-			if len(bw.Mask) != 4 {
+			// CIDR 掩码首字节是 255（区分 DEFECT-4 的 DNAT 位掩码 0x4）
+			if bw.Mask[0] != 255 {
 				continue
 			}
 			want := []byte{192, 168, 1, 0}
@@ -301,4 +302,17 @@ func TestCIDRMatchDataBytesV6(t *testing.T) {
 	if !found {
 		t.Fatal("未在 srcnat 行找到 v6 CIDR Bitwise+Cmp（16B）对")
 	}
+}
+
+func TestIifOifExcludesDNATBit(t *testing.T) {
+	// DEFECT-4 回归：iifOifExprs 必须含 DNAT 位排除（mark&0x4==0 才匹配）——
+	// 否则 DNAT 后端流量被 snat 规则误改写
+	ex := iifOifExprs("eth0", "eth1")
+	want := []byte{4, 0, 0, 0} // MaskDNAT 位掩码（native 小端 u32：低位在前）
+	for _, e := range ex {
+		if bw, ok := e.(*expr.Bitwise); ok && len(bw.Mask) == 4 && string(bw.Mask) == string(want) {
+			return // 找到位掩码序列 ✓
+		}
+	}
+	t.Fatal("iifOifExprs 缺 DNAT 位排除掩码（DEFECT-4 回归——srcnat 会误改写 DNAT 后端流量）")
 }

@@ -223,12 +223,21 @@ func CompileDefaultDeny(ruleID uint, ifaces []string) []Rule {
 
 // iifOifExprs 入口+出口双维度匹配（旧形态 -i in -o out 的等价；防多网卡机器上
 // 从第三块网卡出的包被误改写/误放行——评审 M2）。
+// DEFECT-4：前提 DNAT 位（mark&0x4≠0）不匹配——DNAT 发布的后端流量不走 SNAT
+// （发布流量直达后端，源不该被改写；若源恰在 snat 白名单且出口策略路由在场，
+//
+//	无此前提会把直连后端流量误 SNAT 成出口 IP）。
 func iifOifExprs(ifin, ifout string) []expr.Any {
 	return []expr.Any{
 		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifnameBytes(ifin)},
 		&expr.Meta{Key: expr.MetaKeyOIFNAME, Register: 1},
 		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ifnameBytes(ifout)},
+		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4,
+			Mask: binaryutil.NativeEndian.PutUint32(nft.MarkDNAT),
+			Xor:  binaryutil.NativeEndian.PutUint32(0)},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
 	}
 }
 

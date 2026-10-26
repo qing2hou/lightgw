@@ -13,6 +13,10 @@ const (
 	// MarkPolicyOK bit1：策略放行位（accept 策略命中——仅计数/标记用途，
 	// 不参与默认拒绝判定：策略 accept 不豁免规则白名单，AND 语义——评审 #2）
 	MarkPolicyOK uint32 = 0x2
+	// MarkDNAT bit2：DNAT 发布命中位（DEFECT-4：源=某 snat 白名单的客户端访问
+	// 发布地址时，DNAT 改写后的内网后端流量被该源的策略路由（from 源 lookup 出口表）
+	// 拉去外网出口绕行并误 SNAT——发布流量应直连后端：srcnat 豁免 + 策略路由回 main 表）
+	MarkDNAT uint32 = 0x4
 )
 
 // anchorExprs 锚点规则表达式：meta mark & 0x1 == 0x1 → accept。
