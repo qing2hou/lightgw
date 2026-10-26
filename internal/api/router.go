@@ -239,7 +239,12 @@ func spaHandler(distFS fs.FS) gin.HandlerFunc {
 			c.String(http.StatusServiceUnavailable, "前端资源未构建：请先执行 make web")
 			return
 		}
+		// index.html 禁缓存（带 hash 的 assets 由文件名版本化可长缓存）——
+		// 否则浏览器缓存旧 index 会引用已不存在的旧 bundle，升级后用户停留在旧前端
 		c.Request.URL.Path = "/"
+		if strings.HasSuffix(c.Request.URL.Path, "/") || c.Request.URL.Path == "/" {
+			c.Writer.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+		}
 		fileServer.ServeHTTP(c.Writer, c.Request)
 	}
 }
