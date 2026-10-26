@@ -153,9 +153,9 @@ const form = ref(emptyForm())
 async function load() {
   loading.value = true
   try {
-    const res = await api.get('/rules', { params: { protocol: 'dnat', page: page.value, page_size: pageSize } })
-    rules.value = res.items || []
-    total.value = res.total || 0
+    const { data } = await api.get('/rules', { params: { protocol: 'dnat', page: page.value, page_size: pageSize } })
+    rules.value = data.items || []
+    total.value = data.total || 0
   } catch (e) {
     ElMessage.error(e.error || '加载失败')
   } finally {
@@ -165,8 +165,8 @@ async function load() {
 
 async function loadIfaces() {
   try {
-    const res = await api.get('/interfaces')
-    ifaces.value = res.items || res || []
+    const { data } = await api.get('/interfaces')
+    ifaces.value = data.items || []
     const ips = []
     for (const i of ifaces.value) {
       for (const ip of i.ips || []) ips.push({ ip, iface: i.name })

@@ -123,8 +123,8 @@ const form = ref(emptyForm())
 async function load() {
   loading.value = true
   try {
-    const res = await api.get('/fw-policies')
-    policies.value = res.items || []
+    const { data } = await api.get('/fw-policies')
+    policies.value = data.items || []
   } catch (e) {
     ElMessage.error(e.error || '加载失败')
   } finally {

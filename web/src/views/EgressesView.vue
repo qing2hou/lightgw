@@ -136,8 +136,8 @@ const form = ref(emptyForm())
 async function load() {
   loading.value = true
   try {
-    const res = await api.get('/egresses')
-    egresses.value = res.items || []
+    const { data } = await api.get('/egresses')
+    egresses.value = data.items || []
   } catch (e) {
     ElMessage.error(e.error || '加载失败')
   } finally {
@@ -147,8 +147,8 @@ async function load() {
 
 async function loadIfaces() {
   try {
-    const res = await api.get('/interfaces')
-    ifaces.value = res.items || res || []
+    const { data } = await api.get('/interfaces')
+    ifaces.value = data.items || []
   } catch { /* 静默 */ }
 }
 
