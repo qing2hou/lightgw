@@ -136,7 +136,32 @@
         </el-form-item>
         <el-form-item label="出口网关">
           <el-input v-model="form.egress_gw" placeholder="如 172.16.40.1（留空=仅直连网段）" class="mono-input" />
-          <div class="form-tip">穿越目标是公网/跨网段时必填：出向流量经此网关从出口网卡出去（须与出口网卡同网段）；纯直连网段目标可留空</div>
+          <div class="form-tip">穿越目标是公网/跨网段时必填：出向流量经此网关从出口网卡出去（须与出口网卡同网段）；纯直连网段目标可留空；配置了出口实体（「出口管理」页）时以出口实体为准</div>
+        </el-form-item>
+
+        <el-divider content-position="left">多出口与 SNAT 源池</el-divider>
+        <el-form-item label="绑定出口">
+          <el-select v-model="form.egress_ids" multiple placeholder="不绑定 = 全部启用出口" style="width: 100%">
+            <el-option v-for="eg in egresses" :key="eg.id" :value="eg.id"
+              :label="`${eg.name}（${eg.iface}，优先级 ${eg.priority}${eg.status ? '，' + (eg.status === 'up' ? '可用' : '不可用') : ''}）`"
+              :disabled="!eg.enabled" />
+          </el-select>
+          <div class="form-tip">多出口在「出口管理」页维护；绑定后仅经所选出口出站（多层主备+同层权重分担，探测自动切换）</div>
+        </el-form-item>
+        <el-form-item label="SNAT 源模式">
+          <el-radio-group v-model="form.snat_mode">
+            <el-radio value="fixed">固定单 IP</el-radio>
+            <el-radio value="rotate">按源轮换</el-radio>
+            <el-radio value="sticky">源粘滞</el-radio>
+          </el-radio-group>
+          <div class="form-tip">v1 的轮换/粘滞同为"源确定性映射"（同源恒同出口 IP）；源池成员在下方填写（1-32 个，须归属出口网卡）</div>
+        </el-form-item>
+        <el-form-item v-if="form.snat_mode !== 'fixed'" label="SNAT 源池">
+          <el-select v-model="form.snat_pool" multiple allow-create filterable default-first-option
+            placeholder="选择出口网卡地址，或直接输入 IP 回车" style="width: 100%" class="mono-input">
+            <el-option v-for="ip in outIfIPs" :key="ip" :value="ip" :label="ip" />
+          </el-select>
+          <div class="form-tip">池成员即出口网卡上的多个地址（一卡多址），每个源客户端确定性映射到其中一个</div>
         </el-form-item>
 
         <el-divider content-position="left">源 IP 网段（哪些客户端能走本规则穿越；必须至少一条）</el-divider>
@@ -224,6 +249,7 @@ const saving = ref(false)
 const allowInput = ref('')
 const dstInput = ref('')
 const ifaces = ref([])
+const egresses = ref([])
 let timer = null
 
 const emptyForm = () => ({
@@ -232,6 +258,9 @@ const emptyForm = () => ({
   target_addr: '',
   snat_ip: '',
   egress_gw: '',
+  snat_mode: 'fixed',
+  snat_pool: [],
+  egress_ids: [],
   allow: [],
   acl_group_id: 0,
   srcFrom: 'manual',
@@ -320,6 +349,9 @@ function openEdit(row) {
     target_addr: row.target_addr,
     snat_ip: row.snat_ip || '',
     egress_gw: row.egress_gw || '',
+    snat_mode: row.snat_mode || 'fixed',
+    snat_pool: parseList(row.snat_pool) || [],
+    egress_ids: (row.egress_ids || []).map(Number),
     // 组引用与直配按原样装载，保存时不丢失（引用组的规则直配列表为空是正常态）
     acl_group_id: row.acl_group_id || 0,
     srcFrom: row.acl_group_id ? 'group' : 'manual',
@@ -407,6 +439,9 @@ async function save() {
       target_addr: form.target_addr,
       snat_ip: form.snat_ip || '',
       egress_gw: form.egress_gw.trim(),
+      snat_mode: form.snat_mode,
+      snat_pool: form.snat_mode === 'fixed' ? '[]' : JSON.stringify(form.snat_pool || []),
+      egress_ids: JSON.stringify(form.egress_ids || []),
       acl_mode: isWhitelist ? 'whitelist' : 'off',
       allow_list: !form.acl_group_id && form.allow.length ? JSON.stringify(form.allow) : '',
       deny_list: '',
@@ -465,6 +500,7 @@ async function remove(row) {
 }
 
 onMounted(() => {
+  loadEgresses()
   load()
   loadIfaces()
   timer = setInterval(() => {
@@ -559,3 +595,9 @@ onUnmounted(() => clearInterval(timer))
   padding-right: 8px;
 }
 </style>
+async function loadEgresses() {
+  try {
+    const res = await api.get('/egresses')
+    egresses.value = res.items || []
+  } catch { /* 静默 */ }
+}

@@ -178,7 +178,21 @@ func (h *handlers) healthz(c *gin.Context) {
 	h.DB.Model(&model.ForwardRule{}).Where("last_error <> ''").Count(&ruleFailed)
 	ec := h.Mgr.EngineCounters()
 
+	// 出口状态摘要（M3/P2-2：AC-4.5 的 healthz 可见性）
+	var egs []model.Egress
+	h.DB.Where("enabled = ?", true).Find(&egs)
+	egressUp, egressDown := 0, 0
+	for _, e := range egs {
+		if proxy.EgressUp(e.ID) {
+			egressUp++
+		} else {
+			egressDown++
+		}
+	}
+
 	c.JSON(200, gin.H{
+		"egresses_up":            egressUp,
+		"egresses_down":          egressDown,
 		"status":                 "ok",
 		"version":                h.Version,
 		"tls":                    h.Cfg.TLSEnabled(),
