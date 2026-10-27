@@ -962,11 +962,14 @@ func (s *snatRuleSpec) teardownSnatLimit() error {
 // 注：per-规则 egress 路由仅在 egress_gw 配置时安装。
 
 const (
-	snatRouteTableBase = 201 // haweb 专属路由表号起点（200 以下留给系统）
-	snatRulePref       = 1   // ip rule 优先级（最高，先于 main 的 32766）
+	snatRouteTableBase = nft.RouteTableBase // 201：haweb 专属路由表号起点（200 以下留给系统）
+	snatRouteTableEnd  = nft.RouteTableEnd  // 252：**不能取到 253+**（253 default/254 main/255 local 是内核保留表）
+	snatRulePref       = 1                  // ip rule 优先级（最高，先于 main 的 32766）
 )
 
-// snatAllocTable 分配当前未占用的表号（从 201 起；仅选用本规则未占的）。
+// snatAllocTable 分配当前未占用的表号（仅选用本规则未占的）。
+// 区间以 nft.RouteTableEnd 为界：早期版本取 201..300，一旦规则数超过 52 条
+// 就会分配到 254（内核 main 表），装路由时覆盖/拆表时删除的正是整机默认路由。
 func (m *Manager) snatAllocTable(ruleID uint) int {
 	used := map[int]bool{}
 	m.mu.Lock()
@@ -976,11 +979,16 @@ func (m *Manager) snatAllocTable(ruleID uint) int {
 		}
 	}
 	m.mu.Unlock()
-	for t := snatRouteTableBase; t < snatRouteTableBase+100; t++ {
+	for t := snatRouteTableBase; t <= snatRouteTableEnd; t++ {
+		if nft.IsReservedRouteTable(t) {
+			continue // 冗余防护：区间常量若被误改也不落到保留表
+		}
 		if !used[t] {
 			return t
 		}
 	}
+	logf("[snat] 专属路由表段 %d-%d 已用尽，规则#%d 无法分配策略路由表",
+		snatRouteTableBase, snatRouteTableEnd, ruleID)
 	return 0
 }
 

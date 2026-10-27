@@ -118,3 +118,67 @@
 
 ## 六、结论
 **生产全功能验收通过**：8 组 38 用例全绿；4 项真实缺陷（含 2 项 P1 结构性缺陷）发现→修复→生产复验闭环，修复已入库（9c2f973）并热升级至 170 现网。
+
+---
+
+# 追加：SNAT 规则表单缺陷（DEFECT-7/8/9）与 P0 路由事故（DEFECT-10）
+
+## 一、用户实测触发的三个表单缺陷
+
+用户在「SNAT 穿越」页点保存时收到 `fixed 模式不配置 snat_pool（单 IP 用 snat_ip）`，
+同时页面表格与出口下拉均为空。三者根因彼此独立：
+
+| 编号 | 级别 | 现象 | 根因 | 修复 |
+|---|---|---|---|---|
+| DEFECT-7 | P1 | 新建/编辑 SNAT 规则必定 400 | 前端 fixed 模式固定提交 `snat_pool: '[]'`；后端 `validateSnat` 以 `SnatPool != ""` 判"已配置源池"，空数组被当成非空 | 后端新增 `isEmptyJSONList`（空串/`[]`/`null` 等价于未配置）+ `toRule()` 按模式归一落库；前端 fixed 模式不再提交该字段；rotate/sticky 空池补前置提示 |
+| DEFECT-8 | P1 | SNAT 规则列表恒为空、出口下拉无选项 | `loadEgresses()` 被误写在 `<style>` 块之后（SFC 之外），Vue 编译器**静默丢弃**该函数定义，而 `onMounted` 仍调用它 → ReferenceError 中断挂载钩子，`load()`/`loadIfaces()` 一并未执行 | 函数移回 `<script setup>` 内 |
+| DEFECT-9 | P2 | 编辑已绑定出口的规则时前端抛异常 | `egress_ids` 在库/接口里是 JSON 字符串（`"[2]"`），前端直接 `.map(Number)` | 改为 `parseListJSON(row.egress_ids).map(Number)` |
+
+**验证**（修复后热升级至 170，API 全量复测）：
+
+| 用例 | 结果 |
+|---|---|
+| 新建 SNAT（fixed + `snat_pool:"[]"`，前端原样报文） | 200，落库 `snat_pool=''` ✅ |
+| 编辑同规则（同一报文 PUT） | 200，落库归一 ✅ |
+| rotate 模式空池 | 400 `rotate 模式的 snat_pool 需 1-32 个出口网卡地址（当前 0 个）` ✅ |
+| fixed 模式真配源池 | 400 `fixed 模式不配置 snat_pool` ✅ |
+| 内核面装载 | `fwd` 新增源白名单行、`srcnat` 新增 SNAT 行、`ip rule ... lookup 203`、DNAT 豁免 pref 0 全部落位 ✅ |
+| 正常 API 删除 | 路由表 203 与 `lookup 203` 规则同步清除 ✅ |
+| 线上 bundle 内容核对 | 三项修复全部存在于 `SnatRulesView-D-7MH4Nj.js` ✅ |
+
+## 二、DEFECT-10（P0）：孤儿策略路由对账导致 170 整机失联
+
+**这是我引入的代码缺陷，并非既有功能。** 在清理上节测试残留时发现"绕过 API 直改库删除规则后，
+nft 规则会被启动对账回收，但 ip rule/路由表不会"，于是新增了一段策略路由启动对账。
+
+错误：扫描区间取 `RouteTableBase(201) .. +99(300)`。**254 是内核 main 表**，而每台机器都有
+系统自带的 `32766: from all lookup main`。该规则被判定为孤儿后，`TearEgressRoute(254)`
+删除了这条 ip rule 并删除 main 表的 `default` 路由 → 主机瞬间失去全部非本机路由：
+
+```
+现象：170 从同网段所有主机不可达（ARP INCOMPLETE），eth0/eth1 双网卡全断，
+      同段 151/153/网关均正常（排除交换机/网段问题）。
+```
+
+**处置**：
+1. 移除该孤儿对账功能（净收益不足，且无法在真实主机上安全验证）。
+2. 保留并加固一个确实存在的旧缺陷：路由表分配/拆除区间本身可能踩到 253-255。
+   新增 `RouteTableEnd = 252` 与 `IsReservedRouteTable()`，`TearEgressRoute` 对
+   段外/保留表号**直接拒做**（返回错误，绝不触碰 netlink）。
+3. 新增回归测试 `TestReservedRouteTableGuard` / `TestTearEgressRouteRefusesReserved`。
+
+**恢复 170 需要带外操作**（主机已无 IP 连通性，SSH 不可用）。可选任一：
+- Proxmox 控制台（`192.168.10.10:8006`，需其登录凭据）→ 打开 170 控制台执行：
+  ```bash
+  ip route add default via 192.168.10.1 dev eth0 table main
+  ip rule add pref 32766 from all lookup main    # 若已缺失
+  systemctl restart haproxyweb
+  ```
+- 或直接重启 170 虚机（路由状态不持久化，重启即恢复；`/data` 数据不受影响）。
+
+**教训**：
+- 任何会删除 ip rule / 路由条目的代码，必须对内核保留表（253/254/255/32766+）设硬护栏，
+  且护栏应在**最内层**而非调用方。
+- 生产主机上"顺手补一个对账功能"的代价可能是整机失联——非需求内的加固改动，
+  应在隔离环境验证后再上生产。
+- 删除类操作的爆炸半径要按"最坏输入"评估：此处传错一个表号就是断网。

@@ -1,5 +1,24 @@
 # 更新日志
 
+## 未发布——生产缺陷修复（2026-10-27）
+
+### 修复
+- **SNAT 规则保存必定失败（P1）**：fixed 模式下前端提交 `snat_pool:"[]"`，
+  后端把空 JSON 数组当作"已配置源池"而 400。现统一把空串/`[]`/`null`
+  视为未配置（`isEmptyJSONList`），并在落库前按模式归一转空。
+- **SNAT 页面规则列表与出口下拉全空（P1）**：`loadEgresses()` 被写在
+  `<style>` 块之后，Vue 编译器静默丢弃该定义但 `onMounted` 仍调用，
+  ReferenceError 中断整个挂载钩子（`load`/`loadIfaces` 一并未执行）。
+- **编辑已绑定出口的规则时前端异常（P2）**：`egress_ids` 是 JSON 字符串，
+  前端直接 `.map(Number)`；改为先 `parseListJSON` 再映射。
+
+### 安全加固
+- **路由表号护栏**：新增 `RouteTableEnd = 252` 与 `IsReservedRouteTable()`；
+  `TearEgressRoute` 对段外/内核保留表号（253 default、254 main、255 local、
+  32766+）直接拒做。此前分配/拆除区间按 201..300 取，把 main 表包在扫描
+  范围内，一次误判即可删除 main 的默认路由导致整机失联（详见
+  `docs/test-report-prod-170.md` 的 DEFECT-10）。
+
 ## v1.0 fwgateway——专线防火墙网关（2026-10-26）
 
 纯 Go 的多 IP 多出口双栈防火墙网关：全部转发经内核 nftables 数据面线速执行

@@ -4,6 +4,7 @@ package nft
 
 import (
 	"net"
+
 	"testing"
 )
 
@@ -97,5 +98,47 @@ func TestPolicyVerdictIsDrop(t *testing.T) {
 		if got := policyVerdictIsDrop(c.verdict); got != c.want {
 			t.Fatalf("%s（verdict=%d）: got %v want %v", c.what, c.verdict, got, c.want)
 		}
+	}
+}
+
+// TestReservedRouteTableGuard 路由表号护栏：拆除动作绝不能落到内核保留表。
+// 生产事故回归——曾对 201..300 做孤儿扫描，把 254(main) 判成孤儿并删掉其
+// 默认路由，目标主机整机失联。
+func TestReservedRouteTableGuard(t *testing.T) {
+	for _, tbl := range []int{0, 253, 254, 255, 32766, 32767, 1000} {
+		if !IsReservedRouteTable(tbl) && (tbl < RouteTableBase || tbl > RouteTableEnd) {
+			continue // 段外普通表号由段界判断拦下，不算保留表
+		}
+		if tbl == 1000 {
+			t.Fatalf("表号 %d 不应被判定为保留表（应由段界拦下）", tbl)
+		}
+		if !IsReservedRouteTable(tbl) {
+			t.Fatalf("表号 %d 应被判定为内核保留表", tbl)
+		}
+	}
+	for _, tbl := range []int{201, 251, 252} {
+		if IsReservedRouteTable(tbl) {
+			t.Fatalf("表号 %d 是 haweb 专属段，不应算保留表", tbl)
+		}
+	}
+	// 专属段必须严格低于 253，否则 main/local/default 会落进分配域
+	if RouteTableEnd >= 253 {
+		t.Fatalf("RouteTableEnd=%d 越界：253-255 是内核保留表", RouteTableEnd)
+	}
+	if RouteTableEnd < RouteTableBase {
+		t.Fatalf("专属段区间非法: %d-%d", RouteTableBase, RouteTableEnd)
+	}
+}
+
+// TestTearEgressRouteRefusesReserved 拆除动作对保留表/段外表必须拒做且不panic。
+func TestTearEgressRouteRefusesReserved(t *testing.T) {
+	c := &Conn{} // 不接内核：护栏应在外层就返回，不触碰 netlink
+	for _, tbl := range []int{253, 254, 255, 32766, 1000, 300} {
+		if err := c.TearEgressRoute(tbl, nil); err == nil {
+			t.Fatalf("表号 %d 应被拒绝拆除", tbl)
+		}
+	}
+	if err := c.TearEgressRoute(0, nil); err != nil {
+		t.Fatalf("表号 0（未分配）应静默跳过，实际: %v", err)
 	}
 }

@@ -351,7 +351,8 @@ function openEdit(row) {
     egress_gw: row.egress_gw || '',
     snat_mode: row.snat_mode || 'fixed',
     snat_pool: parseList(row.snat_pool) || [],
-    egress_ids: (row.egress_ids || []).map(Number),
+    // egress_ids 在库/接口里是 JSON 字符串（如 "[1,2]"），必须先解析再转数字
+    egress_ids: parseListJSON(row.egress_ids).map(Number),
     // 组引用与直配按原样装载，保存时不丢失（引用组的规则直配列表为空是正常态）
     acl_group_id: row.acl_group_id || 0,
     srcFrom: row.acl_group_id ? 'group' : 'manual',
@@ -429,6 +430,9 @@ async function save() {
   if (form.dst_mode !== 'off' && !form.dst_list.length) {
     return ElMessage.warning(form.dst_mode === 'whitelist' ? '「仅允许访问」需至少一条目标（空名单会拒绝全部目标）' : '「禁止访问」需至少一条目标（空名单等于不限制）')
   }
+  if (form.snat_mode !== 'fixed' && !(form.snat_pool || []).length) {
+    return ElMessage.warning('轮换/粘滞模式需至少一个源池成员（须为出口网卡上的地址）')
+  }
   saving.value = true
   try {
     const isWhitelist = !!(form.allow.length || form.acl_group_id)
@@ -440,7 +444,8 @@ async function save() {
       snat_ip: form.snat_ip || '',
       egress_gw: form.egress_gw.trim(),
       snat_mode: form.snat_mode,
-      snat_pool: form.snat_mode === 'fixed' ? '[]' : JSON.stringify(form.snat_pool || []),
+      // fixed 模式不承载源池：不提交该字段（提交空数组也会被后端归一为空）
+      snat_pool: form.snat_mode === 'fixed' ? '' : JSON.stringify(form.snat_pool || []),
       egress_ids: JSON.stringify(form.egress_ids || []),
       acl_mode: isWhitelist ? 'whitelist' : 'off',
       allow_list: !form.acl_group_id && form.allow.length ? JSON.stringify(form.allow) : '',
@@ -520,6 +525,12 @@ onMounted(() => {
   }, 5000)
 })
 onUnmounted(() => clearInterval(timer))
+async function loadEgresses() {
+  try {
+    const { data } = await api.get('/egresses')
+    egresses.value = data.items || []
+  } catch (e) { /* 不阻塞页面：出口下拉为空不影响规则新建/编辑 */ }
+}
 </script>
 
 <style scoped>
@@ -595,9 +606,3 @@ onUnmounted(() => clearInterval(timer))
   padding-right: 8px;
 }
 </style>
-async function loadEgresses() {
-  try {
-    const res = await api.get('/egresses')
-    egresses.value = res.items || []
-  } catch { /* 静默 */ }
-}

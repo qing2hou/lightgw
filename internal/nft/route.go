@@ -11,8 +11,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// RouteTableBase haweb 专属路由表号起点（沿承 iptables 时代段位 201-300）。
+// RouteTableBase haweb 专属路由表号起点（沿承 iptables 时代段位）。
 const RouteTableBase = 201
+
+// RouteTableEnd haweb 专属路由表号终点（含）。
+//
+// 绝不能取到 253 及以上：253=default、254=main、255=local 都是内核保留表。
+// 曾有一版启动对账按 201..300 扫描孤儿表，把系统自带的 `32766: lookup main`
+// 判成孤儿并连带删掉 main 的默认路由——整机瞬间失去全部非本机路由
+// （192.168.10.170 生产事故）。分配与任何清理逻辑都必须以本常量为界。
+const RouteTableEnd = 252
+
+// IsReservedRouteTable 内核保留表号（分配/清理的硬性护栏）。
+// 0=unspec、253=default、254=main、255=local，以及 32766/32767 段。
+func IsReservedRouteTable(t int) bool {
+	switch t {
+	case 0, 253, 254, 255:
+		return true
+	}
+	return t >= 32766
+}
 
 // RulePref haweb ip rule 的优先级（先于 main 32766；与旧形态一致取 1）。
 const RulePref = 1
@@ -108,8 +126,15 @@ func uint32Ptr(v uint32) *uint32 { return &v }
 // TearEgressRoute 拆除 per-规则策略路由。
 // 只删"lookup 本表"的规则（表号 per-规则分配，同表只可能属于本规则——
 // 沿承 iptables 时代的精确清理纪律，绝不盲删 pref 槽）。
+//
+// 硬性护栏：表号越界或命中内核保留表时直接拒做。拆除动作会连带删除该表的
+// default 路由与 lookup 该表的 ip rule，一旦传入 254(main) 就是整机失联。
 func (n *Conn) TearEgressRoute(rtTable int, _ []string) error {
-	if rtTable == 0 {
+	if rtTable < RouteTableBase || rtTable > RouteTableEnd || IsReservedRouteTable(rtTable) {
+		if rtTable != 0 {
+			return fmt.Errorf("拒绝拆除路由表 %d：不在 haweb 专属段 %d-%d 内（保护内核保留表 main/local/default）",
+				rtTable, RouteTableBase, RouteTableEnd)
+		}
 		return nil
 	}
 	rules, err := vnetlink.RuleList(unix.AF_INET)

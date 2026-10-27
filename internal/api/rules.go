@@ -45,6 +45,13 @@ type ruleInput struct {
 }
 
 func (in *ruleInput) toRule() model.ForwardRule {
+	// snat 源池归一：fixed 模式不承载源池，空数组/未填一律落库为空串，
+	// 避免库内出现与模式矛盾的 "[]"（引擎只按模式读池，但脏值会误导排障）
+	snatMode := strings.TrimSpace(in.SnatMode)
+	snatPool := strings.TrimSpace(in.SnatPool)
+	if snatMode == "" || snatMode == "fixed" {
+		snatPool = ""
+	}
 	return model.ForwardRule{
 		Name:              strings.TrimSpace(in.Name),
 		Protocol:          strings.ToLower(strings.TrimSpace(in.Protocol)),
@@ -59,8 +66,8 @@ func (in *ruleInput) toRule() model.ForwardRule {
 		DstDenyList:       strings.TrimSpace(in.DstDenyList),
 		SnatIP:            strings.TrimSpace(in.SnatIP),
 		DnatRejectMode:    strings.TrimSpace(in.DnatRejectMode),
-		SnatMode:          strings.TrimSpace(in.SnatMode),
-		SnatPool:          strings.TrimSpace(in.SnatPool),
+		SnatMode:          snatMode,
+		SnatPool:          snatPool,
 		EgressIDs:         strings.TrimSpace(in.EgressIDs),
 		EgressGw:          strings.TrimSpace(in.EgressGw),
 		MinKBps:           in.MinKBps,
@@ -313,7 +320,9 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 	// 绑定多网卡时按规则出口网卡校验；rotate/sticky 模式下 SnatIP 不再单独生效）
 	switch mode := strings.TrimSpace(in.SnatMode); mode {
 	case "", "fixed":
-		if strings.TrimSpace(in.SnatPool) != "" {
+		// "未配置"在请求体里有两种合法表达：字段缺省（空串）与空数组 "[]"
+		// （前端列表控件未选成员时即提交空数组）。两者语义相同，都归一为空。
+		if !isEmptyJSONList(in.SnatPool) {
 			return fmt.Errorf("fixed 模式不配置 snat_pool（单 IP 用 snat_ip）")
 		}
 	case "rotate", "sticky":
@@ -322,7 +331,7 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 			return fmt.Errorf("snat_pool 必须是 JSON 字符串数组")
 		}
 		if len(members) < 1 || len(members) > 32 {
-			return fmt.Errorf("snat_pool 成员数 %d 越界（1-32）", len(members))
+			return fmt.Errorf("%s 模式的 snat_pool 需 1-32 个出口网卡地址（当前 %d 个）", mode, len(members))
 		}
 		outIf := strings.TrimSpace(in.TargetAddr)
 		for _, m := range members {
@@ -516,6 +525,22 @@ func isCIDROrIP(s string) bool {
 // isV4OrV6Addr 合法单 IP（无 CIDR；双族）。
 func isV4OrV6Addr(s string) bool {
 	return net.ParseIP(strings.TrimSpace(s)) != nil
+}
+
+// isEmptyJSONList 字段是否表达"未配置"：空串或空 JSON 数组（"[]"、"null"）。
+// 前端列表类控件未选成员时提交 "[]"，与字段缺省的语义相同；校验层必须
+// 把它们等同看待，否则"必填项都填了"的请求仍会被拒。非法 JSON 不算空
+// （交由后续的类型校验报错）。元素类型无关（字符串数组/数字数组通用）。
+func isEmptyJSONList(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "null" {
+		return true
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal([]byte(s), &items); err != nil {
+		return false
+	}
+	return len(items) == 0
 }
 
 func validateTarget(target string) error {
