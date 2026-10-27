@@ -5,7 +5,7 @@
         <span class="logo-mark">⇄</span>
         <span>轻量专线网关</span>
       </div>
-      <el-menu :default-active="activeMenu" router class="menu">
+      <el-menu :default-active="activeMenu" :default-openeds="['acl-groups']" router class="menu">
         <el-menu-item index="/dashboard">
           <el-icon><Odometer /></el-icon><span>总览</span>
         </el-menu-item>
@@ -142,6 +142,32 @@ async function onCommand(cmd) {
 }
 :deep(.el-menu-item) {
   color: #cbd5e1;
+}
+/* 子菜单标题（如「名单组」）：Element Plus 默认深色文字，在深色侧边栏上
+   对比度极低（几乎看不见），必须显式覆盖 */
+:deep(.el-sub-menu__title) {
+  color: #cbd5e1;
+}
+:deep(.el-sub-menu__title:hover) {
+  background: #263449;
+}
+:deep(.el-sub-menu.is-active > .el-sub-menu__title) {
+  color: #409eff;
+}
+:deep(.el-sub-menu__icon-arrow) {
+  color: #94a3b8;
+}
+/* 展开后的子项：更深底色区分层级 + 左侧缩进 */
+:deep(.el-menu--inline) {
+  background-color: #17202e;
+}
+:deep(.el-menu--inline .el-menu-item) {
+  padding-left: 46px !important;
+  min-width: 0;
+  font-size: 13px;
+}
+:deep(.el-menu--inline .el-menu-item.is-active) {
+  background: #111827;
 }
 :deep(.el-menu-item.is-active) {
   color: #409eff;
