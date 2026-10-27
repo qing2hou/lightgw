@@ -199,7 +199,7 @@
           >
             <el-option
               v-for="g in matchedGroups" :key="g.id" :value="g.id"
-              :label="`${g.name}（${g.mode === 'whitelist' ? '白名单' : '黑名单'}组 · ${g.entry_count} 条）`"
+              :label="`${g.name}（${g.mode === 'whitelist' ? '白名单组' : g.mode === 'blacklist' ? '黑名单组' : 'IP 组'} · ${g.entry_count} 条）`"
             />
           </el-select>
           <div class="form-tip">只能选择与控制模式同类型的组；保存后组条目变更会自动热应用到本规则</div>
@@ -373,7 +373,8 @@ const form = reactive(emptyForm())
 
 // ---------- 名单组 ----------
 const aclGroups = ref([])
-const matchedGroups = computed(() => aclGroups.value.filter((g) => g.mode === form.acl_mode))
+// 可引用的组：与规则模式同类型的组，或中性 IP 组（条目按规则模式语义生效）
+const matchedGroups = computed(() => aclGroups.value.filter((g) => g.mode === form.acl_mode || g.mode === 'ip'))
 const groupRefName = computed(() => {
   const g = aclGroups.value.find((x) => x.id === form.acl_group_id)
   return g ? g.name : ''

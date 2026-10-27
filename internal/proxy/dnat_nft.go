@@ -41,10 +41,16 @@ func (m *Manager) buildDNATSpec(rule model.ForwardRule) *fw.DNatSpec {
 	var srcs []string
 	allow := rule.AllowList
 	if rule.AclMode == model.AclModeWhitelist {
+		// 引用名单组时取组条目（同模式白名单组或中性 IP 组，条目即白名单）
 		if rule.AclGroupID != 0 {
 			var g model.AclGroup
-			if err := m.db.First(&g, rule.AclGroupID).Error; err == nil {
+			if err := m.db.First(&g, rule.AclGroupID).Error; err == nil &&
+				model.AclGroupMatchesMode(g.Mode, model.AclModeWhitelist) {
 				allow = g.Entries
+			} else if err == nil {
+				logf("规则[%s#%d] 引用的名单组#%d 与白名单模式不兼容（dnat），按无白名单处理",
+					rule.Name, rule.ID, rule.AclGroupID)
+				allow = ""
 			}
 		}
 		if b := strings.TrimSpace(allow); b != "" {

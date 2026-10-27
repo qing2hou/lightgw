@@ -30,9 +30,14 @@
         <el-menu-item index="/bw-groups">
           <el-icon><Histogram /></el-icon><span>带宽包</span>
         </el-menu-item>
-        <el-menu-item index="/acl-groups">
-          <el-icon><FolderOpened /></el-icon><span>名单组</span>
-        </el-menu-item>
+        <el-sub-menu index="acl-groups">
+          <template #title>
+            <el-icon><FolderOpened /></el-icon><span>名单组</span>
+          </template>
+          <el-menu-item index="/acl-groups-whitelist">白名单组</el-menu-item>
+          <el-menu-item index="/acl-groups-blacklist">黑名单组</el-menu-item>
+          <el-menu-item index="/acl-groups-ip">IP 组</el-menu-item>
+        </el-sub-menu>
         <el-menu-item index="/traffic-logs">
           <el-icon><Document /></el-icon><span>流量日志</span>
         </el-menu-item>

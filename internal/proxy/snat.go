@@ -102,12 +102,12 @@ func (e *snatEntry) spec() *snatRuleSpec {
 		AllowSrcs: e.allowSrcs, DstAclMode: e.dstMode, DstDeny: e.dstDeny, DstAllow: e.dstAllow}
 }
 
-// buildSnatSpec 由 ForwardRule 构建安装参数（allowlist 展开含名单组）。
+// buildSnatSpec 由 ForwardRule 构建安装参数（源/目标名单均支持引用名单组）。
 func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 	allow := rule.AllowList
 	if rule.AclMode == model.AclModeWhitelist && rule.AclGroupID != 0 {
 		var g model.AclGroup
-		if err := m.db.First(&g, rule.AclGroupID).Error; err == nil && g.Mode == model.AclModeWhitelist {
+		if err := m.db.First(&g, rule.AclGroupID).Error; err == nil && model.AclGroupMatchesMode(g.Mode, model.AclModeWhitelist) {
 			allow = g.Entries
 		} else {
 			logf("规则[%s#%d] 引用的名单组#%d 失效（snat），按无白名单处理", rule.Name, rule.ID, rule.AclGroupID)
@@ -139,8 +139,11 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 	// + 无 -s 的 DROP——为保持"不指定就不通"，把空的 AllowSrcs 特殊化为
 	// 一个不匹配任何真实源的黑洞名单）。目标黑名单同样要求源：无源的黑名单
 	// DROP 会误伤同网卡全部规则的转发（v2 事故同型），一并黑洞化。
+	// 目标黑名单可能来自直配或名单组引用（组的有效性在下方展开时判定，
+	// 这里只需知道"是否配了目标黑名单"）。
+	hasDstDeny := len(parseIPListOrEmpty(rule.DstDenyList)) > 0 || rule.DstAclGroupID != 0
 	needSrcs := rule.AclMode == model.AclModeWhitelist ||
-		(strings.TrimSpace(rule.DstAclMode) == model.AclModeBlacklist && len(parseIPListOrEmpty(rule.DstDenyList)) > 0)
+		(strings.TrimSpace(rule.DstAclMode) == model.AclModeBlacklist && hasDstDeny)
 	if len(srcs) == 0 && needSrcs {
 		srcs = []string{"0.0.0.0/32"} // /32 的全零地址：不匹配任何正常源
 	}
@@ -197,15 +200,32 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 			logf("规则[%s#%d] SNAT 池全部成员已不归属出口网卡 %s，退回固定源", rule.Name, rule.ID, rule.TargetAddr)
 		}
 	}
+	// 目标名单：引用名单组时展开组条目（同模式组或中性 IP 组；组失效则回退
+	// 直配——直配在引用组时被 API 强制为空，回退即"无目标限制"，是唯一可用的
+	// 降级语义，且必须留日志线索）
+	dstMode := strings.TrimSpace(rule.DstAclMode)
+	dstAllowJSON, dstDenyJSON := rule.DstAllowList, rule.DstDenyList
+	if rule.DstAclGroupID != 0 && (dstMode == model.AclModeWhitelist || dstMode == model.AclModeBlacklist) {
+		var g model.AclGroup
+		if err := m.db.First(&g, rule.DstAclGroupID).Error; err == nil && model.AclGroupMatchesMode(g.Mode, dstMode) {
+			if dstMode == model.AclModeWhitelist {
+				dstAllowJSON = g.Entries
+			} else {
+				dstDenyJSON = g.Entries
+			}
+		} else {
+			logf("规则[%s#%d] 目标限制引用的名单组#%d 失效（snat），按无目标限制处理", rule.Name, rule.ID, rule.DstAclGroupID)
+		}
+	}
 	return &snatRuleSpec{
 		ID:           rule.ID,
 		IfIn:         rule.ListenAddr, // snat 行复用：listen_addr=入口网卡
 		IfOut:        rule.TargetAddr, // target_addr=出口网卡
 		OutIP:        outIP,
 		AllowSrcs:    srcs,
-		DstAclMode:   strings.TrimSpace(rule.DstAclMode),
-		DstAllow:     parseIPListOrEmpty(rule.DstAllowList),
-		DstDeny:      parseIPListOrEmpty(rule.DstDenyList),
+		DstAclMode:   dstMode,
+		DstAllow:     parseIPListOrEmpty(dstAllowJSON),
+		DstDeny:      parseIPListOrEmpty(dstDenyJSON),
 		LimitKbps:    rule.UploadLimitKBps,
 		DownloadKbps: rule.DownloadLimitKBps,
 		BWGroupKBps:  bwKBps,

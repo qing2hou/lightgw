@@ -27,14 +27,14 @@ func (in *aclGroupInput) validate() error {
 	if len(in.Name) > 128 {
 		return fmt.Errorf("名单组名称过长（最多 128 字符）")
 	}
-	if in.Mode != model.AclModeWhitelist && in.Mode != model.AclModeBlacklist {
-		return fmt.Errorf("名单组模式必须是 whitelist 或 blacklist")
+	if in.Mode != model.AclModeWhitelist && in.Mode != model.AclModeBlacklist && in.Mode != model.AclGroupModeIP {
+		return fmt.Errorf("名单组类型必须是 whitelist / blacklist / ip")
 	}
 	entries := in.entries()
-	// 白名单组必须非空：空白名单挂在规则上等于静默拒绝所有访问
-	// （与直配名单 ValidateLists 的非空门槛同一防线，联动更新同样覆盖）
-	if in.Mode == model.AclModeWhitelist && len(entries) == 0 {
-		return fmt.Errorf("白名单组需要至少一条条目（空组会导致引用中的规则拒绝所有访问）")
+	// 白名单组与 IP 组必须非空：空组被白名单语义引用时等于静默拒绝所有
+	// 访问（与直配名单的非空门槛同一防线，联动更新同样覆盖）
+	if (in.Mode == model.AclModeWhitelist || in.Mode == model.AclGroupModeIP) && len(entries) == 0 {
+		return fmt.Errorf("%s需要至少一条条目（空组被白名单引用时会拒绝所有访问）", groupModeName(in.Mode))
 	}
 	for _, e := range entries {
 		if err := validateIPEntry(e); err != nil {
@@ -105,14 +105,22 @@ func (h *handlers) listAclGroups(c *gin.Context) {
 		var entries []string
 		_ = json.Unmarshal([]byte(g.Entries), &entries)
 		w.EntryCount = len(entries)
+		// 引用计数：源名单（acl_group_id）+ snat 目标限制（dst_acl_group_id）
 		var refs int64
-		h.DB.Model(&model.ForwardRule{}).Where("acl_group_id = ?", g.ID).Count(&refs)
-		w.RefCount = int(refs)
-		var bad int64
 		h.DB.Model(&model.ForwardRule{}).
-			Where("acl_group_id = ? AND (acl_mode IS NULL OR acl_mode <> ?)", g.ID, g.Mode).
-			Count(&bad)
-		w.Broken = bad > 0
+			Where("acl_group_id = ? OR dst_acl_group_id = ?", g.ID, g.ID).Count(&refs)
+		w.RefCount = int(refs)
+		// broken 判据：存在引用但组类型与该引用方的模式不兼容（数据异常）。
+		// IP 组对任何模式都兼容，天然不会 broken。
+		if g.Mode != model.AclGroupModeIP {
+			var bad int64
+			h.DB.Model(&model.ForwardRule{}).
+				Where("(acl_group_id = ? AND (acl_mode IS NULL OR acl_mode <> ?)) OR "+
+					"(dst_acl_group_id = ? AND (dst_acl_mode IS NULL OR dst_acl_mode <> ?))",
+					g.ID, g.Mode, g.ID, g.Mode).
+				Count(&bad)
+			w.Broken = bad > 0
+		}
 		items = append(items, w)
 	}
 	c.JSON(200, gin.H{"items": items})
@@ -165,12 +173,24 @@ func (h *handlers) updateAclGroup(c *gin.Context) {
 	}
 	group := in.toGroup()
 	group.ID = old.ID
-	// 模式变更：已有引用的规则模式与新模式不匹配时拒绝（会导致引用失效）
+	// 类型变更：已有引用方与新类型不兼容时拒绝（会导致引用失效）。
+	// IP 组可被任意模式引用，从白/黑组改成 IP 组总是安全；反向则要看引用方。
 	if group.Mode != old.Mode {
-		var bad int64
-		h.DB.Model(&model.ForwardRule{}).Where("acl_group_id = ?", group.ID).Count(&bad)
+		var refs []model.ForwardRule
+		h.DB.Where("acl_group_id = ? OR dst_acl_group_id = ?", group.ID, group.ID).Find(&refs)
+		bad := 0
+		for _, r := range refs {
+			if r.AclGroupID == group.ID && !model.AclGroupMatchesMode(group.Mode, r.AclMode) {
+				bad++
+				continue
+			}
+			if r.DstAclGroupID == group.ID && !model.AclGroupMatchesMode(group.Mode, r.DstAclMode) {
+				bad++
+			}
+		}
 		if bad > 0 {
-			c.JSON(400, gin.H{"error": fmt.Sprintf("该组已被 %d 条规则引用，不能变更模式；请先在规则中解除引用", bad)})
+			c.JSON(400, gin.H{"error": fmt.Sprintf("该组已被 %d 处引用，改成%q类型会与引用方的模式冲突；请先在规则中解除引用",
+				bad, groupModeName(group.Mode))})
 			return
 		}
 	}

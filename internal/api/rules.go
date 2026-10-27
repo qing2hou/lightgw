@@ -26,6 +26,7 @@ type ruleInput struct {
 	DenyList          string `json:"deny_list"`
 	AclGroupID        uint   `json:"acl_group_id"`
 	DstAclMode        string `json:"dst_acl_mode"`
+	DstAclGroupID     uint   `json:"dst_acl_group_id"`
 	DstAllowList      string `json:"dst_allow_list"`
 	DstDenyList       string `json:"dst_deny_list"`
 	SnatIP            string `json:"snat_ip"`
@@ -62,6 +63,7 @@ func (in *ruleInput) toRule() model.ForwardRule {
 		DenyList:          strings.TrimSpace(in.DenyList),
 		AclGroupID:        in.AclGroupID,
 		DstAclMode:        strings.TrimSpace(in.DstAclMode),
+		DstAclGroupID:     in.DstAclGroupID,
 		DstAllowList:      strings.TrimSpace(in.DstAllowList),
 		DstDenyList:       strings.TrimSpace(in.DstDenyList),
 		SnatIP:            strings.TrimSpace(in.SnatIP),
@@ -111,8 +113,9 @@ func (in *ruleInput) validate(h *handlers) error {
 	if err := validateTarget(in.TargetAddr); err != nil {
 		return err
 	}
-	// 名单组引用：off 模式不允许引用；组必须存在且模式与规则一致；
-	// 引用组时不能再直配名单，名单条目完全来自组（展开在引擎 buildRuleConfig）
+	// 名单组引用：off 模式不允许引用；组必须存在且与规则模式兼容
+	// （同模式的白/黑组，或中性 IP 组）；引用组时不能再直配名单，
+	// 名单条目完全来自组（展开在引擎 buildRuleConfig / buildSnatSpec）
 	groupRef := false
 	if in.AclGroupID != 0 {
 		if in.AclMode != model.AclModeWhitelist && in.AclMode != model.AclModeBlacklist {
@@ -122,14 +125,15 @@ func (in *ruleInput) validate(h *handlers) error {
 		if err := h.DB.First(&group, in.AclGroupID).Error; err != nil {
 			return fmt.Errorf("引用的名单组不存在（ID %d）", in.AclGroupID)
 		}
-		if group.Mode != in.AclMode {
-			return fmt.Errorf("名单组[%s]是%s组，与规则的%s模式不匹配", group.Name, groupModeName(group.Mode), groupModeName(in.AclMode))
+		if !model.AclGroupMatchesMode(group.Mode, in.AclMode) {
+			return fmt.Errorf("名单组[%s]是%s，与规则的%s模式不匹配（IP 组可用于任意模式）",
+				group.Name, groupModeName(group.Mode), groupModeName(in.AclMode))
 		}
 		if in.AclMode == model.AclModeWhitelist && strings.TrimSpace(in.AllowList) != "" {
-			return fmt.Errorf("已引用白名单组[%s]，不能再直配白名单条目（二选一）", group.Name)
+			return fmt.Errorf("已引用名单组[%s]，不能再直配白名单条目（二选一）", group.Name)
 		}
 		if in.AclMode == model.AclModeBlacklist && strings.TrimSpace(in.DenyList) != "" {
-			return fmt.Errorf("已引用黑名单组[%s]，不能再直配黑名单条目（二选一）", group.Name)
+			return fmt.Errorf("已引用名单组[%s]，不能再直配黑名单条目（二选一）", group.Name)
 		}
 		groupRef = true
 	}
@@ -194,6 +198,8 @@ func groupModeName(mode string) string {
 		return "白名单"
 	case model.AclModeBlacklist:
 		return "黑名单"
+	case model.AclGroupModeIP:
+		return "IP 组"
 	}
 	return mode
 }
@@ -413,7 +419,7 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 			}
 		}
 	}
-	// 组引用（仅白名单组）
+	// 源名单组引用（同模式白/黑组或中性 IP 组）
 	if in.AclGroupID != 0 {
 		if in.AclMode != model.AclModeWhitelist {
 			return fmt.Errorf("off 模式不能引用名单组")
@@ -422,18 +428,20 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 		if err := h.DB.First(&g, in.AclGroupID).Error; err != nil {
 			return fmt.Errorf("引用的名单组不存在（ID %d）", in.AclGroupID)
 		}
-		if g.Mode != model.AclModeWhitelist {
-			return fmt.Errorf("snat 规则只能引用白名单组，[%s] 是黑名单组", g.Name)
+		if !model.AclGroupMatchesMode(g.Mode, model.AclModeWhitelist) {
+			return fmt.Errorf("snat 源名单只能引用白名单组或 IP 组，[%s] 是%s", g.Name, groupModeName(g.Mode))
 		}
 		if strings.TrimSpace(in.AllowList) != "" {
-			return fmt.Errorf("已引用白名单组[%s]，不能再直配名单条目（二选一）", g.Name)
+			return fmt.Errorf("已引用名单组[%s]，不能再直配名单条目（二选一）", g.Name)
 		}
 	}
 	// 目标名单（穿越后能/不能访问哪些目标 IP）：模式三选一，两名单互斥，
-	// 显式模式要求对应名单非空；条目为 IP 或 CIDR；仅 snat 规则支持
+	// 显式模式要求对应名单非空（直配条目或引用名单组二者其一）；
+	// 条目为 IP 或 CIDR；仅 snat 规则支持
 	switch mode := strings.TrimSpace(in.DstAclMode); mode {
 	case "", model.AclModeOff:
-		if strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" {
+		if strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" ||
+			in.DstAclGroupID != 0 {
 			return fmt.Errorf("off 模式不能配置目标名单，请选择目标白名单或目标黑名单模式")
 		}
 	case model.AclModeWhitelist, model.AclModeBlacklist:
@@ -443,6 +451,21 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 		}
 		if mode == model.AclModeBlacklist && strings.TrimSpace(in.DstAllowList) != "" {
 			return fmt.Errorf("目标黑名单模式下不能同时配置目标白名单，请二选一")
+		}
+		// 组引用：仅允许同模式组或中性 IP 组；引用组时不得再直配目标条目
+		if in.DstAclGroupID != 0 {
+			var g model.AclGroup
+			if err := h.DB.First(&g, in.DstAclGroupID).Error; err != nil {
+				return fmt.Errorf("目标限制引用的名单组不存在（ID %d）", in.DstAclGroupID)
+			}
+			if !model.AclGroupMatchesMode(g.Mode, mode) {
+				return fmt.Errorf("目标限制引用的名单组[%s]是%s，与「%s」模式不匹配（IP 组可用于任意模式）",
+					g.Name, groupModeName(g.Mode), groupModeName(mode))
+			}
+			if strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" {
+				return fmt.Errorf("已引用名单组[%s]，不能再直配目标条目（二选一）", g.Name)
+			}
+			break
 		}
 		listJSON := in.DstAllowList
 		if mode == model.AclModeBlacklist {
@@ -456,9 +479,9 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 		}
 		if len(entries) == 0 {
 			if mode == model.AclModeWhitelist {
-				return fmt.Errorf("目标白名单模式需配置至少一条目标条目（空名单会拒绝全部目标）")
+				return fmt.Errorf("目标白名单模式需配置至少一条目标条目，或引用一个名单组（空名单会拒绝全部目标）")
 			}
-			return fmt.Errorf("目标黑名单模式需配置至少一条目标条目（空名单等于不限，与 off 无异）")
+			return fmt.Errorf("目标黑名单模式需配置至少一条目标条目，或引用一个名单组（空名单等于不限，与 off 无异）")
 		}
 		for _, e := range entries {
 			if !isCIDROrIP(e) {
@@ -787,6 +810,7 @@ func (h *handlers) updateRule(c *gin.Context) {
 	if err := h.DB.Model(&old).Select(
 		"Name", "Protocol", "ListenAddr", "TargetAddr", "AclMode",
 		"AllowList", "DenyList", "AclGroupID", "SnatIP", "EgressGw", "MinKBps", "SourceIP",
+		"DstAclGroupID",
 		"DstAclMode", "DstAllowList", "DstDenyList",
 		// B6：M2/M3 新列显式加入（AGENTS 踩坑：Select 白名单漏新列=编辑静默丢字段）
 		"DnatRejectMode", "SnatMode", "SnatPool", "EgressIDs",

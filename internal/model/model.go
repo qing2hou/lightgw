@@ -22,7 +22,26 @@ const (
 	AclModeOff       = "off"
 	AclModeWhitelist = "whitelist"
 	AclModeBlacklist = "blacklist"
+
+	// AclGroupModeIP 名单组的第三种类型：IP 组——语义中性的 IP 集合。
+	// 白/黑名单组只能被同模式的规则引用；IP 组不带方向语义，可被白名单
+	// 或黑名单（源名单或目标限制）任意引用，组条目按引用方的语义生效。
+	AclGroupModeIP = "ip"
 )
+
+// AclGroupModes 名单组的合法类型集合（创建/更新校验用）。
+func AclGroupModes() []string {
+	return []string{AclModeWhitelist, AclModeBlacklist, AclGroupModeIP}
+}
+
+// AclGroupMatchesMode 名单组能否被指定模式引用：同模式组，或中性 IP 组。
+// 规则侧的白/黑名单模式与目标限制模式共用此判据。
+func AclGroupMatchesMode(groupMode, useMode string) bool {
+	if groupMode == AclGroupModeIP {
+		return true
+	}
+	return groupMode == useMode
+}
 
 type User struct {
 	ID                 uint   `gorm:"primaryKey" json:"id"`
@@ -59,6 +78,7 @@ type ForwardRule struct {
 	DstAclMode        string    `gorm:"size:16;default:off" json:"dst_acl_mode"`               // snat 目标名单模式（off/whitelist/blacklist）——穿越后能/不能访问哪些目标
 	DstAllowList      string    `gorm:"type:text" json:"dst_allow_list"`                       // snat 目标白名单（JSON 字符串数组；whitelist 模式生效）
 	DstDenyList       string    `gorm:"type:text" json:"dst_deny_list"`                        // snat 目标黑名单（JSON 字符串数组；blacklist 模式生效）
+	DstAclGroupID     uint      `gorm:"index;default:0" json:"dst_acl_group_id"`               // 目标限制引用的名单组 ID；0 = 不引用（用直配目标名单）
 	SnatIP            string    `gorm:"size:64" json:"snat_ip"`                                // snat 规则显式出口源 IP；空 = 自动取出口网卡首 IPv4
 	DnatRejectMode    string    `gorm:"size:16;default:reject" json:"dnat_reject_mode"`        // dnat 规则后端不可达时对客户端行为（reject/timeout）
 	SnatMode          string    `gorm:"size:16;default:fixed" json:"snat_mode"`                // snat 源模式：fixed（单 IP）/ rotate（会话轮换）/ sticky（源粘滞）
@@ -131,15 +151,16 @@ type BWGroup struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-// AclGroup 名单组：可复用的 IP 名单集合，规则通过 acl_group_id 引用。
-// Mode 决定组语义（whitelist/blacklist），Entries 为 JSON 字符串数组
-// （元素支持单 IP 与 CIDR 网段）。规则引用组时，组的 Mode 必须与规则的
-// AclMode 一致（whitelist 规则引白名单组、blacklist 规则引黑名单组），
-// 保存时校验；组条目变更时联动重应用所有引用中的规则。
+// AclGroup 名单组：可复用的 IP 名单集合，规则通过 acl_group_id（源名单）
+// 或 dst_acl_group_id（snat 目标限制）引用。
+// Mode 决定组语义：whitelist/blacklist 带方向语义，只能被同模式的引用方使用；
+// ip 为中性 IP 组，可被任意模式（白名单、黑名单、目标限制）引用，条目按
+// 引用方语义生效。Entries 为 JSON 字符串数组（元素支持单 IP 与 CIDR 网段）。
+// 组条目变更时联动重应用所有引用中的规则。
 type AclGroup struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	Name      string    `gorm:"size:128;uniqueIndex" json:"name"`
-	Mode      string    `gorm:"size:16" json:"mode"` // whitelist / blacklist
+	Mode      string    `gorm:"size:16" json:"mode"` // whitelist / blacklist / ip
 	Entries   string    `gorm:"type:text" json:"entries"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`

@@ -121,3 +121,20 @@
 
 - 全部新接口挂 admin 组（现有 JWT 中间件）；POST/PUT/DELETE 全量审计（沿用 audit.go，action=egress.create 等）
 - 导出/导入（/api/rules/export、import）包含新字段（格式版本 +1，向后解析：旧包无新字段按默认语义)
+
+## API-G1 名单组（三类）
+- GET /api/acl-groups → 全部组（前端按 `mode` 分到三个子菜单）
+- POST /api/acl-groups `{ name, mode:"whitelist|blacklist|ip", entries:["1.2.3.4","10.0.0.0/8"] }`
+- PUT /api/acl-groups/:id 同上（类型变更：与现有引用方冲突时 400）
+- DELETE /api/acl-groups/:id（存在引用时 400，返回引用它的规则 ID）
+- 响应项：`{ id, name, mode, entries, entry_count, ref_count, broken }`
+- `ref_count` = 源名单引用（`acl_group_id`）+ SNAT 目标限制引用（`dst_acl_group_id`）之和
+- 兼容判据：同类型组，或 `mode=ip` 的中性组可用于任意使用模式
+- 错误 422：`{ message:"名单组类型必须是 whitelist / blacklist / ip" }`；
+  `{ message:"IP 组需要至少一条条目（空组被白名单引用时会拒绝所有访问）" }`
+
+## API-G2 规则的目标限制引用组（snat）
+- 请求体新增 `dst_acl_group_id`（0 = 不引用）：与 `dst_acl_mode` 配套
+- 引用组时 `dst_allow_list`/`dst_deny_list` 必须为空（二选一）
+- 错误 422：`"目标限制引用的名单组[X]是黑名单组，与「白名单」模式不匹配（IP 组可用于任意模式）"`；
+  `"已引用名单组[X]，不能再直配目标条目（二选一）"`

@@ -43,7 +43,7 @@ func (h *handlers) exportRules(c *gin.Context) {
 		r := &rules[i]
 		r.LastError = ""
 		if r.AclGroupID != 0 {
-			if g, ok := groups[r.AclGroupID]; ok && g.Mode == r.AclMode {
+			if g, ok := groups[r.AclGroupID]; ok && model.AclGroupMatchesMode(g.Mode, r.AclMode) {
 				if r.AclMode == model.AclModeWhitelist {
 					r.AllowList = g.Entries
 				} else if r.AclMode == model.AclModeBlacklist {
@@ -51,6 +51,17 @@ func (h *handlers) exportRules(c *gin.Context) {
 				}
 			}
 			r.AclGroupID = 0
+		}
+		// snat 目标限制的组引用同样内联展开（导出文件自包含）
+		if r.DstAclGroupID != 0 {
+			if g, ok := groups[r.DstAclGroupID]; ok && model.AclGroupMatchesMode(g.Mode, r.DstAclMode) {
+				if r.DstAclMode == model.AclModeWhitelist {
+					r.DstAllowList = g.Entries
+				} else if r.DstAclMode == model.AclModeBlacklist {
+					r.DstDenyList = g.Entries
+				}
+			}
+			r.DstAclGroupID = 0
 		}
 	}
 	data, err := json.MarshalIndent(gin.H{

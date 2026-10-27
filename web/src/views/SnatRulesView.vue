@@ -200,10 +200,26 @@
             <el-radio-button value="blacklist">禁止访问</el-radio-button>
           </el-radio-group>
           <div class="form-tip" v-if="form.dst_mode === 'off'">当前不限制——如需只允许/禁止访问某些目标 IP，点上方「仅允许访问」或「禁止访问」，下方随即出现目标填写框</div>
-          <div class="form-tip" v-else-if="form.dst_mode === 'whitelist'">仅列表内目标可达，其余一律拒绝；在下方填写允许访问的目标 IP/网段（必须至少一条）</div>
-          <div class="form-tip" v-else>列表内目标拒绝访问，其余正常穿越；在下方填写禁止访问的目标 IP/网段（必须至少一条）</div>
+          <div class="form-tip" v-else-if="form.dst_mode === 'whitelist'">仅列表内目标可达，其余一律拒绝；在下方手填目标 IP/网段，或引用一个白名单组/IP 组（二者其一，必须非空）</div>
+          <div class="form-tip" v-else>列表内目标拒绝访问，其余正常穿越；在下方手填目标 IP/网段，或引用一个黑名单组/IP 组（二者其一，必须非空）</div>
         </el-form-item>
-        <el-form-item ref="dstItemRef" :label="form.dst_mode === 'blacklist' ? '禁止目标' : '允许目标'" v-if="form.dst_mode !== 'off'">
+        <el-form-item label="目标来源" v-if="form.dst_mode !== 'off'">
+          <el-radio-group v-model="form.dstFrom" @change="onDstFromChange">
+            <el-radio-button value="manual">手填目标</el-radio-button>
+            <el-radio-button value="group">引用名单组</el-radio-button>
+          </el-radio-group>
+        </el-form-item>
+        <el-form-item label="名单组" v-if="form.dst_mode !== 'off' && form.dstFrom === 'group'">
+          <el-select v-model="form.dst_acl_group_id" clearable filterable
+            :placeholder="`选择一个${form.dst_mode === 'whitelist' ? '白名单组' : '黑名单组'}或 IP 组`" style="width: 100%">
+            <el-option v-for="g in dstGroups" :key="g.id" :value="g.id"
+              :label="`${g.name}（${modeLabelOf(g.mode)} · ${g.entry_count} 条）`" />
+          </el-select>
+          <div class="form-tip" v-if="form.dst_acl_group_id">目标条目来自「{{ groupNameOf(form.dst_acl_group_id) }}」（在名单组页维护，变更即时热生效）</div>
+          <div class="form-tip" v-else>只能选择与「{{ form.dst_mode === 'whitelist' ? '仅允许访问' : '禁止访问' }}」同类型的组，或中性 IP 组</div>
+        </el-form-item>
+        <el-form-item ref="dstItemRef" :label="form.dst_mode === 'blacklist' ? '禁止目标' : '允许目标'"
+          v-if="form.dst_mode !== 'off' && form.dstFrom === 'manual'">
           <div class="list-editor">
             <div class="tags" v-if="form.dst_list.length">
               <el-tag v-for="t in form.dst_list" :key="t" closable :type="form.dst_mode === 'blacklist' ? 'danger' : 'success'" @close="removeDstTag(t)" class="tag">{{ t }}</el-tag>
@@ -266,6 +282,8 @@ const emptyForm = () => ({
   srcFrom: 'manual',
   dst_mode: 'off',
   dst_list: [],
+  dstFrom: 'manual',
+  dst_acl_group_id: 0,
   enabled: true,
 })
 const form = reactive(emptyForm())
@@ -316,9 +334,18 @@ async function loadIfaces() {
   } catch (e) { /* 不阻塞 */ }
 }
 
-// 白名单组（SNAT 只能引用白名单组）
+// 源名单可引用的组：白名单组 + 中性 IP 组（IP 组按引用方白名单语义生效）
 const aclGroups = ref([])
-const whitelistGroups = computed(() => aclGroups.value.filter((g) => g.mode === 'whitelist'))
+const whitelistGroups = computed(() =>
+  aclGroups.value.filter((g) => g.mode === 'whitelist' || g.mode === 'ip'))
+// 目标限制可引用的组：与目标模式同类型的组，或中性 IP 组
+const dstGroups = computed(() =>
+  aclGroups.value.filter((g) => g.mode === form.dst_mode || g.mode === 'ip'))
+const groupNameOf = (id) => {
+  const g = aclGroups.value.find((x) => x.id === id)
+  return g ? g.name : `#${id}`
+}
+const modeLabelOf = (m) => ({ whitelist: '白名单组', blacklist: '黑名单组', ip: 'IP 组' }[m] || m)
 async function loadGroups() {
   try {
     const { data } = await api.get('/acl-groups')
@@ -360,6 +387,8 @@ function openEdit(row) {
     dst_mode: row.dst_acl_mode === 'whitelist' || row.dst_acl_mode === 'blacklist' ? row.dst_acl_mode : 'off',
     dst_list: row.dst_acl_mode === 'whitelist' ? parseListJSON(row.dst_allow_list)
       : row.dst_acl_mode === 'blacklist' ? parseListJSON(row.dst_deny_list) : [],
+    dstFrom: row.dst_acl_group_id ? 'group' : 'manual',
+    dst_acl_group_id: row.dst_acl_group_id || 0,
     enabled: row.enabled,
   })
   allowInput.value = ''
@@ -395,6 +424,19 @@ function onDstModeChange() {
       dstItemRef.value?.$el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
     })
   }
+  // 模式切换后已选组的类型可能不再兼容（白名单组不能用于黑名单模式）
+  if (form.dst_acl_group_id) {
+    const g = aclGroups.value.find((x) => x.id === form.dst_acl_group_id)
+    if (g && g.mode !== 'ip' && g.mode !== form.dst_mode) {
+      form.dst_acl_group_id = 0
+      ElMessage.info('已选名单组的类型与新限制方式不匹配，已取消引用')
+    }
+  }
+  if (form.dst_mode === 'off') {
+    form.dst_acl_group_id = 0
+    form.dst_list = []
+    return
+  }
   if (form.dst_list.length) {
     ElMessageBox.confirm(
       `目标限制已从「${form.dst_mode === 'blacklist' ? '仅允许访问' : '禁止访问'}」切换，两种模式的语义相反。是否清空已录入的目标列表？`,
@@ -403,6 +445,15 @@ function onDstModeChange() {
     ).then(() => {
       form.dst_list = []
     }).catch(() => {})
+  }
+}
+
+// 目标来源切换：手填 ↔ 引用组（二者互斥，切换时清空另一方，避免保存时被 API 拒绝）
+function onDstFromChange() {
+  if (form.dstFrom === 'group') {
+    form.dst_list = []
+  } else {
+    form.dst_acl_group_id = 0
   }
 }
 
@@ -427,8 +478,13 @@ async function save() {
   if (!form.target_addr) return ElMessage.warning('请选择出口网卡')
   if (form.srcFrom === 'group' && !form.acl_group_id) return ElMessage.warning('已选择「引用名单组」，请选择一个白名单组（或切回手填网段）')
   if (form.srcFrom === 'manual' && !form.allow.length) return ElMessage.warning('手填源网段需至少一条（IP 或网段）——未指定的源一律无法穿越')
-  if (form.dst_mode !== 'off' && !form.dst_list.length) {
-    return ElMessage.warning(form.dst_mode === 'whitelist' ? '「仅允许访问」需至少一条目标（空名单会拒绝全部目标）' : '「禁止访问」需至少一条目标（空名单等于不限制）')
+  if (form.dst_mode !== 'off') {
+    if (form.dstFrom === 'group' && !form.dst_acl_group_id) {
+      return ElMessage.warning('已选择「引用名单组」，请选择一个名单组（或切回手填目标）')
+    }
+    if (form.dstFrom === 'manual' && !form.dst_list.length) {
+      return ElMessage.warning(form.dst_mode === 'whitelist' ? '「仅允许访问」需至少一条目标（空名单会拒绝全部目标）' : '「禁止访问」需至少一条目标（空名单等于不限制）')
+    }
   }
   if (form.snat_mode !== 'fixed' && !(form.snat_pool || []).length) {
     return ElMessage.warning('轮换/粘滞模式需至少一个源池成员（须为出口网卡上的地址）')
@@ -452,8 +508,10 @@ async function save() {
       deny_list: '',
       acl_group_id: form.acl_group_id || 0,
       dst_acl_mode: form.dst_mode,
-      dst_allow_list: form.dst_mode === 'whitelist' && form.dst_list.length ? JSON.stringify(form.dst_list) : '',
-      dst_deny_list: form.dst_mode === 'blacklist' && form.dst_list.length ? JSON.stringify(form.dst_list) : '',
+      // 引用组时不再直配目标条目（API 强制二选一）
+      dst_allow_list: form.dst_mode === 'whitelist' && form.dstFrom === 'manual' && form.dst_list.length ? JSON.stringify(form.dst_list) : '',
+      dst_deny_list: form.dst_mode === 'blacklist' && form.dstFrom === 'manual' && form.dst_list.length ? JSON.stringify(form.dst_list) : '',
+      dst_acl_group_id: form.dst_mode !== 'off' && form.dstFrom === 'group' ? (form.dst_acl_group_id || 0) : 0,
       download_limit_kbps: 0,
       max_conns: 0,
       idle_timeout_sec: 0,

@@ -226,11 +226,12 @@ func (m *Manager) ResetBWLimiters() {
 
 func (m *Manager) buildRuleConfig(rule model.ForwardRule) *ruleConfig {
 	// 引用名单组时展开组条目：whitelist 模式取组的条目作白名单，
-	// blacklist 模式取组的条目作黑名单（组语义与规则模式一致性由 API 层保存时校验）
+	// blacklist 模式取组的条目作黑名单（组与规则模式的兼容性由 API 层保存时
+	// 校验；中性 IP 组对两种模式都成立，条目按规则模式语义生效）
 	allowJSON, denyJSON := rule.AllowList, rule.DenyList
 	if rule.AclGroupID != 0 {
 		var group model.AclGroup
-		if err := m.db.First(&group, rule.AclGroupID).Error; err == nil && group.Mode == rule.AclMode {
+		if err := m.db.First(&group, rule.AclGroupID).Error; err == nil && model.AclGroupMatchesMode(group.Mode, rule.AclMode) {
 			if rule.AclMode == model.AclModeWhitelist {
 				allowJSON = group.Entries
 			} else if rule.AclMode == model.AclModeBlacklist {
@@ -269,12 +270,14 @@ func (m *Manager) buildRuleConfig(rule model.ForwardRule) *ruleConfig {
 	}
 }
 
-// ApplyAclGroup 名单组条目变更后的联动：重应用所有引用该组且模式匹配的
-// 启用规则（组展开发生在 buildRuleConfig，重应用即完成名单热更新）。
+// ApplyAclGroup 名单组条目变更后的联动：重应用所有引用该组（源名单或
+// snat 目标限制）且已启用的规则（组展开发生在 buildRuleConfig /
+// buildSnatSpec，重应用即完成名单热更新）。
 // 组删除时联动不调用（删除前 API 层已拦截存在引用的场景）。
 func (m *Manager) ApplyAclGroup(groupID uint) {
 	var rules []model.ForwardRule
-	if err := m.db.Where("acl_group_id = ? AND enabled = ?", groupID, true).Find(&rules).Error; err != nil {
+	if err := m.db.Where("(acl_group_id = ? OR dst_acl_group_id = ?) AND enabled = ?",
+		groupID, groupID, true).Find(&rules).Error; err != nil {
 		logf("名单组#%d 联动查询引用规则失败: %v", groupID, err)
 		return
 	}
@@ -286,9 +289,10 @@ func (m *Manager) ApplyAclGroup(groupID uint) {
 }
 
 // ReferencedByAclGroup 返回引用指定名单组的规则 ID 列表（API 删除组前校验）。
+// 源名单与 snat 目标限制两侧都算引用。
 func (m *Manager) ReferencedByAclGroup(groupID uint) []uint {
 	var rules []model.ForwardRule
-	m.db.Where("acl_group_id = ?", groupID).Find(&rules)
+	m.db.Where("acl_group_id = ? OR dst_acl_group_id = ?", groupID, groupID).Find(&rules)
 	ids := make([]uint, 0, len(rules))
 	for _, r := range rules {
 		ids = append(ids, r.ID)

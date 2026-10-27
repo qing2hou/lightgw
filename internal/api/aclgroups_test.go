@@ -205,12 +205,13 @@ func TestAclGroupFullFlow(t *testing.T) {
 	if w.Code != 400 || !strings.Contains(w.Body.String(), "引用") {
 		t.Fatalf("被引用组删除应 400: %d %s", w.Code, w.Body.String())
 	}
-	// 被引用的组不能改模式
+	// 被引用的组不能改成与引用方冲突的类型：该组被白名单规则引用，
+	// 改成 blacklist 会让引用失效，必须 400（文案含"引用"）
 	w = groupDo(r, "PUT", fmt.Sprintf("/api/acl-groups/%d", group.ID), tok, map[string]any{
 		"name": "内网放行", "mode": "blacklist", "entries": []string{"1.2.3.4"},
 	})
-	if w.Code != 400 || !strings.Contains(w.Body.String(), "变更模式") {
-		t.Fatalf("被引用组改模式应 400: %d %s", w.Code, w.Body.String())
+	if w.Code != 400 || !strings.Contains(w.Body.String(), "引用") {
+		t.Fatalf("被引用组改成冲突类型应 400: %d %s", w.Code, w.Body.String())
 	}
 
 	// 8. 解除引用后可删除：规则改 off

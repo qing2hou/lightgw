@@ -61,5 +61,6 @@ make dev        # vite(5173 代理 /api) + go run .
 - **路由表号 253-255 是内核保留表**（253 default / 254 main / 255 local），32766/32767 亦然。策略路由分配与拆除只能落在 `nft.RouteTableBase(201)..RouteTableEnd(252)`；`TearEgressRoute` 对段外/保留表号直接拒做。曾经一段启动对账按 201..300 扫描孤儿，把系统自带的 `32766: from all lookup main` 判成孤儿，连 main 的默认路由一起删掉——**目标主机整机失联**（见 docs/test-report-prod-170.md DEFECT-10）。删除类操作按"最坏输入"评估爆炸半径
 - Vue SFC 里 `<script setup>`/`<style>` 之外的代码会被编译器**静默丢弃**（不报错），而 `onMounted` 仍会调用它 → ReferenceError 中断整个挂载钩子，页面数据全空。改 `.vue` 后可用 `@vue/compiler-sfc` 的 `parse+compileScript` 自检"函数是否真的进了产物"
 - 前端字段类型要对齐后端序列化形态：`egress_ids`/`snat_pool`/`allow_list` 等在库里是 **JSON 字符串**，取值必须先 `parseListJSON` 再 `.map()`，直接对字符串 `.map` 抛 TypeError
+- 名单组有三类（`whitelist`/`blacklist`/`ip`），兼容判据统一走 `model.AclGroupMatchesMode(组类型, 使用模式)`：同类型组或中性 `ip` 组可用。规则有**两处**引用位——源名单 `AclGroupID`、SNAT 目标限制 `DstAclGroupID`；新增引用位时必须同步：校验、引擎展开（`buildRuleConfig`/`buildSnatSpec`）、联动 `ApplyAclGroup`、删除保护 `ReferencedByAclGroup`、导出内联，漏一处就是"改了组不生效"或"删组把规则打挂"
 - 列表类控件未选成员时提交 `"[]"` 而非空串：后端"未配置"判据要用 `isEmptyJSONList`（空串/`[]`/`null` 等价），否则界面必填项都填好仍被 400 拒
 - 统计口径：`/api/stats` 的今日/累计只含落库数据，活跃会话字节单独 `live_*` 字段，不要叠加（会双重计数）；`/metrics` 的规则级字节数是进程内实时累计，与落库口径不同，不要混用
