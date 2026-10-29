@@ -1,5 +1,29 @@
 # 更新日志
 
+## 未发布——SNAT 带宽包限速完全失效修复
+
+### 修复（严重）
+- **带宽包限速完全不生效**（实测上传 79.9 MB/s，配置 4 MB/s）。两层根因：
+  1. **u32 filter 不参与分类**：`tc filter ... u32 match ... at 12/16` 挂上后
+     各 class 的 `Sent` 恒为 0、流量全走 default；把限速类压到 1 Kbit 仍能
+     满速上传。
+  2. **父类下挂子类时绕过限速**：未被 filter 指定的包无法归入子类，内核
+     直接走 direct queue 发出（`direct_packets_stat` 持续增长、class `Sent`
+     为 0、`overlimits` 不涨）。
+
+  修复：改为**扁平 htb**——`qdisc default` 直连限速类 `1:100`，不建子类、
+  不做 filter 分类。实测同一场景：`direct_packets_stat` 恒 0、`1:100` 承载
+  全部流量、20MB 上传 5 秒 = **4.21 MB/s**（配置 4 MB/s，误差 5%）。
+
+  同时 `ensureHTB` 清理历史遗留的 per-源子类与 filter（升级后旧子类会继续
+  破坏分类路径）。
+
+### 语义变化（重要）
+- **放弃每源保底分摊**：`BWGroup.MinKBps` 仅作为配置值保留，不再生效。
+  per-源 分配必须依赖 u32 分类或子类层级，两者在本环境（virtio + Linux 6.8）
+  均不可靠。当前语义为"该网卡全部出向转发流量共享带宽包总额"。
+  细粒度限速待换 BPF/leaky-bucket 方案后实现。
+
 ## 未发布——SNAT 流量统计修正（速率只算上行 ACK）
 
 ### 修复

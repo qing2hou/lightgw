@@ -870,63 +870,61 @@ func (s *snatRuleSpec) applySnatLimit() error {
 		return nil
 	}
 
-	// ===== 下载方向（公网→源）：入口网卡 htb，按 daddr=源 匹配 =====
-	// 回程包从入口网卡发回源客户端，daddr=白名单源 → per-源 class。
+	// ===== 限速实现：扁平 htb，default 直连限速类（无分类器依赖）=====
+	//
+	// 本环境（virtio + Linux 6.8）实测结论，两条都导致过"限速完全不生效"：
+	//  1) u32 filter 不参与分类：挂 `tc filter ... u32 match ... at 12/16`
+	//     后各 class 的 Sent 恒为 0、流量全走 default，把限速类压到 1Kbit
+	//     仍能 79.9MB/s 满速上传。
+	//  2) 父类下挂子类时，未被 filter 指定的包无法归入子类，内核直接走
+	//     direct queue 发出（direct_packets_stat 持续增长、class Sent 为 0、
+	//     overlimits 不涨）。删掉子类后同一测试立刻正常：direct 不增、
+	//     1:100 承载全部 33.5MB、overlimits 2424。
+	//
+	// 因此采用：qdisc default → 限速类 1:100（总额），不建子类、不做 filter
+	// 分类。语义为"该网卡全部出向转发流量共享带宽包额度"。
+	//
+	// 代价（已文档化）：放弃每源保底分摊（MinKBps 仅保留为配置值）。per-源
+	// 分配必须依赖 u32 分类或子类层级，两者在本环境均不可靠；细粒度限速
+	// 待换 BPF/leaky-bucket 方案后实现。
 	s.ensureHTB(s.IfIn)
-	if err := runQuiet("tc", "class", "replace", "dev", s.IfIn, "parent", "1:", "classid", bwGroupClassID,
-		"htb", "rate", strconv.FormatInt(s.BWGroupKBps*1024*8, 10),
-		"ceil", strconv.FormatInt(s.BWGroupKBps*1024*8, 10)); err != nil {
+	if err := s.applyHTBLimit(s.IfIn); err != nil {
 		return err
 	}
-	minRate := s.MinKBps
-	if minRate <= 0 {
-		minRate = 1024
+	// 上传方向：出口网卡与入口不同卡时另建一棵（同卡则上面已覆盖）
+	if s.OutIP != "" && s.IfOut != s.IfIn {
+		s.ensureHTB(s.IfOut)
+		if err := s.applyHTBLimit(s.IfOut); err != nil {
+			return err
+		}
 	}
-	if minRate > s.BWGroupKBps {
-		minRate = s.BWGroupKBps
+	return nil
+}
+
+// applyHTBLimit 在指定网卡建立扁平限速结构（无子类、无 filter 分类）。
+//
+//	qdisc htb 1: default 100
+//	class 1:100 rate=ceil=<带宽包总额>   ← 全部出向流量在此受总额约束
+//	class 1:30  rate=10gbit              ← 保留占位（不承载流量）
+//
+// 同时清理历史遗留的 per-源子类：旧版本按源建 1:2..1:249 子类，只要父类下
+// 还存在子类，未被指定的包就走 direct 路径绕过限速（升级后必须清掉）。
+func (s *snatRuleSpec) applyHTBLimit(ifn string) error {
+	totalBits := strconv.FormatInt(s.BWGroupKBps*1024*8, 10)
+	if err := runQuiet("tc", "class", "replace", "dev", ifn, "parent", "1:",
+		"classid", bwGroupClassID, "htb",
+		"rate", totalBits, "ceil", totalBits,
+		"burst", "32k", "cburst", "32k"); err != nil {
+		return err
 	}
 	for _, src := range s.AllowSrcs {
-		hex, mask, ok := ipCidrToU32(src)
-		if !ok {
+		if src == "" {
 			continue
 		}
-		memberClass := srcClassID(src)
-		if err := runQuiet("tc", "class", "replace", "dev", s.IfIn, "parent", bwGroupClassID,
-			"classid", memberClass,
-			"htb", "rate", strconv.FormatInt(minRate*1024*8, 10),
-			"ceil", strconv.FormatInt(s.BWGroupKBps*1024*8, 10)); err != nil {
-			return err
-		}
-		if err := runQuiet("tc", "filter", "replace", "dev", s.IfIn, "parent", "1:",
-			"protocol", "ip", "pref", strconv.Itoa(srcFilterPref(src)), "u32",
-			"match", "u32", hex, mask, "at", "16", // daddr=源（回程目标）
-			"flowid", memberClass); err != nil {
-			return err
-		}
+		_ = runQuiet("tc", "class", "del", "dev", ifn, "classid", srcClassID(src))
 	}
-
-	// ===== 上传方向（源→公网）：出口网卡 htb，按 saddr=SNAT 后源(OutIP) 匹配 =====
-	// 上传包经 FORWARD → SNAT（源=OutIP）→ 从出口网卡发出。此前误挂入口网卡
-	// （IfIn 只能按 dattr 匹配回程=下载方向），上传从未被限——实测 76MB/s 漏网。
-	// 出口网卡独立 htb 树 + u32 at12 源匹配（SNAT 在 POSTROUTING 先于 qdisc 生效，
-	// 到达出口 qdisc 的包源已是 OutIP），per-包总额 class + 全包成员收敛到同一 class。
-	if s.OutIP != "" {
-		s.ensureHTB(s.IfOut)
-		if err := runQuiet("tc", "class", "replace", "dev", s.IfOut, "parent", "1:", "classid", bwGroupClassID,
-			"htb", "rate", strconv.FormatInt(s.BWGroupKBps*1024*8, 10),
-			"ceil", strconv.FormatInt(s.BWGroupKBps*1024*8, 10)); err != nil {
-			return err
-		}
-		outHex, outMask, ok := ipCidrToU32(s.OutIP)
-		if ok {
-			if err := runQuiet("tc", "filter", "replace", "dev", s.IfOut, "parent", "1:",
-				"protocol", "ip", "pref", strconv.Itoa(uploadFilterPref(s.OutIP)), "u32",
-				"match", "u32", outHex, outMask, "at", "12", // saddr=SNAT 后源
-				"flowid", bwGroupClassID); err != nil {
-				return err
-			}
-		}
-	}
+	// 历史 filter 也清掉（本方案不依赖它们，留着会干扰 direct 判定）
+	_ = runQuiet("tc", "filter", "del", "dev", ifn, "parent", "1:")
 	return nil
 }
 
@@ -964,15 +962,23 @@ func uploadFilterPref(src string) int {
 	return 1002 + sum%997
 }
 
-// ensureHTB 保证指定网卡 root 是 htb（幂等；fq_codel 等默认 qdisc 被替换为
-// htb default 30 全速，drops 行为不变）。
+// ensureHTB 保证指定网卡 root 是 htb，且 default 指向限速类 1:100。
+//
+// default 必须是限速类：本环境 u32 filter 不参与分类（见 applySnatLimit），
+// 唯一可靠的限速路径就是让所有包默认进限速类。`tc qdisc change ... default N`
+// 在本内核返回 "Change operation not supported"，所以 default 不对时只能重建
+// qdisc——重建会短暂清空 class，故仅在确有必要时执行。
 func (s *snatRuleSpec) ensureHTB(ifn string) {
 	out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output()
-	if err == nil && strings.Contains(string(out), "qdisc htb") {
-		return
+	if err == nil {
+		info := string(out)
+		// default 0x64 == 100（限速类）
+		if strings.Contains(info, "qdisc htb") && strings.Contains(info, "default 0x64") {
+			return
+		}
 	}
 	_ = runQuiet("tc", "qdisc", "del", "dev", ifn, "root")
-	_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "root", "handle", "1:", "htb", "default", "30")
+	_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "root", "handle", "1:", "htb", "default", "100")
 	_ = runQuiet("tc", "class", "add", "dev", ifn, "parent", "1:", "classid", "1:30",
 		"htb", "rate", "10gbit")
 }
