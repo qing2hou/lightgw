@@ -901,14 +901,27 @@ func (s *snatRuleSpec) applySnatLimit() error {
 	return nil
 }
 
-// applyHTBLimit 在指定网卡建立扁平限速结构（无子类、无 filter 分类）。
+// applyHTBLimit 建立"限速总额类 + fq_codel 流公平"结构。
 //
-//	qdisc htb 1: default 100
-//	class 1:100 rate=ceil=<带宽包总额>   ← 全部出向流量在此受总额约束
-//	class 1:30  rate=10gbit              ← 保留占位（不承载流量）
+//	qdisc htb 1:   default 100                              ← 全部转向限速类
+//	class 1:100    rate=ceil=<带宽包总额>                     ← 总额硬限
+//	qdisc fq_codel 100: parent 1:100                        ← 流级公平调度
+//	class 1:30     rate=10gbit                              ← 占位（不承载流量）
 //
-// 同时清理历史遗留的 per-源子类：旧版本按源建 1:2..1:249 子类，只要父类下
-// 还存在子类，未被指定的包就走 direct 路径绕过限速（升级后必须清掉）。
+// 为什么是"default 直连 + fq_codel"而不是按源分类（详见 nft/anchor.go 的
+// 长注释）：本环境所有按源分类的通路都不可用——u32 完全不参与分类；
+// fw 只认奇数小整数 handle 且要求 mark 无额外位；flower 不支持 skb mark。
+// 上传包在 egress 上源地址又已被 SNAT 改成网关 IP，按地址分类本就不可能。
+//
+// 实际保证：
+//   - 总额：严格受 htb rate 约束（实测 8MB/s 配置跑出 6.67MB/s，差额为 TCP 开销）
+//   - 公平：fq_codel 按流轮转，多连接并发时按流均分，单个源的多条连接
+//     不会整体饿死其他源
+//   - 每源硬保底（MinKBps）当前不生效，见 anchor.go 说明
+//
+// 幂等：class replace 自幂等；fq_codel 已存在则不重复添加（重复 add 会失败）；
+// 顺带清理历史遗留的 per-源子类（旧版本建的 1:2..1:249，会让流量走 direct
+// 路径绕过限速）。
 func (s *snatRuleSpec) applyHTBLimit(ifn string) error {
 	totalBits := strconv.FormatInt(s.BWGroupKBps*1024*8, 10)
 	if err := runQuiet("tc", "class", "replace", "dev", ifn, "parent", "1:",
@@ -917,13 +930,25 @@ func (s *snatRuleSpec) applyHTBLimit(ifn string) error {
 		"burst", "32k", "cburst", "32k"); err != nil {
 		return err
 	}
-	for _, src := range s.AllowSrcs {
-		if src == "" {
+	// fq_codel 挂在限速类下（幂等：已有则跳过）
+	if out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output(); err == nil {
+		if !strings.Contains(string(out), "qdisc fq_codel 100:") {
+			_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "parent", bwGroupClassID,
+				"handle", "100:", "fq_codel")
+		}
+	}
+	// 清理历史 per-源子类（旧版本按源建的 1:2..1:249）。
+	// 注意必须跳过限速类 1:100 与占位类 1:30——早期版本这里从 2 遍历到 249，
+	// 把刚建好的 1:100 一并删掉，导致 default 0x100 指向不存在的 class，
+	// 内核把包全部走 direct 路径，限速彻底失效（实测 24MB/s 满速）。
+	for n := 2; n <= 249; n++ {
+		clsID := "1:" + strconv.Itoa(n)
+		if clsID == bwGroupClassID || clsID == "1:30" {
 			continue
 		}
-		_ = runQuiet("tc", "class", "del", "dev", ifn, "classid", srcClassID(src))
+		_ = runQuiet("tc", "class", "del", "dev", ifn, "classid", clsID)
 	}
-	// 历史 filter 也清掉（本方案不依赖它们，留着会干扰 direct 判定）
+	// 清理历史 u32/fw filter（本方案不依赖分类器，残留会干扰 direct 判定）
 	_ = runQuiet("tc", "filter", "del", "dev", ifn, "parent", "1:")
 	return nil
 }
@@ -964,10 +989,9 @@ func uploadFilterPref(src string) int {
 
 // ensureHTB 保证指定网卡 root 是 htb，且 default 指向限速类 1:100。
 //
-// default 必须是限速类：本环境 u32 filter 不参与分类（见 applySnatLimit），
-// 唯一可靠的限速路径就是让所有包默认进限速类。`tc qdisc change ... default N`
-// 在本内核返回 "Change operation not supported"，所以 default 不对时只能重建
-// qdisc——重建会短暂清空 class，故仅在确有必要时执行。
+// default 必须是限速类：本环境没有可用的分类器（见 applyHTBLimit 注释），
+// 唯一可靠的限速路径就是让包默认进限速类。`tc qdisc change ... default N`
+// 在本内核返回 "Change operation not supported"，default 不匹配时只能重建。
 func (s *snatRuleSpec) ensureHTB(ifn string) {
 	out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output()
 	if err == nil {
