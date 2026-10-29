@@ -1526,6 +1526,13 @@ func parseSnatCountersOutput(out, comment string) *snatCounters {
 type snatBaseline struct {
 	accept int64
 	drop   int64
+	// sampledAt 上次采样时刻（unix 秒）。速率 = 本次差分 / 实际间隔——SNAT 的
+	// 计数来自内核 nft counter，只能按轮询周期取差分，不能像连接级会话那样
+	// 逐次 Add 到 rateMeter（那是每写一次就落一个秒槽的精确口径）。
+	// 早期实现把 5s 的差分整块塞进 rateMeter 的"当前秒槽"，而 Rate() 恒按
+	// 10 秒窗口求平均：槽里只有 2 个有数据、其余 8 个为空，显示值 = 真实值 / 5
+	// （实测 46.7MB/s 下载显示 66KB/s，用户可见的严重偏差）。
+	sampledAt int64
 }
 
 // pollSnatCounters 单轮全量轮询：读计数 → 差分入 ruleStats（速率窗口+拒绝计数）。
@@ -1565,8 +1572,9 @@ func (m *Manager) pollSnatCounters() {
 		m.snatMu.Lock()
 		base := m.snatBase[e.ruleID]
 		first := base == nil
+		nowSec := time.Now().Unix()
 		if first {
-			base = &snatBaseline{accept: c.BytesAccept, drop: c.BytesDrop}
+			base = &snatBaseline{accept: c.BytesAccept, drop: c.BytesDrop, sampledAt: nowSec}
 			m.snatBase[e.ruleID] = base
 		}
 		dUp := c.BytesAccept - base.accept
@@ -1581,19 +1589,30 @@ func (m *Manager) pollSnatCounters() {
 				}
 			}
 		}
-		// 速率窗口：入向（accept 字节差分，双倍计入——每字节进出各一次转发）。
-		// 为语义清晰：up=入向穿越字节、down=出向穿越字节——内核只在一处计数（FORWARD），
-		// 无方向区分；按 SNAT 场景主流诉求统一计为 up（入向），down 同步镜像展示。
+		// 速率：按【实际采样间隔】折算，而不是喂 rateMeter 的 10 秒窗口。
+		// 内核 nft counter 只有轮询点能读差分，每 5s 才产生一次增量；把它整块
+		// 塞进 rateMeter 的"当前秒槽"会让 10 个槽里只有 2 个有数据，而 Rate()
+		// 恒除以 10，显示值被压低 5 倍（用户实测 46.7MB/s 下载显示 66KB/s）。
+		//
+		// 方向语义：fwd 放行行的 counter 统计双向穿越字节（内核只在 FORWARD
+		// 计一次，无方向区分）。SNAT 的主流诉求是看总吞吐，故 up/down 同值展示。
 		if !first && dUp > 0 {
 			if st := m.statsLookup(e.ruleID); st != nil {
-				st.RateUp.Add(dUp)
-				st.RateDown.Add(dUp)
+				if dt := nowSec - base.sampledAt; dt > 0 {
+					st.SnatRateBps.Store(dUp / dt)
+				}
 				st.BytesUp.Add(dUp)
 				st.BytesDown.Add(dUp)
+			}
+		} else if !first && dUp == 0 {
+			// 本周期无流量：速率归零，避免静止规则长期显示历史峰值
+			if st := m.statsLookup(e.ruleID); st != nil {
+				st.SnatRateBps.Store(0)
 			}
 		}
 		base.accept = c.BytesAccept
 		base.drop = c.BytesDrop
+		base.sampledAt = nowSec
 		m.snatMu.Unlock()
 	}
 }

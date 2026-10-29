@@ -21,6 +21,12 @@ type ruleStats struct {
 	// 实时速率（最近 10 秒滑动窗口平均，B/s；写入点在 addBytes）
 	RateUp   rateMeter
 	RateDown rateMeter
+	// SnatRateBps SNAT 专用速率（B/s）。SNAT 的字节数只能按轮询周期（5s）从
+	// 内核 nft counter 取差分，喂不进 rateMeter 的"每次写入落一个秒槽"模型：
+	// 5s 采样只会填满 2/10 个槽，而 Rate() 恒按窗口长度 10 求平均，显示值
+	// = 真实值 / 5（实测 46.7MB/s 下载显示 66KB/s）。
+	// 这里直接存"本次差分 ÷ 实际采样间隔"，语义为最近一个周期的平均速率。
+	SnatRateBps atomic.Int64
 }
 
 // RuleMetric 单条规则的指标快照。
@@ -107,6 +113,12 @@ func (m *Manager) RuleMetrics() []RuleMetric {
 			rm.BytesDown = st.BytesDown.Load()
 			rm.RateUpBps = st.RateUp.Rate()
 			rm.RateDownBps = st.RateDown.Rate()
+			// SNAT 走独立口径（轮询差分 / 实际间隔）：内核 counter 只在周期
+			// 采样点更新，rateMeter 的秒槽模型在这里会低估 5 倍。
+			if v := st.SnatRateBps.Load(); v > 0 {
+				rm.RateUpBps = v
+				rm.RateDownBps = v
+			}
 			rm.Errors = st.Errors.Load()
 			rm.Denied = st.Denied.Load()
 		}
