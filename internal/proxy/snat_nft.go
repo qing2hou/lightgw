@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"fmt"
+	"strings"
 
 	"haproxyweb/internal/model"
 	"haproxyweb/internal/nft"
@@ -109,9 +110,23 @@ func (m *Manager) teardownSnatNFT(ruleID uint) {
 	m.reinstallDefaultDenyLocked(conn)
 }
 
+// RecomputeDefaultDeny 按当前 DB 状态重算默认拒绝尾行（API 删除规则后调用：
+// Stop() 时规则尚未从库里删除，重算出的辖区包含它；DB 删除后必须再算一次）。
+func (m *Manager) RecomputeDefaultDeny() {
+	conn, err := m.nftConn()
+	if err != nil {
+		logf("默认拒绝尾行重算跳过（nft 引擎不可用）: %v", err)
+		return
+	}
+	m.nftApplyMu.Lock()
+	defer m.nftApplyMu.Unlock()
+	m.reinstallDefaultDenyLocked(conn)
+}
+
 // reinstallDefaultDenyLocked 默认拒绝尾行重装（调用方持 nftApplyMu）。
-// 入口集 = 当前 DB 启用 snat 规则的入口网卡去重集；空集时拆除尾行
-// （vanilla 语义回到全通——与"有规则才有管辖区"一致）。
+// 辖区 = 存在中的 snat 规则入口网卡 ∪ 出口实体网卡（含停用规则，见
+// computeDefaultDenySets 的语义说明）；完全无规则且无出口时才拆除尾行
+// （本机不承担网关职责，不干预转发）。
 func (m *Manager) reinstallDefaultDenyLocked(conn *nft.Conn) {
 	ifaces, dnatBackends, denied, err := m.computeDefaultDenySets()
 	if err != nil {
@@ -151,35 +166,70 @@ func (m *Manager) appendDefaultDenyNoFlush(conn *nft.Conn) {
 
 // computeDefaultDenySets 默认拒绝尾行的辖区与豁免计算（纯读，复核建议：
 // 此前两处逐行同构的拷贝合并于此——改辖区逻辑只动这一处）。
-// 返回：snat 入口网卡集、dnat 后端 IP 集、是否存在"指定就不通"语义规则。
+// 返回：snat 入口网卡集、dnat 后端 IP 集、是否启用默认拒绝。
+//
+// 管辖语义（B 方案，用户确认）：**只要系统里存在任何 snat 规则（含停用）
+// 或任何出口实体，就维持默认拒绝**。理由：本产品的定位是一台网关，转发面
+// 必须"默认不通、按规则放行"。早期实现按"启用中的规则"取辖区，导致停用最后
+// 一条规则时默认拒绝行连同辖区一起消失，整机静默退化为全放行路由器
+// （ip_forward 恒为 1），运维以为只是关了一条规则、实际是打开了整机转发。
+//
+// 辖区取值的两个来源取并集：
+//   - 所有 snat 规则（无论 enabled）的入口网卡：停用的规则仍需守住它的入口，
+//     否则"停用=放开该网卡全部流量"
+//   - 所有出口实体的网卡：出口实体本身就是"允许出站的路径"，反向定义了
+//     受管范围；没有 snat 规则但配了出口时同样要拒绝未声明流量
+//
+// dnat 侧不变：只取启用中规则的后端 IP（停用的发布不该继续把流量改写到后端，
+// 但也不该因此放开 fwd——后端 IP 辖区随规则停用而收缩是正确的）。
 func (m *Manager) computeDefaultDenySets() (ifaces, dnatBackends []string, denied bool, err error) {
 	var rules []model.ForwardRule
-	if err := m.db.Where("protocol IN ? AND enabled = ?", []string{"snat", "dnat"}, true).Find(&rules).Error; err != nil {
+	// 注意：这里**不过滤 enabled**——辖区必须覆盖停用规则，见上方注释
+	if err := m.db.Where("protocol = ?", model.ProtocolSNAT).Find(&rules).Error; err != nil {
+		return nil, nil, false, err
+	}
+	var dnatRules []model.ForwardRule
+	if err := m.db.Where("protocol = ? AND enabled = ?", model.ProtocolDNAT, true).Find(&dnatRules).Error; err != nil {
 		return nil, nil, false, err
 	}
 	seen := map[string]bool{}
 	ifaces = make([]string, 0, len(rules))
-	dnatBackends = make([]string, 0, len(rules))
+	dnatBackends = make([]string, 0, len(dnatRules))
 	for _, r := range rules {
-		if r.Protocol == model.ProtocolDNAT {
-			// dnat：辖区=后端 IP；白名单语义恒真（API 强制），发布行必然依赖兜底拒绝
-			if bip, _, ok := splitHostPortOK(r.TargetAddr); ok && !seen["b:"+bip] {
-				seen["b:"+bip] = true
-				dnatBackends = append(dnatBackends, bip)
+		ifn := strings.TrimSpace(r.ListenAddr)
+		if ifn != "" && !seen["i:"+ifn] {
+			seen["i:"+ifn] = true
+			ifaces = append(ifaces, ifn)
+		}
+		// 任何 snat 规则的存在（含停用）即启用默认拒绝
+		denied = true
+	}
+	for _, r := range dnatRules {
+		// dnat：辖区=后端 IP；白名单语义恒真（API 强制），发布行必然依赖兜底拒绝
+		if bip, _, ok := splitHostPortOK(r.TargetAddr); ok && !seen["b:"+bip] {
+			seen["b:"+bip] = true
+			dnatBackends = append(dnatBackends, bip)
+		}
+		denied = true
+	}
+	// 出口实体同样定义受管范围：没有 snat 规则但配了出口时也要拒绝未声明流量，
+	// 否则"只配出口不配规则"会退回全放行路由器。
+	// 只有在 snat 规则完全没有定义辖区（无任何 snat 规则）时才用出口网卡兜底——
+	// 有规则时辖区以规则的入口网卡为准，不额外扩大（避免误伤不经规则的旁路转发）。
+	var egs []model.Egress
+	if err := m.db.Where("enabled = ?", true).Find(&egs).Error; err != nil {
+		return nil, nil, false, err
+	}
+	if len(egs) > 0 {
+		denied = true
+		if len(ifaces) == 0 {
+			for _, e := range egs {
+				ifn := strings.TrimSpace(e.Iface)
+				if ifn != "" && !seen["i:"+ifn] {
+					seen["i:"+ifn] = true
+					ifaces = append(ifaces, ifn)
+				}
 			}
-			denied = true
-			continue
-		}
-		if !seen[r.ListenAddr] {
-			seen[r.ListenAddr] = true
-			ifaces = append(ifaces, r.ListenAddr)
-		}
-		// 复审 N5：目标白名单也依赖兜底拒绝（白名单外全拒）——与源白名单、
-		// 目标黑名单同属"指定就不通"语义族
-		if r.AclMode == model.AclModeWhitelist ||
-			(r.DstAclMode == model.AclModeWhitelist && len(parseIPListOrEmpty(r.DstAllowList)) > 0) ||
-			(r.DstAclMode == model.AclModeBlacklist && len(parseIPListOrEmpty(r.DstDenyList)) > 0) {
-			denied = true
 		}
 	}
 	return ifaces, dnatBackends, denied, nil

@@ -771,6 +771,9 @@ func (h *handlers) createRule(c *gin.Context) {
 		// 应用失败（如端口被外部进程占用）则回滚删除
 		if delErr := h.DB.Delete(&model.ForwardRule{}, rule.ID).Error; delErr != nil {
 			log.Printf("[api] 规则[%s#%d] 应用失败后回滚删除失败: %v", rule.Name, rule.ID, delErr)
+		} else if rule.Protocol == model.ProtocolSNAT {
+			// 辖区重算：这条 snat 规则已回到"不存在"，默认拒绝辖域需同步收缩
+			h.Mgr.RecomputeDefaultDeny()
 		}
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
@@ -858,6 +861,12 @@ func (h *handlers) deleteRule(c *gin.Context) {
 		return
 	}
 	h.Mgr.ForgetRule(rule.ID) // 清理进程内指标条目
+	// 辖区重算：辖区覆盖"存在的全部 snat 规则（含停用）"。Stop() 时规则还在库里，
+	// 重算得到的是删除前辖区；DB 删除后必须再算一次，否则删掉最后一条 snat 规则
+	// 会留下指向不存在规则的默认拒绝行（该网卡全部转发被永久拒绝）。
+	if rule.Protocol == model.ProtocolSNAT {
+		h.Mgr.RecomputeDefaultDeny()
+	}
 	h.Audit.Record(h.username(c), "rule_delete", ruleDetail(rule), h.clientIP(c))
 	c.JSON(200, gin.H{"ok": true})
 }

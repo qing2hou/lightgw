@@ -152,6 +152,8 @@ func (h *handlers) importRules(c *gin.Context) {
 		for _, r := range existing {
 			h.Mgr.ForgetRule(r.ID)
 		}
+		// 辖区重算：清空后可能已无任何 snat 规则，默认拒绝行需随之拆除
+		h.Mgr.RecomputeDefaultDeny()
 	}
 
 	// 批次内同协议同端口冲突跟踪："proto|port" -> 首个占用者名称
