@@ -122,10 +122,15 @@
         <el-form-item label="出口网卡" required>
           <el-select v-model="form.target_addr" filterable placeholder="流量从哪块网卡出去" style="width: 100%" class="mono-input" @change="form.snat_ip = ''">
             <el-option v-for="i in ifaces" :key="i.name" :value="i.name"
-              :label="`${i.name}（${i.ips && i.ips.length ? i.ips.join(', ') : '无 IPv4'}，${i.status}）`"
-              :disabled="i.status !== 'up' || !i.ips || !i.ips.length || i.name === form.listen_addr" />
+              :label="`${i.name}（${i.ips && i.ips.length ? i.ips.join(', ') : '无 IPv4'}，${i.status}）${i.name === form.listen_addr ? '· 与入口同一张' : ''}`"
+              :disabled="i.status !== 'up' || !i.ips || !i.ips.length" />
           </el-select>
           <div class="form-tip">SNAT 后流量从这块网卡出去，源地址替换为下方选定的 IP</div>
+          <div class="form-tip" v-if="form.target_addr && form.target_addr === form.listen_addr">
+            单臂网关：入口与出口是同一张网卡（{{
+              form.listen_addr
+            }}）。上游需把默认网关指向本机在这块网卡上的地址，本机再用另一个地址做 SNAT 转发出去。
+          </div>
         </el-form-item>
         <el-form-item label="SNAT 源 IP" required>
           <el-select v-model="form.snat_ip" filterable allow-create placeholder="自动（网卡首地址）" style="width: 100%" class="mono-input">

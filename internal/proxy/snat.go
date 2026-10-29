@@ -337,11 +337,22 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 			return fmt.Errorf("SNAT 源 IP %s 已不在出口网卡 %s 上（网卡地址已变更？），已停用规则——请重新选择", rule.SnatIP, spec.IfOut)
 		}
 	}
-	if spec.IfIn == spec.IfOut {
-		return fmt.Errorf("入口与出口网卡不能相同: %s", spec.IfIn)
-	}
+	// 入口/出口同卡是合法的（单臂网关）：上游把网关指向本机同一网卡的地址，
+	// 转发后再从该网卡发出。nft 侧 iif==oif 正常匹配；tc 限速在该网卡上
+	// 同时承担下载（daddr=源）与上传（saddr=OutIP）两类 filter，二者 pref
+	// 由 applySnatLimit 按方向分段，不会互相覆盖。
 	if err := ensureIPForward(); err != nil {
 		return err
+	}
+	// 同卡时必须关闭该网卡的 ICMP redirect 发送：内核看到"入口==出口且同网段"
+	// 会直接回 ICMP redirect 让发送方绕开本机直连（实测路由缓存标记 <redirect>，
+	// 包根本不进 FORWARD，规则计数恒为 0），单臂网关因此完全不转发。
+	if spec.IfIn == spec.IfOut {
+		if err := ensureNoSendRedirects(spec.IfIn); err != nil {
+			// 不阻断主功能：部分环境（容器/只读 procfs）写不了，留痕即可
+			logf("规则[%s#%d] 同卡部署需关闭 %s 的 send_redirects，写入失败（同网段目标可能不转发）: %v",
+				rule.Name, rule.ID, spec.IfIn, err)
+		}
 	}
 	// nftables 后端（T004）：fw 编译经 netlink 装载；旧 iptables 形态由
 	// T006 启动迁移拆除，此处双形态拆除中 iptables 拆除仅作兜底（升级过渡期）
@@ -414,6 +425,46 @@ func ensureIPForward() error {
 	}
 	logf("[snat] 已自动开启 net.ipv4.ip_forward（原值为 0）")
 	return nil
+}
+
+// ensureNoSendRedirects 关闭指定网卡（及 all）的 ICMP redirect 发送。
+//
+// 为什么同卡 SNAT 必须关：内核在"入口接口 == 出口接口且目标与源同网段"时
+// 判定为次优路径，直接给发送方回 ICMP redirect 并丢弃转发意图（`ip route get`
+// 的缓存标记 <redirect>），包不进 FORWARD 链——nft 的 iif==oif 放行行永远
+// 不命中，单臂网关表现为"规则在位但零转发"。
+//
+// 只写 send_redirects，不动 accept_redirects（那是收包侧语义，与本问题无关）。
+func ensureNoSendRedirects(ifName string) error {
+	paths := []string{
+		"/proc/sys/net/ipv4/conf/all/send_redirects",
+		"/proc/sys/net/ipv4/conf/" + ifName + "/send_redirects",
+	}
+	var firstErr error
+	changed := false
+	for _, p := range paths {
+		b, err := osReadFile(p)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("读取 %s 失败: %w", p, err)
+			}
+			continue
+		}
+		if strings.TrimSpace(string(b)) == "0" {
+			continue
+		}
+		if err := osWriteFile(p, []byte("0"), 0644); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("写入 %s 失败: %w", p, err)
+			}
+			continue
+		}
+		changed = true
+	}
+	if changed {
+		logf("[snat] 已关闭 %s 的 send_redirects（单臂网关同卡转发的必要条件）", ifName)
+	}
+	return firstErr
 }
 
 // snatRuleSpec 由 ForwardRule 展开出的 iptables 规则参数（校验已在前置完成）。
@@ -869,7 +920,7 @@ func (s *snatRuleSpec) applySnatLimit() error {
 		outHex, outMask, ok := ipCidrToU32(s.OutIP)
 		if ok {
 			if err := runQuiet("tc", "filter", "replace", "dev", s.IfOut, "parent", "1:",
-				"protocol", "ip", "pref", strconv.Itoa(srcFilterPref(s.OutIP)), "u32",
+				"protocol", "ip", "pref", strconv.Itoa(uploadFilterPref(s.OutIP)), "u32",
 				"match", "u32", outHex, outMask, "at", "12", // saddr=SNAT 后源
 				"flowid", bwGroupClassID); err != nil {
 				return err
@@ -889,13 +940,28 @@ func srcClassID(src string) string {
 	return fmt.Sprintf("1:%d", 2+sum%248)
 }
 
-// srcFilterPref 源 IP -> 稳定 filter pref（2..999；pref 1 固定保留）。
+// srcFilterPref 下载方向 filter pref（2..998；pref 1 固定保留）。
+// 下载 filter 匹配 daddr=源，上传 filter 匹配 saddr=OutIP——入口/出口同卡
+// （单臂网关）时两类 filter 落在同一个 qdisc 上，pref 必须分段不相交，
+// 否则 tc filter replace 会按 pref 覆盖，导致某一方向限速失效。
+// 本函数区段保持不变（2..998）：已部署规则的下载 filter 依赖该 pref 做精确拆除。
 func srcFilterPref(src string) int {
 	sum := 0
 	for _, b := range []byte(src) {
 		sum += int(b)
 	}
 	return 2 + sum%997
+}
+
+// uploadFilterPref 上传方向 filter pref（1002..1998，与下载区段 2..998 不相交）。
+// 同卡部署下两方向共存的关键；双卡部署时上传 filter 在出口网卡、下载在入口
+// 网卡，本就互不干扰，分段只是让两种拓扑共用一套代码。
+func uploadFilterPref(src string) int {
+	sum := 0
+	for _, b := range []byte(src) {
+		sum += int(b)
+	}
+	return 1002 + sum%997
 }
 
 // ensureHTB 保证指定网卡 root 是 htb（幂等；fq_codel 等默认 qdisc 被替换为
@@ -960,10 +1026,15 @@ func ipCidrToU32(s string) (hex, mask string, ok bool) {
 func (s *snatRuleSpec) teardownSnatLimit() error {
 	// 下载：删入口网卡自己源的 filter（pref 由源稳定 hash，不碰别人）。
 	// 上传：删出口网卡 OutIP 源 filter。root htb/class 保留（他规则可能共用）。
+	// 同卡部署（单臂网关）时 IfIn==IfOut，两个循环各自按 pref 精确命中，
+	// 因下载区段(2..998)与上传区段(1002..1998)不相交，互不误删。
 	for _, src := range s.AllowSrcs {
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "1:", "pref", strconv.Itoa(srcFilterPref(src)))
 	}
 	if s.OutIP != "" {
+		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(uploadFilterPref(s.OutIP)))
+		// 旧版上传 filter 用的是 srcFilterPref 区段（升级前装的），同卡部署下
+		// 会与下载 filter 争用 pref——首次重装时一并清掉。
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(srcFilterPref(s.OutIP)))
 	}
 	return nil

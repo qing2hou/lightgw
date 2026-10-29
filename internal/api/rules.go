@@ -291,9 +291,10 @@ func (h *handlers) validateSnat(in *ruleInput) error {
 	if up, _ := proxy.InterfaceExists(in.TargetAddr); !up {
 		return fmt.Errorf("出口网卡 %q 不存在或未启用（可用网卡见 GET /api/interfaces）", strings.TrimSpace(in.TargetAddr))
 	}
-	if strings.TrimSpace(in.ListenAddr) == strings.TrimSpace(in.TargetAddr) {
-		return fmt.Errorf("入口与出口网卡不能相同: %s", in.ListenAddr)
-	}
+	// 入口与出口可以是同一张网卡（单臂网关：上游把网关/路由指向本机同一网卡的
+	// 另一个地址，转发后再从这张网卡发出去）。引擎按 iif==oif 正常匹配，
+	// 但同卡时 tc 限速的上传/下载 filter 会落在同一 qdisc 上，需按方向区分
+	// pref（applySnatLimit 已处理），此处不再限制。
 	if strings.TrimSpace(in.DenyList) != "" {
 		return fmt.Errorf("snat 规则不支持黑名单（穿越转发无监听端口语义），请使用白名单")
 	}
