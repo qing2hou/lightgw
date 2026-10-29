@@ -142,6 +142,21 @@ func CompileSNAT(s Spec) ([]Rule, error) {
 		}
 	}
 
+	// ④b fwd：回程方向计数行（只计数、无判决，紧跟放行行之后）。
+	//
+	// 为什么需要：放行行（②③④）都以 saddr=白名单源 为条件，只能命中
+	// "客户端→服务器"方向。下载回程包的源是公网服务器、目的是客户端，
+	// saddr 不匹配 → 靠 pre_mark 的 ct established 打标放行，**绕过全部
+	// counter**。结果是页面速率只反映客户端发出的 ACK 小包：
+	// 实测 3.54MB/s 下载期间页面显示 68.9KB/s——恰为该下载速率对应的 ACK
+	// 字节速率（2542 包/s ÷ 2 延迟确认 × 54B ≈ 67KB/s，误差 3%）。
+	//
+	// 本行匹配"目的=白名单源"（即回程），打同一个 comment 使其字节并入
+	// 同一规则的计数口径；不带 Verdict——放行仍由 pre_mark 的 established
+	// 打标 + 尾部默认拒绝行的 mark 判据完成，语义零变化。
+	out = append(out, returnPathCounterRows(tbl, ud, s)...)
+
+
 	// ⑤ srcnat：SNAT 源改写（每源一行；off 无源=仅出入口行——均带 oif 出口维度）。
 	// 池模式（T207）：每源的改写目标 = Pool 按源确定性映射（同源恒同 IP）
 	srcList := srcs
@@ -388,4 +403,57 @@ func CompileDefaultDenyEx(ruleID uint, ifaces, dnatBackends []string) []Rule {
 		}})
 	}
 	return out
+}
+
+// returnPathCounterRows 回程方向计数行（目的 = 白名单源）。
+//
+// 只计数、不打标、不判决：回程包的放行依赖 pre_mark 的 ct established 打标，
+// 本行只是把回程字节并入同一规则的 counter（否则页面速率只反映 ACK 小包）。
+// 网卡维度与放行行保持一致（iif/oif + DNAT 位排除），保证计数口径与规则辖区一致。
+func returnPathCounterRows(tbl *nftables.Table, ud string, s Spec) []Rule {
+	if len(s.AllowSrcs) == 0 {
+		return nil
+	}
+	var out []Rule
+	for _, src := range s.AllowSrcs {
+		if src == "" {
+			continue
+		}
+		// 显式新建切片：iifOifExprs 返回的切片若被 append 复用底层数组，
+		// 后续追加会覆盖其内容（实测导致 daddr 偏移退化为 saddr、CIDR 掩码串位）
+		ex := make([]expr.Any, 0, 12)
+		ex = append(ex, iifOifExprs(s.IfIn, s.IfOut)...)
+		// 目的 = 白名单源（回程方向）
+		ex = append(ex, addrMatchExprsDst(src)...)
+		ex = append(ex, &expr.Counter{})
+		out = append(out, Rule{Chain: nft.ChainFwd, Rule: &nftables.Rule{
+			Table: tbl, UserData: []byte(ud), Exprs: ex,
+		}})
+	}
+	return out
+}
+
+// addrMatchExprsDst 目的地址匹配（v4 offset16/4B；v6 offset24/16B）。
+// 与 addrMatchExprsSrc 同构，仅偏移不同（回程包目的 = 客户端地址）。
+func addrMatchExprsDst(dst string) []expr.Any {
+	if ip := v4(dst); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr, Len: 4},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if ip := v4OrV6(dst); ip != nil {
+		return []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offDaddr6, Len: 16},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: ip},
+		}
+	}
+	if _, ipn, err := net.ParseCIDR(dst); err == nil && ipn != nil {
+		off := uint32(offDaddr)
+		if ipn.IP.To4() == nil {
+			off = offDaddr6
+		}
+		return cidrMatchExprs(ipn, off)
+	}
+	return nil
 }

@@ -1,5 +1,27 @@
 # 更新日志
 
+## 未发布——SNAT 流量统计修正（速率只算上行 ACK）
+
+### 修复
+- **SNAT 页面速率/字节只统计上行方向**：`fwd` 的放行行以 `saddr=白名单源`
+  为条件，只能命中"客户端→服务器"方向；下载回程包（源=公网服务器、
+  目的=客户端）靠 `pre_mark` 的 ct established 打标放行，**绕过全部 counter**。
+  结果页面速率只反映客户端发出的 ACK 小包——实测 3.54MB/s 下载显示
+  68.9KB/s（2542 包/s ÷ 2 延迟确认 × 54B ≈ 67KB/s，误差 3%，即为证）。
+
+  修复：为每个白名单源追加一条**回程计数行**（匹配 `daddr=白名单源`，
+  只 `counter` 无 verdict），与放行行共用同一 comment，字节并入同一规则
+  统计口径。放行语义零变化（回程仍由 established 打标 + 尾部默认拒绝的
+  mark 判据完成）。
+
+  实测（170，NVIDIA CUDA 真实下载）：页面 4.00MB/s / 3.79MB/s，
+  与 wget 报告 3.54MB/s 一致（修复前 68.9KB/s）。
+
+### 同时修复
+- `returnPathCounterRows` 初期实现直接 `append` 复用 `iifOifExprs` 的
+  底层数组，导致 daddr 偏移退化为 saddr、CIDR 掩码串位；改为显式新建
+  切片。单测以 `Payload.Offset==offDaddr` 作为回程行判据覆盖此点。
+
 ## 未发布——SNAT 实时速率显示修复
 
 ### 修复
