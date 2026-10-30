@@ -2,7 +2,7 @@
 
 **阶段**: S1 — 影子链原子切换
 **日期**: 2026-10-30
-**本轮提交范围**: `4ac63ad`（4 个新文件，约 1,100 行含测试）
+**本轮提交范围**: `4ac63ad`（影子链）+ `3c8419e`（翻译器），6 个新文件
 
 ---
 
@@ -13,10 +13,28 @@
 | `internal/adapter/nftables/engine.go` | 引擎骨架：表/链结构创建（**只增不删**）、4 个锚点 + 8 个工作链 + MSS/input 固定链、`Slot` 版本槽 |
 | `internal/adapter/nftables/shadow.go` | `CommitShadow` 四阶段、`installLocked`/`verifyLocked`/`switchLocked`/`cleanupChainLocked`、`JumpCount`/`AllJumpCounts`/`ChainRuleCount` |
 | `internal/adapter/nftables/conn.go` | `connAPI` 接口（10 方法）+ 编译期断言 `var _ connAPI = (*nftables.Conn)(nil)` |
+| `internal/adapter/nftables/translate.go` | `TranslatePlan` / `translateMSS` / `translateRule` / `translateAddrMatch` / `ApplyFixed` |
 | `internal/adapter/nftables/shadow_test.go` | 17 个测试 |
+| `internal/adapter/nftables/translate_test.go` | 26 个测试 |
 | `internal/adapter/nftables/memconn_test.go` | 内存 netlink 实现（精确模拟 batch 回滚语义） |
 
-**覆盖率**：85.9%。
+**覆盖率**：83.8%（43 个测试）。
+
+**真机验证已执行**（`192.168.10.170`，表名 `haweb_v2`，验完已删）：
+
+| 断言 | 结果 |
+|---|---|
+| 14 条链建成功（4 锚点 + 8 工作链 + MSS + input） | ✅ |
+| 4 个锚点各 1 条 jump | ✅ |
+| MSS `maxseg size set 1360` 被接受 | ✅ |
+| ICMP 3,11 / ICMPv6 1,2,3 豁免被接受 | ✅ |
+| DNAT `tcp dport 1022 ct mark ... counter dnat ip to ...` | ✅ |
+| SNAT `tcp sport 1022 ct mark ... counter snat ip to ...` | ✅ |
+| ct mark 位运算保留（显示 `0x00000100/24`） | ✅ |
+| 4 个锚点单 batch 切换 a→b，切换后各仍 1 条 jump | ✅ |
+| `nft list tables` 复查只剩三张业务表 | ✅ |
+
+**未做**：真机上的 `-race` 并发切换（用内存实现覆盖，见下）。
 
 ---
 
@@ -61,17 +79,30 @@ Engine 依赖 `connAPI` 而非 `*nftables.Conn`，唯一目的是让切换逻辑
 - 切换成功后 `active = target`，`shadow = target.Other()`
 - 一个工作链的两个槽**不能同时有规则**（全量重装 + 切换后清理保证）
 
+### 6. 翻译器的四条硬约束（真机验证得出，改动前必读）
+
+| # | 约束 | 违反后果（实测） |
+|---|---|---|
+| 1 | **`Bitwise.Mask/Xor` 必须 `BigEndian`，不能 `NativeEndian`** | x86 上 0xFFFFFF00 被写成 00FFFFFF：规则语法合法、内核接受、**匹配不到任何流量**（静默失效）。这是本轮最危险的 bug |
+| 2 | dnat/snat 前必须有传输层协议匹配 | 内核报 `transport protocol mapping is only valid after transport protocol match` |
+| 3 | 协议匹配后必须**紧跟**一个传输层字段（dport/sport） | `tcp ct mark ...` 报 `syntax error, unexpected ct`。所以 NAT 规则强制要求 `DstPort != 0` 作为上下文锚点 |
+| 4 | NAT 是**终结语句**，counter 必须在它之前 | 内核报 `Statement after terminal statement has no effect` |
+
+另有两条互斥保护：① 同一条规则不能既设 ct mark 又做 NAT（都用 Register 1）；
+② 多网段地址匹配必须由调用方展开（不能静默取第一个）。
+
+**这四条都以真机 `nft` 命令 + `nft -j` 输出为基准核对过**，不是从文档推断的。
+
 ---
 
 ## 未完成 / 降级
 
 | 项 | 状态 | 影响什么 |
 |---|---|---|
-| **compile.Plan → nftables 表达式的翻译器** | **未实现** | 这是 S1 与 S0 之间的最后一段胶水：`compile.Rule` 的 `Dst/MatchSrc/CtMarkEq/DnatTo/SetCtMark/Verdict/MSSValue` 等字段要翻译成 `[]expr.Any`。**S2 之前必须补上**，否则 `CommitShadow` 只能装 counter 规则 |
-| MSS 的 netlink 表达式 | 只有规格（`MSSValue`/`MSSFamily`） | 需 `expr.Exthdr` + `expr.Payload{Operation: PayloadWrite, CsumType: CsumTypeInet, CsumOffset: 16, CsumFlags: 0x1}`。**必须先用 `nft add rule ... tcp option maxseg size set 1360` 命令行逐字段对照** |
-| ICMP 豁免的匹配表达式 | 只有规格（`IcmpExempt` 常量在 compile 层） | 需 `expr.Meta{Key: MetaKeyL4PROTO}` + `expr.Payload`（type 字段）+ `expr.Cmp` |
-| 真机建表验证（S1 DoD 第 1 条） | **未执行** | 需要在 `192.168.10.170` 上建 `table inet haweb_v2`（**不能叫 haweb**，那个在跑业务）并 `nft list table` 核对链布局。本轮只做了内存验证 |
+| 多网段地址匹配的展开 | **未实现** | `translateAddrMatch` 只接受 1 个前缀（多网段必须由调用方展开成多条规则）。`TranslatePlan` 目前还没做这个展开——**配了多网段白名单时会报错**。S2 前必须补 |
+| ICMP 豁免的 netlink 表达式 | **只有规格** | `compile.IcmpExempt` 有常量，`translateRule` 里 `Proto == ""` 时不会生成 ICMP 匹配。真机验证用的是 `nft` CLI，不是翻译器产物。**S2 前必须补** |
 | 计数器读取（工作链的 counter 供 UI 展示） | 未实现 | S4/S5 的指标层 |
+| 真机上的并发切换 | 未做 | 用 `memConn` 覆盖（10 goroutine × 20 轮，`-race` 通过） |
 
 ---
 
