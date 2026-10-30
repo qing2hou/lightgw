@@ -74,3 +74,7 @@ make dev        # vite(5173 代理 /api) + go run .
 - 名单组有三类（`whitelist`/`blacklist`/`ip`），兼容判据统一走 `model.AclGroupMatchesMode(组类型, 使用模式)`：同类型组或中性 `ip` 组可用。规则有**两处**引用位——源名单 `AclGroupID`、SNAT 目标限制 `DstAclGroupID`；新增引用位时必须同步：校验、引擎展开（`buildRuleConfig`/`buildSnatSpec`）、联动 `ApplyAclGroup`、删除保护 `ReferencedByAclGroup`、导出内联，漏一处就是"改了组不生效"或"删组把规则打挂"
 - 列表类控件未选成员时提交 `"[]"` 而非空串：后端"未配置"判据要用 `isEmptyJSONList`（空串/`[]`/`null` 等价），否则界面必填项都填好仍被 400 拒
 - 统计口径：`/api/stats` 的今日/累计只含落库数据，活跃会话字节单独 `live_*` 字段，不要叠加（会双重计数）；`/metrics` 的规则级字节数是进程内实时累计，与落库口径不同，不要混用
+- **绝不在生产机上用测试配置启动完整服务**。曾用空数据目录在生产机跑新版二进制验证 `/api/status`，启动对账把生产的 SNAT/DNAT 规则全判成「孤儿」拆掉，`inet haweb` 三个链清空、转发中断约 2 分钟（见 `docs/incident-2026-10-30-orphan-reconcile.md`）。真机验证要么用 `netns` 隔离，要么只跑单功能探针，绝不跑完整服务
+- **对账/清理类判据必须能证明归属，不能靠「我以为」**。旧判据「内核里有标记 + 我的库里没有 = 孤儿」在「第二个进程用不同数据目录碰同一张表」时全线崩溃。现方案：数据目录下 `instance_id`（16 位 hex）参与 nft 规则 comment（`haweb-nft:<instance>:<kind>:<id>`），对账只认本实例；旧格式标记一律视为非本实例、不拆。这与 DEFECT-10（`ip rule` 扫 201..300 删掉内核 32766 导致整机失联）是同一错误模式。**删除类操作按「最坏输入」评估爆炸半径**
+- **孤儿清理默认只告警不删**（`tuning.nft_reconcile_purge` 默认 false）。孤儿残留只多几条内核规则；误拆会清空转发面。代价不对称，默认选安全那边
+- **`fwd` 是 nft 保留字**：`chain fwd { }` 与 `add rule inet haweb fwd ...` 都会被解析成关键字（加引号也不行），所以 `nft -f` 无法用于本项目的表（链名里有 `fwd`）。这是全部走 native netlink 的实际原因。手工恢复规则时改用 `systemctl restart haproxyweb` 让服务自建
