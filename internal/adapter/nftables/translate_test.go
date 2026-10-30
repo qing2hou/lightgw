@@ -447,3 +447,179 @@ func TestTranslateUnknownProto(t *testing.T) {
 		t.Fatal("未知协议应报错")
 	}
 }
+
+// TestTranslateIcmpRule ICMP 豁免必须：① 先匹配 L4 协议 ② 用传输头基址读 type
+// ③ 多类型用单条 Cmp + 多字节 Data。
+//
+// 真机 `nft -j` 输出：
+//
+//	{"payload": {"protocol": "icmp", "field": "type"}}  → Base=TransportHeader, Offset=0
+//	{"right": {"set": ["destination-unreachable", "time-exceeded"]}}
+func TestTranslateIcmpRule(t *testing.T) {
+	out, err := translateIcmpRule(compile.Rule{
+		Comment:    "haweb:deny:icmp:ipv4",
+		IcmpFamily: "ipv4",
+		IcmpTypes:  []uint8{3, 11},
+		Verdict:    "accept",
+	})
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	// ① 协议匹配（Meta l4proto == 1）
+	meta, ok := out[0].(*expr.Meta)
+	if !ok || meta.Key != expr.MetaKeyL4PROTO {
+		t.Fatalf("首条应为 Meta{l4proto}，实际 %+v", out[0])
+	}
+	cmp, ok := out[1].(*expr.Cmp)
+	if !ok || len(cmp.Data) != 1 || cmp.Data[0] != 1 { // IPPROTO_ICMP = 1
+		t.Fatalf("第二条应为 Cmp{proto==1}，实际 %+v", out[1])
+	}
+	// ② type 用传输头基址 + 偏移 0
+	pl, ok := out[2].(*expr.Payload)
+	if !ok {
+		t.Fatalf("第三条应为 Payload，实际 %+v", out[2])
+	}
+	if pl.Base != expr.PayloadBaseTransportHeader {
+		t.Fatalf("★ ICMP type 必须用 TransportHeader 基址（不是 NetworkHeader），实际 %v", pl.Base)
+	}
+	if pl.Offset != 0 || pl.Len != 1 {
+		t.Fatalf("type 偏移应为 0、长度 1，实际 offset=%d len=%d", pl.Offset, pl.Len)
+	}
+	// ③ 多类型集合比较
+	cmp2, ok := out[3].(*expr.Cmp)
+	if !ok {
+		t.Fatalf("第四条应为 Cmp，实际 %+v", out[3])
+	}
+	if len(cmp2.Data) != 2 || cmp2.Data[0] != 3 || cmp2.Data[1] != 11 {
+		t.Fatalf("类型集合应为 [3, 11]，实际 %v", cmp2.Data)
+	}
+	// ④ verdict
+	if _, ok := out[4].(*expr.Verdict); !ok {
+		t.Fatalf("最后一条应为 Verdict，实际 %+v", out[4])
+	}
+}
+
+// TestTranslateIcmpV6 ICMPv6 用协议号 58。
+func TestTranslateIcmpV6(t *testing.T) {
+	out, err := translateIcmpRule(compile.Rule{
+		Comment:    "haweb:deny:icmp:ipv6",
+		IcmpFamily: "ipv6",
+		IcmpTypes:  []uint8{1, 2, 3},
+		Verdict:    "accept",
+	})
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	cmp := out[1].(*expr.Cmp)
+	if cmp.Data[0] != 58 { // IPPROTO_ICMPV6 = 58
+		t.Fatalf("ICMPv6 协议号应为 58，实际 %d", cmp.Data[0])
+	}
+	cmp2 := out[3].(*expr.Cmp)
+	if len(cmp2.Data) != 3 {
+		t.Fatalf("应有 3 个类型，实际 %d", len(cmp2.Data))
+	}
+}
+
+// TestTranslateIcmpSingleType 单类型也要正确。
+func TestTranslateIcmpSingleType(t *testing.T) {
+	out, err := translateIcmpRule(compile.Rule{
+		Comment: "t", IcmpFamily: "ipv4", IcmpTypes: []uint8{3}, Verdict: "accept",
+	})
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	cmp := out[3].(*expr.Cmp)
+	if len(cmp.Data) != 1 || cmp.Data[0] != 3 {
+		t.Fatalf("单类型应为 [3]，实际 %v", cmp.Data)
+	}
+}
+
+// TestTranslateIcmpErrors ICMP 规则的错误分支。
+func TestTranslateIcmpErrors(t *testing.T) {
+	if _, err := translateIcmpRule(compile.Rule{Comment: "t", IcmpFamily: "ipv4"}); err == nil {
+		t.Fatal("空类型集合应报错")
+	}
+	if _, err := translateIcmpRule(compile.Rule{
+		Comment: "t", IcmpFamily: "ipx", IcmpTypes: []uint8{1},
+	}); err == nil {
+		t.Fatal("非法地址族应报错")
+	}
+	if _, err := translateIcmpRule(compile.Rule{
+		Comment: "t", IcmpFamily: "ipv4", IcmpTypes: []uint8{3}, Verdict: "reject",
+	}); err == nil {
+		t.Fatal("未知 verdict 应报错")
+	}
+}
+
+// TestTranslatePlanIcmpGoesToFwd ICMP 豁免必须落在 fwd 工作链，且在 drop 之前。
+func TestTranslatePlanIcmpGoesToFwd(t *testing.T) {
+	c := &compile.Compiler{Caps: compile.Caps{TcNetlink: true}}
+	p, err := c.Compile(compile.State{
+		Version:   1,
+		DenyScope: model.ScopeDnatTarget,
+		Rules: []model.Rule{{
+			ID:       1,
+			Name:     "t",
+			Proto:    model.ProtoTCP,
+			ListenAt: netip.MustParseAddrPort("192.168.10.170:1022"),
+			Backend:  netip.MustParseAddrPort("192.168.10.152:22"),
+			Enabled:  true,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	set, _, err := TranslatePlan(p)
+	if err != nil {
+		t.Fatalf("翻译失败: %v", err)
+	}
+	fwd := set[WorkFwd]
+	if len(fwd) == 0 {
+		t.Fatal("fwd 链应有规则")
+	}
+	// 必须含 ICMP 的 proto 匹配（Meta l4proto）
+	var icmpCnt, dropCnt int
+	for _, exprs := range fwd {
+		for _, e := range exprs {
+			if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyL4PROTO {
+				icmpCnt++
+			}
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+				dropCnt++
+			}
+		}
+	}
+	if icmpCnt < 2 {
+		t.Fatalf("应有 IPv4 + IPv6 两条 ICMP 豁免（各含 l4proto 匹配），实际 %d", icmpCnt)
+	}
+	if dropCnt != 1 {
+		t.Fatalf("应有恰好 1 条 drop（默认拒绝行），实际 %d", dropCnt)
+	}
+	// ICMP 豁免必须在 drop 之前
+	firstDrop := -1
+	icmpBefore := 0
+	for i, exprs := range fwd {
+		isDrop := false
+		for _, e := range exprs {
+			if v, ok := e.(*expr.Verdict); ok && v.Kind == expr.VerdictDrop {
+				isDrop = true
+			}
+		}
+		if isDrop && firstDrop < 0 {
+			firstDrop = i
+		}
+		if !isDrop {
+			for _, e := range exprs {
+				if m, ok := e.(*expr.Meta); ok && m.Key == expr.MetaKeyL4PROTO {
+					if firstDrop < 0 {
+						icmpBefore++
+					}
+				}
+			}
+		}
+	}
+	if icmpBefore < 2 {
+		t.Fatalf("ICMP 豁免必须排在 drop 之前（否则差错报文先被 drop），"+
+			"实际 drop 前只有 %d 条", icmpBefore)
+	}
+}

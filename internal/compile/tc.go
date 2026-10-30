@@ -254,7 +254,8 @@ func CompileTc(spec TcSpec) (TcPlan, error) {
 				Pref:     UploadPref(i),
 				MatchSrc: true,
 				Match:    prefixOf(e.Source),
-				FlowID:   "", // 重定向用 action mirred，无 flowid；由 adapter 识别
+				FlowID:   "", // 重定向用 action mirred，无 flowid
+				MirredTo: spec.IfbDevice,
 			})
 		}
 		buildSide(spec.IfbDevice, true)

@@ -230,11 +230,13 @@ func CompileDefaultDeny(scope model.DenyScope, backendTargets []netip.Addr) ([]R
 	// 后面的豁免规则永远看不到它们。
 	for _, ex := range IcmpExempt {
 		out = append(out, Rule{
-			Chain:   ChainDnat,
-			Comment: fmt.Sprintf("%sicmp:%s", denyCommentPrefix, ex.Family),
-			Proto:   "", // ICMP 不是 tcp/udp，由 adapter 按 family 生成匹配
-			Counter: false,
-			Verdict: "accept",
+			Chain:      ChainDnat,
+			WorkChain:  "fwd",
+			Comment:    fmt.Sprintf("%sicmp:%s", denyCommentPrefix, ex.Family),
+			Proto:      "", // ICMP 不是 tcp/udp
+			IcmpFamily: ex.Family,
+			IcmpTypes:  ex.Types,
+			Verdict:    "accept",
 		})
 	}
 

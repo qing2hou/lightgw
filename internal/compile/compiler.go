@@ -128,10 +128,24 @@ func (c *Compiler) Compile(s State) (*Plan, error) {
 	p.Nft.Deny = deny
 	p.Nft.BackendTargets = targets
 
-	// 8. 链布局
+	// 8. 展开多网段地址匹配
+	//
+	// 必须在自检之前：展开会改变 comment（追加 #N），而 Plan.Validate
+	// 校验 comment 唯一性。放在这里而不是 translate 层，是为了让 Plan
+	// 本身就是「可直接逐条下发」的形态——adapter 不需要猜规则怎么拆。
+	for _, seg := range []*[]Rule{&p.Nft.Dnat, &p.Nft.Snat, &p.Nft.Policy,
+		&p.Nft.Forward, &p.Nft.Deny, &p.Nft.Mss} {
+		expanded, err := ExpandAddrMatches(*seg)
+		if err != nil {
+			return nil, err
+		}
+		*seg = expanded
+	}
+
+	// 9. 链布局
 	p.Nft.Chains = DefaultChains()
 
-	// 9. tc
+	// 10. tc
 	if !c.Caps.TcNetlink {
 		p.Warnings = append(p.Warnings, "tc 不可用，所有限速不生效")
 	} else {
@@ -143,7 +157,7 @@ func (c *Compiler) Compile(s State) (*Plan, error) {
 		}
 	}
 
-	// 10. 自检：计划本身必须自洽
+	// 11. 自检：计划本身必须自洽
 	if err := p.Validate(); err != nil {
 		return nil, fmt.Errorf("编译产物自检失败: %w", err)
 	}

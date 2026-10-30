@@ -192,6 +192,12 @@ func translateMSS(r compile.Rule) ([]expr.Any, error) {
 //	匹配条件（proto / port / addr / ct state / ct mark / meta mark）
 //	→ 动作（counter / ct mark set / meta mark set / dnat / snat / verdict）
 func translateRule(r compile.Rule) ([]expr.Any, error) {
+	// ICMP 豁免走独立路径：它需要「协议 + type ∈ 集合」两段匹配，
+	// 与 tcp/udp 的 dport 匹配结构完全不同。
+	if r.IcmpFamily != "" {
+		return translateIcmpRule(r)
+	}
+
 	var out []expr.Any
 
 	// ① 协议
@@ -584,4 +590,82 @@ func snatExprs(to netip.Addr) []expr.Any {
 			Type: expr.NATTypeSourceNAT, Family: addrFamily(to), RegAddrMin: 1,
 		},
 	}
+}
+
+// translateIcmpRule 翻译 ICMP/ICMPv6 类型匹配规则。
+//
+// 真机核对过的写法（nft CLI 与 nft -j 输出）：
+//
+//	icmp type { destination-unreachable, time-exceeded } accept
+//	icmpv6 type { destination-unreachable, packet-too-big, time-exceeded } accept
+//
+// 例如 `icmp type { 3, 11 }` 的表达式是：
+//
+//	Payload{Base: NetworkHeader, Offset: 9, Len: 1}   ← icmp.type（IP 头之后第 1 字节）
+//	Cmp{Op: Eq, Data: [3, 11]}                        ← 集合比较（多字节 data = 多值 OR）
+//	Verdict{Accept}
+//
+// 关键点：
+//   - IPv4 的 icmp type 在 IP 头（20 字节）+ 0 = 偏移 20；但 nft 的
+//     PayloadBaseNetworkHeader 会自动跳过 IP 头，所以 Offset 是 0。
+//   - 必须同时匹配 l4proto（icmp=1 / icmpv6=58），否则会把 tcp/udp 包
+//     的第 1 字节当成 icmp type 比较。
+//   - 多类型的集合比较用单条 Cmp + 多字节 Data（nft 的 set 语义）。
+func translateIcmpRule(r compile.Rule) ([]expr.Any, error) {
+	if len(r.IcmpTypes) == 0 {
+		return nil, fmt.Errorf("翻译 ICMP 规则 %s 失败: 类型集合为空", r.Comment)
+	}
+	var proto byte
+	switch r.IcmpFamily {
+	case "ipv4":
+		proto = unix.IPPROTO_ICMP
+	case "ipv6":
+		proto = unix.IPPROTO_ICMPV6
+	default:
+		return nil, fmt.Errorf("翻译 ICMP 规则 %s 失败: 地址族 %q 无效（应为 ipv4/ipv6）",
+			r.Comment, r.IcmpFamily)
+	}
+
+	out := []expr.Any{
+		// ① 先匹配 L4 协议（防止把 tcp/udp 的首字节误判为 icmp type）
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{proto}},
+		// ② 匹配 icmp type
+		//
+		// 真机 `nft -j` 输出为 {"payload": {"protocol": "icmp", "field": "type"}}，
+		// 即 **传输头基址 + 偏移 0**（不是网络头）。用 NetworkHeader 会把
+		// IP 头的第 1 字节（version/IHL）当 type 比较，永远匹配不到。
+		&expr.Payload{
+			DestRegister: 1,
+			Base:         expr.PayloadBaseTransportHeader,
+			Offset:       0,
+			Len:          1,
+		},
+	}
+	if len(r.IcmpTypes) == 1 {
+		out = append(out, &expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     []byte{r.IcmpTypes[0]},
+		})
+	} else {
+		// 多类型：单条 Cmp + 多字节 Data（nft 的集合比较语义）
+		out = append(out, &expr.Cmp{
+			Op:       expr.CmpOpEq,
+			Register: 1,
+			Data:     append([]byte(nil), r.IcmpTypes...),
+		})
+	}
+	// ③ verdict
+	if r.Verdict != "" {
+		switch r.Verdict {
+		case "accept":
+			out = append(out, &expr.Verdict{Kind: expr.VerdictAccept})
+		case "drop":
+			out = append(out, &expr.Verdict{Kind: expr.VerdictDrop})
+		default:
+			return nil, fmt.Errorf("翻译 ICMP 规则 %s 失败: 未知 verdict %q", r.Comment, r.Verdict)
+		}
+	}
+	return out, nil
 }

@@ -163,6 +163,14 @@ type Rule struct {
 	// 留空表示由 adapter 按默认规则推断（向后兼容）。
 	WorkChain string
 
+	// IcmpFamily 非空（"ipv4"/"ipv6"）时，该规则匹配 ICMP 类型集合 IcmpTypes。
+	//
+	// 用于默认拒绝的 ICMP 差错报文豁免（技术方案 §3.3(c)）：
+	// 路径 MTU 发现依赖 ICMP destination-unreachable / time-exceeded，
+	// 若默认拒绝把它们也 drop，会出现「大包黑洞」——ping 小包通、大包不通。
+	IcmpFamily string
+	IcmpTypes  []uint8
+
 	// MSSValue 非零时该规则是 MSS clamping：`tcp flags syn tcp option maxseg
 	// size set <MSSValue>`。MSSFamily 决定挂 v4 还是 v6 匹配（"ipv4"/"ipv6"）。
 	//
@@ -239,8 +247,12 @@ type TcFilterSpec struct {
 	MatchSrc bool
 	// Match 是展开后的地址/网段（v4 归一化由 adapter 负责）。
 	Match netip.Prefix
-	// FlowID 是目标 class，如 "1:208"。
+	// FlowID 是目标 class，如 "1:208"。为空表示该 filter 用 action mirred
+	// 重定向（上传方向的 ingress 分类），而非分类到某个 class。
 	FlowID string
+	// MirredTo 是 mirred redirect 的目标设备名（如 ifb-hw1）。
+	// 仅当该 filter 是「上传方向 ingress 重定向」时非空。
+	MirredTo string
 }
 
 // Dir 返回该过滤器方向的字符串表示（"src" / "dst"），供日志与断言。
@@ -332,7 +344,18 @@ func (p TcPlan) Validate() error {
 		}
 	}
 	// 硬约束 3：filter 的 flowid 必须存在且是叶子
+	//
+	// 例外：FlowID 为空表示该 filter 用 action mirred 重定向（上传方向
+	// ingress 分类），没有目标 class，不需要查表。
 	for _, f := range p.Filters {
+		if f.FlowID == "" {
+			// mirred 重定向必须指定目标设备，否则这个 filter 无效
+			if f.MirredTo == "" {
+				return fmt.Errorf("校验 tc 计划失败: %s 上有一��无 flowid 的 filter"+
+					"（应为 mirred 重定向）但没有指定目标设备", f.Device)
+			}
+			continue
+		}
 		var minor uint32
 		if _, err := fmt.Sscanf(f.FlowID, "1:%d", &minor); err != nil {
 			return fmt.Errorf("校验 tc 计划失败: filter 的 flowid %q 格式无效", f.FlowID)
