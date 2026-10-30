@@ -24,24 +24,22 @@ const mssCommentPrefix = "haweb:mss:"
 //
 //	tcp flags syn tcp option maxseg size set <mss>
 //
-// 三个必须同时满足的条件，缺一不可：
+// 两个必须同时满足的条件：
 //
 //  1. **只改 SYN（不含 ACK）**。SYN-ACK 也会带 MSS 选项，但它的 MSS 是服务端
 //     宣告自己的接收能力，改它对路径 MTU 发现没有帮助，反而可能误导对端。
-//     flags & 0x02 == 0x02 且 flags & 0x10 == 0（SYN=1, ACK=0）。
-//  2. **MSS 选项必须存在**。用 `tcp option maxseg size set N` 时内核只在选项
-//     存在时改写（nft 的 exthdr 表达式语义）；若选项不存在，表达式返回真但
-//     写入位置无意义。命令行实测确认过这一点。
-//  3. **必须重算 TCP 校验和**。Payload write 的 CsumType/CsumOffset 写错会导致
-//     SYN 被对端静默丢弃——比不做 clamping 更糟。
+//  2. **MSS 选项必须存在**。内核的 `tcp option maxseg size set` 只在选项存在时
+//     改写；选项不存在时该表达不做任何事（不会写到错误偏移）。
 //
-// ⚠️ 第 3 点在 nft 的 netlink 表达式层对应：
+// **校验和由内核自动重算**——这一点在真机上核对过 `nft -j` 输出：
 //
-//	Payload{Base: TransportHeader, Offset: 22, Len: 2,
-//	        CsumType: CsumTypeInet, CsumOffset: 16, CsumFlags: 0x1}
+//	{"mangle": {"key": {"tcp option": {"name": "maxseg", "field": "size"}}, "value": 1360}}
 //
-// 其中 Offset 22 = TCP 头里的 MSS 选项值偏移（标准 20 字节头 + 选项 kind/len 2 字节），
-// CsumOffset 16 = TCP 校验和字段偏移。这两个常量由内核 ABI 决定，不能凭记忆改。
+// 内核只需要一条 `mangle` 表达，不需要手工构造
+// `Payload{CsumType: CsumTypeInet, CsumOffset: 16, CsumFlags: 0x1}`。
+// （早期文档写「必须手工重算校验和」是误解了 nft 的命令行语法与 netlink
+// 表达式的对应关系：命令行里的 `set` 会由 nft 工具翻译成内核的 mangle，
+// 而 mangle 天然带校验和更新语义。）
 //
 // 返回空切片表示不生成任何规则（mss=0 即关闭）。
 func CompileMSSClamp(v4, v6 uint16) ([]Rule, error) {

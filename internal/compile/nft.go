@@ -40,7 +40,8 @@ func CompileDnat(rules []model.Rule) ([]Rule, error) {
 
 		// ① pre_mark：判定 + 打标
 		pre := Rule{
-			Chain:          ChainDnat, // adapter 按 comment 前缀路由到 pre_mark 链
+			Chain:          ChainDnat,
+			WorkChain:      "pre", // 判定阶段：打 ct mark + FWD_OK
 			Comment:        fmt.Sprintf("%s%d:mark", dnatCommentPrefix, r.ID),
 			Proto:          string(r.Proto),
 			DstPort:        r.ListenAt.Port(),
@@ -63,9 +64,14 @@ func CompileDnat(rules []model.Rule) ([]Rule, error) {
 		// ② dnat：按 ct mark 改写（不再判断源——判定已在 ① 完成）
 		ruleMark := mark & CtRuleMask
 		out = append(out, Rule{
-			Chain:    ChainDnat,
-			Comment:  fmt.Sprintf("%s%d:apply", dnatCommentPrefix, r.ID),
-			Proto:    string(r.Proto),
+			Chain:     ChainDnat,
+			WorkChain: "dnat", // 改写阶段：按 ct mark 做 DNAT
+			Comment:   fmt.Sprintf("%s%d:apply", dnatCommentPrefix, r.ID),
+			Proto:     string(r.Proto),
+			// VIP 侧端口作为「传输层上下文锚点」：内核要求协议匹配后紧跟
+			// 一个传输层字段，否则 `tcp ct mark ...` 报 syntax error（实测）。
+			// 注意这里匹配的是 **VIP 端口**（DNAT 之前），不是后端端口。
+			DstPort:  r.ListenAt.Port(),
 			CtMarkEq: &ruleMark,
 			DnatTo:   r.Backend,
 			Counter:  true,
@@ -118,9 +124,14 @@ func CompileSnat(specs []SnatSpec) ([]Rule, error) {
 			continue
 		}
 		out = append(out, Rule{
-			Chain:    ChainSnat,
-			Comment:  fmt.Sprintf("%s%d", snatCommentPrefix, r.ID),
-			Proto:    string(r.Proto),
+			Chain:     ChainSnat,
+			WorkChain: "snat",
+			Comment:   fmt.Sprintf("%s%d", snatCommentPrefix, r.ID),
+			Proto:     string(r.Proto),
+			// DstPort 在这里是「传输层上下文锚点」，不是匹配条件：
+			// 内核要求协议匹配后紧跟一个传输层字段，否则 `tcp ct mark ...`
+			// 会报 syntax error（实测）。用规则自身的监听端口即可。
+			DstPort:  r.ListenAt.Port(),
 			CtMarkEq: &masked,
 			SnatTo:   snatTo,
 			Counter:  true,
@@ -307,6 +318,7 @@ func CompileEstablished() []Rule {
 	fwdOK := MarkFwdOK
 	return []Rule{{
 		Chain:       ChainDnat,
+		WorkChain:   "pre", // 显式：回程放行属于 pre_mark 阶段
 		Comment:     establishedComment,
 		SetMetaMark: &fwdOK,
 		// 由 adapter 翻译成 ct state established,related

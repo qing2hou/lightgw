@@ -155,6 +155,14 @@ type Rule struct {
 	// JumpTo 非空时生成 jump（与 Verdict 互斥）。
 	JumpTo string
 
+	// WorkChain 显式指定该规则应落到哪个工作链（pre/dnat/fwd/snat）。
+	//
+	// 为什么不用 Chain 字段推断：ChainDnat 这个常量同时被「DNAT 判定行」
+	// 与「回程放行」使用，靠 comment 后缀区分太脆弱——漏一个后缀就落到
+	// 错误的链，而错误的链意味着规则永不生效（静默）。
+	// 留空表示由 adapter 按默认规则推断（向后兼容）。
+	WorkChain string
+
 	// MSSValue 非零时该规则是 MSS clamping：`tcp flags syn tcp option maxseg
 	// size set <MSSValue>`。MSSFamily 决定挂 v4 还是 v6 匹配（"ipv4"/"ipv6"）。
 	//
