@@ -31,9 +31,9 @@ func TestSnatSameIfaceAllowed(t *testing.T) {
 	in = &ruleInput{
 		Name: "snat-same-gw", Protocol: model.ProtocolSNAT,
 		ListenAddr: lo, TargetAddr: lo,
-		EgressGw:  "10.255.255.1",
-		AclMode:   model.AclModeWhitelist, AllowList: `["192.168.10.0/24"]`,
-		SnatMode:  "fixed",
+		EgressGw: "10.255.255.1",
+		AclMode:  model.AclModeWhitelist, AllowList: `["192.168.10.0/24"]`,
+		SnatMode: "fixed",
 	}
 	if err := in.validate(h); err == nil {
 		t.Fatal("网关不在网卡网段内应被拒绝（同卡也一样）")
