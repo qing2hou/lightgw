@@ -813,7 +813,7 @@ func TestUploadDownloadPrefDisjoint(t *testing.T)
 1. **上传 filter 必须 `match ip src`，下载必须 `match ip dst`**，两个方向严禁互相照抄。现网事故：写成 `dst` → 超速 14.8 倍。
 2. **`pref` 按 `srcFilterPref` / `uploadFilterPref` 派生**，不许写死常量。
 3. **清理历史子类时跳过 `1:100` 与 `1:30`**，在 `applyHtb` 入口加显式白名单判断，不要靠循环边界。曾因循环 `1:2..1:249` 把刚建好的限速类删掉，`default` 指向不存在的 class，**8MB/s 配置跑出 24MB/s**。新代码必须保留等价测试。
-4. **`default` 必须是 `100`**，不许 `0xffff`（无默认）、不许 `0`（直通）。
+4. **`default` 必须指向「叶子兜底类」（有 qdisc、无子类），不许指向挂了子类的内层类**；也不许 `0xffff`（无默认）、不许 `0`（直通）。实测反证：`default` → 内层 `1:100` 时未命中 filter 的包 100% 走 `direct queue` 绕过整棵树（2828.79 MB/s vs 配置 8）。
 5. **`netlink.HtbClass` 的 `Rate`/`Ceil` 单位是 bytes/sec**，`tc` CLI 的 `kbit`/`mbit` 是 bit/sec。换算错 8 倍是这块的经典 bug。`Buffer`/`Cbuffer` 单位是 bytes。
 6. **`burst` 必须随速率缩放**，不许固定 `32k`/`16k`。固定值在千兆下只有 10ms 额度的 1/40，表现为「限 1Gbps 实测只跑 200Mbps」。
 
