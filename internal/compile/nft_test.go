@@ -722,3 +722,145 @@ func TestCompilerSnatDisabledEgress(t *testing.T) {
 		t.Fatalf("出口未启用时不应生成 SNAT，实际 %d", len(p.Nft.Snat))
 	}
 }
+
+// TestDefaultDenyThreeScopesEachHaveTest 默认拒绝三档各一条断言（技术方案 §4.4 要求）。
+func TestDefaultDenyThreeScopesEachHaveTest(t *testing.T) {
+	targets := []netip.Addr{netip.MustParseAddr("192.168.10.152")}
+
+	// ① off：完全不装
+	off, err := CompileDefaultDeny(model.ScopeOff, targets)
+	if err != nil {
+		t.Fatalf("off 档编译失败: %v", err)
+	}
+	if len(off) != 0 {
+		t.Fatalf("off 档不应有规则，实际 %d", len(off))
+	}
+
+	// ② dnat_target：只拒「目标 ∈ 后端集」的未打标流量（默认档）
+	dt, err := CompileDefaultDeny(model.ScopeDnatTarget, targets)
+	if err != nil {
+		t.Fatalf("dnat_target 档编译失败: %v", err)
+	}
+	var dropDT *Rule
+	for i := range dt {
+		if dt[i].Verdict == "drop" {
+			dropDT = &dt[i]
+		}
+	}
+	if dropDT == nil {
+		t.Fatal("dnat_target 档必须有 drop 行")
+	}
+	// ★ 核心断言（任务卡 §4.4 明确要求）：目标不是后端集的流量**不被拒**
+	if dropDT.Dst.Empty() {
+		t.Fatal("dnat_target 档的 drop 行必须限定目的地址为后端集，否则会误杀同机 Docker/K8s")
+	}
+	if !dropDT.Dst.Prefixes[0].Contains(netip.MustParseAddr("192.168.10.152")) {
+		t.Fatal("drop 行的目的集合应包含后端地址")
+	}
+	if dropDT.Dst.Prefixes[0].Contains(netip.MustParseAddr("172.17.0.5")) {
+		t.Fatal("★ 目标不是后端集的流量（如 Docker 172.17.0.5）不应被默认拒绝覆盖")
+	}
+	// 只拒 ct state new（已建连接由 ct mark 判定）
+	if !dropDT.CtStateNew {
+		t.Fatal("默认拒绝应只作用于 ct state new")
+	}
+	// 只拒「未打 FWD_OK」的
+	if dropDT.MetaMarkNotSet == nil || *dropDT.MetaMarkNotSet != MarkFwdOK {
+		t.Fatal("默认拒绝必须只匹配未打 FWD_OK 标记的流量")
+	}
+
+	// ③ interface：不限定目的（危险档）
+	iface, err := CompileDefaultDeny(model.ScopeInterface, targets)
+	if err != nil {
+		t.Fatalf("interface 档编译失败: %v", err)
+	}
+	var dropIf *Rule
+	for i := range iface {
+		if iface[i].Verdict == "drop" {
+			dropIf = &iface[i]
+		}
+	}
+	if dropIf == nil {
+		t.Fatal("interface 档必须有 drop 行")
+	}
+	if !dropIf.Dst.Empty() {
+		t.Fatal("interface 档不应限定目的地址（拒绝整个入口，这正是它危险的原因 D-13）")
+	}
+}
+
+// TestDefaultDenyScopeComesFromConfig 零值作用域必须落到 dnat_target（最安全档）。
+func TestDefaultDenyScopeComesFromConfig(t *testing.T) {
+	targets := []netip.Addr{netip.MustParseAddr("192.168.10.152")}
+	zero, err := CompileDefaultDeny("", targets)
+	if err != nil {
+		t.Fatalf("零值作用域应回落到 dnat_target，实际报错: %v", err)
+	}
+	explicit, err := CompileDefaultDeny(model.ScopeDnatTarget, targets)
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	if len(zero) != len(explicit) {
+		t.Fatalf("零值（%d 条）应与显式 dnat_target（%d 条）等价", len(zero), len(explicit))
+	}
+}
+
+// TestCompileForwardMultipleRulesDistinctComments 多规则必须有不同 comment。
+func TestCompileForwardMultipleRulesDistinctComments(t *testing.T) {
+	out, err := CompileForward([]model.Rule{
+		testRule(1, "192.168.10.170:1022", "192.168.10.152:22", true),
+		testRule(2, "192.168.10.170:1023", "192.168.10.153:22", true),
+		testRule(3, "192.168.10.170:1024", "192.168.10.154:22", true),
+	})
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	if len(out) != 3 {
+		t.Fatalf("应 3 条，实际 %d", len(out))
+	}
+	seen := map[string]bool{}
+	for _, r := range out {
+		if seen[r.Comment] {
+			t.Fatalf("comment 重复: %q", r.Comment)
+		}
+		seen[r.Comment] = true
+	}
+}
+
+// TestCompileForwardDstIsBackendNotVIP 白名单行必须匹配后端地址而非 VIP。
+//
+// 理由：forward 链看到的是 DNAT 之后的包，目的地址已是后端。
+// 若匹配 VIP，规则永不命中 → 全部被默认拒绝。
+func TestCompileForwardDstIsBackendNotVIP(t *testing.T) {
+	out, err := CompileForward([]model.Rule{
+		testRule(1, "192.168.10.170:1022", "192.168.10.152:22", true),
+	})
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	got := out[0].Dst.Prefixes[0].Addr().String()
+	if got != "192.168.10.152" {
+		t.Fatalf("白名单应匹配后端 192.168.10.152，实际 %s", got)
+	}
+	if got == "192.168.10.170" {
+		t.Fatal("★ 白名单不能匹配 VIP——forward 链看到的是 DNAT 后的后端地址")
+	}
+}
+
+// TestCompileDnatMarkDstIsVIP DNAT 判定行必须匹配 VIP（DNAT 之前）。
+func TestCompileDnatMarkDstIsVIP(t *testing.T) {
+	out, err := CompileDnat([]model.Rule{
+		testRule(1, "192.168.10.170:1022", "192.168.10.152:22", true),
+	})
+	if err != nil {
+		t.Fatalf("编译失败: %v", err)
+	}
+	for _, r := range out {
+		if !strings.HasSuffix(r.Comment, ":mark") {
+			continue
+		}
+		got := r.Dst.Prefixes[0].Addr().String()
+		if got != "192.168.10.170" {
+			t.Fatalf("DNAT 判定行应匹配 VIP 192.168.10.170，实际 %s", got)
+		}
+	}
+}

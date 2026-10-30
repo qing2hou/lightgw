@@ -88,7 +88,7 @@ func TestPickOrderIndependent(t *testing.T) {
 // 任务卡要求 ≤25%（留出哈希抖动余量）。
 func TestReshuffleRateOnGrow(t *testing.T) {
 	old4 := pool(4)
-	new5 := append(pool(5))
+	new5 := pool(5)
 	srcs := sources(100000)
 	rate := ReshuffleRate(old4, new5, srcs)
 	t.Logf("池 4→5 重排率 = %.4f（理论 1/5=0.2）", rate)
