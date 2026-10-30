@@ -172,7 +172,9 @@ func (c Caps) Critical() error {
 //
 // 顺序固定（nftables 之外按名称），保证 UI 每次渲染的行序一致。
 func (c Caps) Warnings() []string {
-	var out []string
+	// 初始化成空切片而不是 nil：JSON 序列化时空切片是 []，nil 是 null。
+	// 前端对 null 做 .length / .map 会直接抛错（AGENTS.md 的 JSON 坑）。
+	out := make([]string, 0, 5)
 	for _, item := range []struct {
 		name string
 		st   Status

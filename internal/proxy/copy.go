@@ -25,6 +25,15 @@ type Options struct {
 	GlobalUploadKBps       int64         // 整机上传带宽上限 KB/s，0 = 不限
 	GlobalDownloadKBps     int64         // 整机下载带宽上限 KB/s，0 = 不限
 	HealthWebhookURL       string        // 健康状态翻转通知地址，空 = 关闭
+	// NFTPurgeOrphans 控制启动对账是否**真的拆除**本实例的孤儿规则。
+	//
+	// 默认 false（只告警）。这是事故 2026-10-30 后的刻意选择：
+	//   - 孤儿残留：多几条内核规则，占用可忽略
+	//   - 误拆：转发面规则被清空，业务中断
+	// 两种错误的代价不对称，所以默认选「留着」。
+	//
+	// 需要真删时配 tuning.nft_reconcile_purge: true。
+	NFTPurgeOrphans bool
 }
 
 // errIdleTimeout TCP 空闲超时哨兵错误：空闲断开属正常关闭，流量日志不记为 error。

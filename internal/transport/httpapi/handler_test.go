@@ -84,13 +84,20 @@ func (f *fakeSessionSvc) KillByACLGroup(ctx context.Context, gid uint, pfx []net
 
 // setup 建一个挂了本包路由的测试引擎，并注入调用者身份。
 func setup(p PolicyService, s SessionService, prefixes func(context.Context, uint) ([]netip.Prefix, error)) *gin.Engine {
+	return setupWithStatus(p, s, prefixes, nil)
+}
+
+// setupWithStatus 是带状态服务的版本。
+func setupWithStatus(p PolicyService, s SessionService,
+	prefixes func(context.Context, uint) ([]netip.Prefix, error),
+	st StatusProvider) *gin.Engine {
 	r := gin.New()
 	// 模拟鉴权中间件：注入 username
 	r.Use(func(c *gin.Context) {
 		c.Set("username", "tester")
 		c.Next()
 	})
-	h := &Handler{Policy: p, Session: s, ACLGroupPrefixes: prefixes}
+	h := &Handler{Policy: p, Session: s, ACLGroupPrefixes: prefixes, Status: st}
 	h.Register(r)
 	return r
 }

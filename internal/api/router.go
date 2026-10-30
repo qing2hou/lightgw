@@ -15,6 +15,7 @@ import (
 	"haproxyweb/internal/auth"
 	"haproxyweb/internal/config"
 	"haproxyweb/internal/model"
+	"haproxyweb/internal/platform/caps"
 	"haproxyweb/internal/proxy"
 	"haproxyweb/internal/trafficlog"
 )
@@ -27,6 +28,9 @@ type Deps struct {
 	Mgr     *proxy.Manager
 	Cfg     *config.Config
 	Version string
+	// Caps 是启动时的能力快照（技术方案 §9.2：缺失必须在 UI 可见）。
+	// 为 nil 时 /status 与 /capabilities 返回 available=false 的占位。
+	Caps *caps.Caps
 }
 
 func NewRouter(d Deps, distFS fs.FS) (*gin.Engine, error) {
@@ -106,6 +110,9 @@ func NewRouter(d Deps, distFS fs.FS) (*gin.Engine, error) {
 		admin.GET("/rules/:id/health", h.ruleHealthHistory)
 
 		admin.GET("/stats", h.stats)
+		// 能力快照与运行状态（技术方案 §9.2 / D-12：详细信息必须鉴权）
+		admin.GET("/capabilities", h.capabilities)
+		admin.GET("/status", h.status)
 		admin.GET("/streams", h.streams)
 		admin.GET("/rules/:id/live", h.ruleLiveStats)
 		admin.GET("/traffic-logs", h.trafficLogs)

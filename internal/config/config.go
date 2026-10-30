@@ -40,7 +40,24 @@ type Config struct {
 		HealthLogRetentionDays int  `yaml:"health_log_retention_days"` // 健康检测记录保留天数，-1 = 跟随 log_retention_days
 		GlobalUploadKBps       int  `yaml:"global_upload_kbps"`        // 整机上传带宽上限 KB/s，0 = 不限
 		GlobalDownloadKBps     int  `yaml:"global_download_kbps"`      // 整机下载带宽上限 KB/s，0 = 不限
+		// NFTPurgeOrphans 控制启动对账是否真的拆除本实例的孤儿 nft 规则。
+		// 默认 false = 只告警。事故 2026-10-30：空库实例在生产机上把生产规则
+		// 全判成孤儿拆掉，转发中断约 2 分钟。孤儿残留代价远小于误拆。
+		NFTPurgeOrphans bool `yaml:"nft_reconcile_purge"`
 	} `yaml:"tuning"`
+
+	// Backup 定时备份（技术方案 §9.1）。
+	//
+	// 三项都零值时**不启用**备份（备份不是必选项）。
+	// LocalDir 必须在数据目录之外——放同一个盘等于没备份。
+	Backup struct {
+		// IntervalHours 是备份间隔（小时）。0 = 不启用定时备份。
+		IntervalHours int `yaml:"interval_hours"`
+		// Keep 是保留份数（按时间戳删最旧的）。0 = 不自动删。
+		Keep int `yaml:"keep"`
+		// LocalDir 是本地备份目录。空 = 不启用。
+		LocalDir string `yaml:"local_dir"`
+	} `yaml:"backup"`
 }
 
 func defaults() *Config {
@@ -65,6 +82,12 @@ func defaults() *Config {
 	c.Tuning.HealthLogRetentionDays = -1
 	c.Tuning.GlobalUploadKBps = 0
 	c.Tuning.GlobalDownloadKBps = 0
+	// 默认不拆孤儿（安全优先，见字段注释）
+	c.Tuning.NFTPurgeOrphans = false
+	// 备份默认关闭：需要运维显式配置 local_dir（且该目录应在另一个盘上）
+	c.Backup.IntervalHours = 0
+	c.Backup.Keep = 7
+	c.Backup.LocalDir = ""
 	return c
 }
 
@@ -197,6 +220,21 @@ func (c *Config) validate() error {
 	}
 	if u := c.Web.HealthWebhookURL; u != "" && !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return fmt.Errorf("web.health_webhook_url 必须以 http:// 或 https:// 开头")
+	}
+	// 备份配置校验（启动即失败，不静默回退）
+	if c.Backup.IntervalHours < 0 {
+		return fmt.Errorf("backup.interval_hours 不能为负数（0 表示不启用定时备份）")
+	}
+	if c.Backup.Keep < 0 {
+		return fmt.Errorf("backup.keep 不能为负数（0 表示不自动删除旧备份）")
+	}
+	// 间隔配了但目录没配 → 明确报错，避免「以为配了备份其实没跑」
+	if c.Backup.IntervalHours > 0 && c.Backup.LocalDir == "" {
+		return fmt.Errorf("backup.interval_hours 已配置但 backup.local_dir 为空：定时备份会静默不执行，请补上备份目录")
+	}
+	// 备份目录不能与数据目录相同：同一个盘坏了等于没有备份
+	if c.Backup.LocalDir != "" && c.Backup.LocalDir == c.Web.DataDir {
+		return fmt.Errorf("backup.local_dir 不能与 web.data_dir 相同（同一块盘损坏时备份与源数据会一起丢失）")
 	}
 	for _, p := range c.Web.TrustedProxies {
 		if !isValidIPOrCIDR(p) {

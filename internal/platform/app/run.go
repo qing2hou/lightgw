@@ -18,6 +18,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+
+	"haproxyweb/internal/adapter/backup"
 	"haproxyweb/internal/api"
 	"haproxyweb/internal/audit"
 	"haproxyweb/internal/auth"
@@ -59,18 +64,6 @@ func Run(opt Options) error {
 		return fmt.Errorf("创建数据目录失败: %w", err)
 	}
 
-	// 能力探测（技术方案 §9.2）：**缺失必须在启动输出里可见**。
-	// 不阻断启动，但 nftables 缺失会拒绝——数据面完全不能工作的进程不该跑起来。
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	capsSnap := caps.Probe(probeCtx, caps.DefaultProber())
-	probeCancel()
-	if err := capsSnap.Critical(); err != nil {
-		return err
-	}
-	for _, w := range capsSnap.Warnings() {
-		log.Printf("[caps] 降级: %s", w)
-	}
-
 	// 双进程零中断升级：子进程从环境变量还原父进程传递的监听 fd
 	var inherited *proxy.InheritedListeners
 	if os.Getenv(proxy.EnvUpgradeChild) == "1" {
@@ -102,7 +95,23 @@ func Run(opt Options) error {
 		}
 		fmt.Printf("配置校验通过\n  监听地址: %s\n  数据目录: %s（可写）\n  数据库: OK（规则 %d 条 / 用户 %d 个，schema 已就绪）\n  TLS: %s\n",
 			cfg.Web.Listen, cfg.Web.DataDir, rules, users, tlsState)
+		// -check 在校验完配置与库后退出，**不做能力探测**。
+		// 理由：这个模式会在替换二进制后、正式启动前由升级脚本调用，
+		// 常见于无 CAP_NET_ADMIN 的校验环境（CI、容器、非 root）。
+		// 把能力探测放进来会让「配置没问题」被误判成「无法启动」。
 		return nil
+	}
+
+	// 能力探测（技术方案 §9.2）：**缺失必须在启动输出里可见**。
+	// 不阻断启动，但 nftables 缺失会拒绝——数据面完全不能工作的进程不该跑起来。
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	capsSnap := caps.Probe(probeCtx, caps.DefaultProber())
+	probeCancel()
+	if err := capsSnap.Critical(); err != nil {
+		return err
+	}
+	for _, w := range capsSnap.Warnings() {
+		log.Printf("[caps] 降级: %s", w)
 	}
 
 	authSvc, err := auth.New(cfg.Web.DataDir, db)
@@ -119,6 +128,17 @@ func Run(opt Options) error {
 	auditW := audit.New(db, cfg.Web.AuditRetentionDays)
 
 	mgr := proxy.NewManager(db, tlog, cfg.ListenPort(), BuildProxyOptions(cfg))
+	// 实例 ID：让「本实例装的 nft 规则」可以被证明。
+	// 事故后修复（方案 A）：对账只认本 ID 的规则，别人的（含旧格式）一律不碰。
+	// 加载失败是**致命**的——没有实例 ID 就无法安全对账，宁可拒绝启动。
+	instID, err := proxy.LoadOrCreateInstanceID(cfg.Web.DataDir)
+	if err != nil {
+		return fmt.Errorf("加载实例标识失败: %w", err)
+	}
+	if err := mgr.SetInstanceID(instID); err != nil {
+		return fmt.Errorf("设置实例标识失败: %w", err)
+	}
+	log.Printf("[proxy] 实例标识: %s（nft 对账只处理本实例的规则）", instID)
 	if inherited != nil {
 		mgr.AdoptListeners(inherited)
 	}
@@ -129,6 +149,9 @@ func Run(opt Options) error {
 	mgr.StartHealthChecks()
 	mgr.StartSnatPolling() // snat 内核计数轮询（iptables 计数 → 速率/统计）
 
+	// 定时备份（若配置了目标与间隔）。失败只记日志，不影响主流程。
+	startBackupScheduler(cfg, opt.Version)
+
 	var webFS fs.FS = opt.WebAssets
 	deps := api.Deps{
 		DB:      db,
@@ -138,6 +161,8 @@ func Run(opt Options) error {
 		Mgr:     mgr,
 		Cfg:     cfg,
 		Version: opt.Version,
+		// 能力快照：/api/status 与 /api/capabilities 的数据源（§9.2）
+		Caps: &capsSnap,
 	}
 	r, err := api.NewRouter(deps, webFS)
 	if err != nil {
@@ -336,4 +361,55 @@ func Run(opt Options) error {
 			return nil
 		}
 	}
+}
+
+// startBackupScheduler 按配置启动定时备份。未配置时是 no-op。
+//
+// 为什么放在启动流程里而不是单独的守护进程：
+//   - 备份需要与主进程共享数据目录与库路径（配置已经解析好了）
+//   - 备份失败只记日志（定时任务不该让主进程退出）
+//   - 单实例串行执行（Scheduler 内部保证不重叠）
+func startBackupScheduler(cfg *config.Config, version string) {
+	if cfg == nil {
+		return
+	}
+	// 配置项：backup.interval_hours / backup.keep / backup.local_dir
+	// 未配置（interval<=0 或 local_dir 为空）时静默跳过——备份不是必选项。
+	if cfg.Backup.IntervalHours <= 0 || cfg.Backup.LocalDir == "" {
+		return
+	}
+	interval := time.Duration(cfg.Backup.IntervalHours) * time.Hour
+	sink, err := backup.NewLocalSink(cfg.Backup.LocalDir)
+	if err != nil {
+		log.Printf("[backup] 本地备份目标初始化失败，定时备份未启用: %v", err)
+		return
+	}
+	dbPath := filepath.Join(cfg.Web.DataDir, "config.db")
+	svc := backup.New(dbPath, cfg.Web.DataDir, func(ctx context.Context, dest string) error {
+		// VACUUM INTO 由调用方注入：本包不 import gorm。
+		// 这里用一个独立的只读连接执行，避免与主库的长事务互相阻塞。
+		gdb, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{Logger: logger.Discard})
+		if err != nil {
+			return fmt.Errorf("打开配置库失败: %w", err)
+		}
+		sqlDB, err := gdb.DB()
+		if err != nil {
+			return fmt.Errorf("获取底层连接失败: %w", err)
+		}
+		defer sqlDB.Close()
+		if err := gdb.Exec("VACUUM INTO ?", dest).Error; err != nil {
+			return fmt.Errorf("VACUUM INTO 失败: %w", err)
+		}
+		return nil
+	}, sink)
+
+	sch := backup.NewScheduler(svc, interval, backup.Options{
+		Keep:   cfg.Backup.Keep,
+		Source: "config",
+	}, nil)
+	if sch == nil {
+		return
+	}
+	log.Printf("[backup] 定时备份已启用: %s", sch.Describe())
+	go sch.Run(context.Background())
 }

@@ -212,3 +212,79 @@ func TestLoadHealthCheckConfig(t *testing.T) {
 		t.Errorf("负数周期应报错，实际: %v", err)
 	}
 }
+
+// TestBackupConfigValidation 备份配置的启动期校验。
+//
+// 原则（AGENTS.md）：新增配置项要「两处都加 + 启动即失败，不静默回退」。
+func TestBackupConfigValidation(t *testing.T) {
+	base := func() *Config {
+		c := defaults()
+		c.Web.CertFile = "/tmp/c.pem"
+		c.Web.KeyFile = "/tmp/k.pem"
+		return c
+	}
+	// 默认：不启用备份
+	c := base()
+	if err := c.validate(); err != nil {
+		t.Fatalf("默认配置应通过: %v", err)
+	}
+	if c.Backup.IntervalHours != 0 {
+		t.Fatal("默认不应启用定时备份")
+	}
+
+	// 负间隔
+	c = base()
+	c.Backup.IntervalHours = -1
+	if err := c.validate(); err == nil {
+		t.Fatal("负间隔应报错")
+	}
+	// 负保留份数
+	c = base()
+	c.Backup.Keep = -1
+	if err := c.validate(); err == nil {
+		t.Fatal("负保留份数应报错")
+	}
+	// ★ 配了间隔但没配目录 → 必须报错（否则「以为配了备份其实没跑」）
+	c = base()
+	c.Backup.IntervalHours = 24
+	c.Backup.LocalDir = ""
+	if err := c.validate(); err == nil {
+		t.Fatal("★ 配了 interval 但 local_dir 为空必须报错")
+	}
+	// ★ 备份目录 == 数据目录 → 必须报错（同盘损坏等于没备份）
+	c = base()
+	c.Backup.IntervalHours = 24
+	c.Backup.LocalDir = c.Web.DataDir
+	if err := c.validate(); err == nil {
+		t.Fatal("★ 备份目录不能与数据目录相同")
+	}
+	// 合法配置
+	c = base()
+	c.Backup.IntervalHours = 24
+	c.Backup.LocalDir = "/mnt/backup"
+	if err := c.validate(); err != nil {
+		t.Fatalf("合法备份配置应通过: %v", err)
+	}
+}
+
+// TestNFTPurgeOrphansDefaultOff 启动对账默认不拆孤儿（事故 2026-10-30 的修复）。
+//
+// 理由：孤儿残留只浪费几条内核规则的空间，误拆会清空转发面规则导致断网。
+// 两种错误的代价不对称，所以默认选安全的那边。
+func TestNFTPurgeOrphansDefaultOff(t *testing.T) {
+	c := defaults()
+	if c.Tuning.NFTPurgeOrphans {
+		t.Fatal("★ nft_reconcile_purge 默认必须为 false（事故后修复）")
+	}
+	if err := c.validate(); err != nil {
+		t.Fatalf("默认配置应通过: %v", err)
+	}
+	// 显式开启后仍然通过校验
+	c.Tuning.NFTPurgeOrphans = true
+	if err := c.validate(); err != nil {
+		t.Fatalf("显式开启应通过: %v", err)
+	}
+	if !c.Tuning.NFTPurgeOrphans {
+		t.Fatal("显式开启后应保留 true")
+	}
+}

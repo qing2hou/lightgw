@@ -23,7 +23,10 @@ const (
 	KindEgress = "eg"     // 出口 SNAT 行（多出口跟随）
 )
 
-// Comment 构造标记。
+// Comment 构造标记（无实例 ID 的旧格式）。
+//
+// ** deprecated **：新代码用 CommentFor(instance, kind, id)。
+// 保留它是为了测试与「旧版本装的规则」的解析兼容。
 func Comment(kind string, id uint) string {
 	if kind == KindAnchor {
 		return "haweb-nft:anchor"
@@ -31,17 +34,111 @@ func Comment(kind string, id uint) string {
 	return "haweb-nft:" + kind + ":" + strconv.FormatUint(uint64(id), 10)
 }
 
-// ParseComment 解析标记（kind, id, ok）。
+// CommentFor 构造带实例 ID 的标记：haweb-nft:<instance>:<kind>:<id>
+//
+// 为什么必须带实例 ID（事故 2026-10-30）：
+// 旧标记 `haweb-nft:<kind>:<id>` 无法区分「谁装的」。启动对账用
+// 「内核有但我的库里没有 = 孤儿」判定，在「第二个进程用不同数据目录碰
+// 同一张表」时会把别人的规则全拆掉。带上实例 ID 之后，对账可以先按
+// 实例过滤，从根本上消除这类误拆。
+//
+// instance 为空时退化为旧格式（保持兼容；但此时对账不做拆除，见
+// proxy.purgeOrphanNFTRules 的安全分支）。
+func CommentFor(instance, kind string, id uint) string {
+	if kind == KindAnchor {
+		if instance == "" {
+			return "haweb-nft:anchor"
+		}
+		return "haweb-nft:" + instance + ":anchor"
+	}
+	base := "haweb-nft:"
+	if instance != "" {
+		base += instance + ":"
+	}
+	return base + kind + ":" + strconv.FormatUint(uint64(id), 10)
+}
+
+// ParsedComment 是解析后的标记。
+type ParsedComment struct {
+	// Instance 是实例 ID；旧格式（无实例段）时为空串。
+	Instance string
+	Kind     string
+	ID       uint
+	// Legacy 为 true 表示这是旧格式标记（无实例 ID）。
+	//
+	// **对账必须把 Legacy 视为「非本实例」**——升级后第一次启动不会自动
+	// 清理升级前的孤儿，这是有意的安全取舍：清不掉只占空间，清错了会断网。
+	Legacy bool
+}
+
+// ParseComment 解析标记（kind, id, ok）——旧接口，保留兼容。
 func ParseComment(ud string) (string, uint, bool) {
+	pc, ok := ParseCommentFull(ud)
+	if !ok {
+		return "", 0, false
+	}
+	return pc.Kind, pc.ID, true
+}
+
+// ParseCommentFull 解析标记，同时给出实例归属。
+//
+// 接受两种格式：
+//
+//	haweb-nft:<instance>:<kind>:<id>   新格式（instance 为 16 位十六进制）
+//	haweb-nft:<kind>:<id>             旧格式（Legacy=true）
+//	haweb-nft:anchor / haweb-nft:<instance>:anchor   锚点行
+func ParseCommentFull(ud string) (ParsedComment, bool) {
 	parts := strings.Split(ud, ":")
-	if len(parts) != 3 || parts[0] != "haweb-nft" {
-		return "", 0, false
+	if len(parts) < 2 || parts[0] != "haweb-nft" {
+		return ParsedComment{}, false
 	}
-	id, err := strconv.ParseUint(parts[2], 10, 32)
-	if err != nil {
-		return "", 0, false
+	switch len(parts) {
+	case 2:
+		// haweb-nft:anchor
+		if parts[1] != KindAnchor {
+			return ParsedComment{}, false
+		}
+		return ParsedComment{Kind: KindAnchor, Legacy: true}, true
+	case 3:
+		// 可能：haweb-nft:<kind>:<id>（旧） 或 haweb-nft:<instance>:anchor（新锚点）
+		if parts[2] == KindAnchor && isInstanceSegment(parts[1]) {
+			return ParsedComment{Instance: parts[1], Kind: KindAnchor}, true
+		}
+		id, err := strconv.ParseUint(parts[2], 10, 32)
+		if err != nil {
+			return ParsedComment{}, false
+		}
+		return ParsedComment{Kind: parts[1], ID: uint(id), Legacy: true}, true
+	case 4:
+		// haweb-nft:<instance>:<kind>:<id>
+		if !isInstanceSegment(parts[1]) {
+			return ParsedComment{}, false
+		}
+		id, err := strconv.ParseUint(parts[3], 10, 32)
+		if err != nil {
+			return ParsedComment{}, false
+		}
+		return ParsedComment{Instance: parts[1], Kind: parts[2], ID: uint(id)}, true
 	}
-	return parts[1], uint(id), true
+	return ParsedComment{}, false
+}
+
+// isInstanceSegment 判断某段是否为实例 ID（16 位小写十六进制）。
+//
+// 严格校验的意义：区分 `haweb-nft:<kind>:<id>`（旧）与
+// `haweb-nft:<instance>:anchor`（新）两种 3 段格式。
+func isInstanceSegment(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // rulesOf 单链全部规则（链上无规则返回空切片）。
@@ -125,6 +222,53 @@ func (n *Conn) InstalledIDs() (map[string]map[uint]bool, error) {
 		}
 	}
 	return out, nil
+}
+
+// InstalledIDsByInstance 列出**指定实例**已安装的 (kind, id) 集合。
+//
+// 与 InstalledIDs 的区别（事故修复的核心）：
+//   - InstalledIDs 返回所有带 haweb-nft 标记的规则（含别人的实例、含旧格式）
+//   - 本函数**只返回 instance 匹配的**，旧格式一律排除（Legacy=true 跳过）
+//
+// 旧格式被排除是有意的安全取舍：升级后第一次启动不会自动清理升级前的
+// 孤儿。清不掉只占几 KB 规则空间，清错了会断网。
+func (n *Conn) InstalledIDsByInstance(instance string) (map[string]map[uint]bool, error) {
+	out := map[string]map[uint]bool{}
+	if instance == "" {
+		return out, nil
+	}
+	for _, chain := range []string{ChainPreMark, ChainDstNAT, ChainFwd, ChainSrcNAT, ChainInput} {
+		rules, err := n.rulesOf(chain)
+		if err != nil {
+			return nil, err
+		}
+		for _, r := range rules {
+			pc, ok := ParseCommentFull(string(r.UserData))
+			if !ok || pc.Legacy || pc.Instance != instance {
+				continue
+			}
+			if pc.Kind == KindAnchor {
+				continue
+			}
+			if out[pc.Kind] == nil {
+				out[pc.Kind] = map[uint]bool{}
+			}
+			out[pc.Kind][pc.ID] = true
+		}
+	}
+	return out, nil
+}
+
+// PurgeByCommentFor 按（实例, kind, id）精确拆除。
+//
+// 与 PurgeByComment 的区别：本函数**只删 instance 匹配的**，
+// 绝不碰到别的实例或旧格式的规则。
+func (n *Conn) PurgeByCommentFor(instance, kind string, id uint) error {
+	if instance == "" {
+		return fmt.Errorf("按实例拆除失败: 实例 ID 为空")
+	}
+	_, err := n.purgeByCommentTarget(CommentFor(instance, kind, id))
+	return err
 }
 
 // CounterPair 双桶计数（复审 N1：同标记多行——放行桶与拒绝桶分开求和，

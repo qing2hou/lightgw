@@ -63,6 +63,15 @@ type Manager struct {
 	// 多规则共用同一 ifb 时，父类总额按最后写入者为准——需要知道谁在用、
 	// 拆除时是否该删设备。
 	ifbOwners map[string]map[uint]bool
+	// instanceID 是本实例的标识（存在数据目录的 instance_id 文件里）。
+	//
+	// 它参与 nft 规则的 comment 标记，让「我装的规则」可以被证明。
+	// **空串表示未启用实例隔离**——此时启动对账不做任何拆除（
+	// 因为无法区分「我的孤儿」与「别人的规则」）。
+	//
+	// 事故：2026-10-30 用空库在生产机启动测试实例，对账把生产的
+	// SNAT 规则全判成孤儿拆掉（docs/incident-2026-10-30-orphan-reconcile.md）。
+	instanceID string
 
 	// 出口探测循环（M3/T202）
 	egressDone      chan struct{}

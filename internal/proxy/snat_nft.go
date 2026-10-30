@@ -245,17 +245,40 @@ func (m *Manager) migrateLegacyIPTables() (int, error) {
 	return conn.PurgeLegacyIPTables()
 }
 
-// purgeOrphanNFTRules nft 形态启动对账：haweb 表内 haweb-nft:snat:<id> 标记
-// 规则、DB 无对应启用 snat 规则的，按标记拆除（进程崩溃残留归零）。
+// purgeOrphanNFTRules nft 形态启动对账。
+//
+// **事故后的重写（2026-10-30，docs/incident-2026-10-30-orphan-reconcile.md）**
+//
+// 旧判据是「内核里有 haweb-nft 标记、但我的库里没有对应启用规则 = 孤儿」。
+// 这个判据只在「内核里只有我自己装的规则」时成立。后果：用空库在生产机
+// 启动一个测试实例，它把生产的所有 SNAT/DNAT 规则全判成孤儿拆掉，
+// 转发面规则清空约 2 分钟。
+//
+// 新逻辑（方案 A + C）：
+//
+//  1. **按实例过滤**：只考虑 instance 等于本实例的规则。别的实例的规则
+//     （含旧格式 `haweb-nft:<kind>:<id>`）一律跳过——它们不是我的孤儿。
+//  2. **默认只告警不删**（方案 C）：即使确认是本实例的孤儿，也只在
+//     `tuning.nft_reconcile_purge=true` 时才真删。默认行为是打印告警。
+//     理由：孤儿残留只占几条规则的空间，误拆会断网。两种错误的代价不对称。
+//  3. **实例 ID 为空时不拆除**：无法证明归属时，宁可留着。
+//
+// 需要清理旧孤儿时用显式运维动作（重建规则或手工删），不在启动路径自动做。
 func (m *Manager) purgeOrphanNFTRules() {
 	conn, err := m.nftConn()
 	if err != nil {
 		logf("[snat] nft 启动对账跳过（引擎连接不可用）: %v", err)
 		return
 	}
+	instance := m.InstanceID()
+	if instance == "" {
+		// 方案 C 的一部分：没有实例 ID 就无法证明归属，绝不拆除。
+		logf("[snat] nft 启动对账跳过（未启用实例隔离，无法证明规则归属）")
+		return
+	}
 	m.nftApplyMu.Lock()
 	defer m.nftApplyMu.Unlock()
-	installed, err := conn.InstalledIDs()
+	installed, err := conn.InstalledIDsByInstance(instance)
 	if err != nil {
 		logf("[snat] nft 启动对账读取失败: %v", err)
 		return
@@ -269,21 +292,39 @@ func (m *Manager) purgeOrphanNFTRules() {
 	for _, r := range rules {
 		live[r.ID] = true
 	}
-	var purged []uint
-	// 评审 #7：两个 kind 都对账（dnat 孤儿残留=发布地址流量被永久改写到
-	// 已删除的后端）
+	var orphans []uint
 	for _, kind := range []string{nft.KindSNAT, nft.KindDNAT} {
 		for id := range installed[kind] {
 			if live[id] {
 				continue
 			}
-			if err := conn.PurgeByComment(kind, id); err == nil {
+			orphans = append(orphans, id)
+		}
+	}
+	if len(orphans) == 0 {
+		m.reinstallDefaultDenyLocked(conn)
+		return
+	}
+	if !m.opts().NFTPurgeOrphans {
+		// 方案 C：默认只告警。孤儿残留只浪费几条规则，误拆会断网。
+		logf("[snat] nft 启动对账发现 %d 条本实例孤儿规则 %v（未拆除：%s）",
+			len(orphans), orphans, "tuning.nft_reconcile_purge 未开启")
+		m.reinstallDefaultDenyLocked(conn)
+		return
+	}
+	var purged []uint
+	for _, kind := range []string{nft.KindSNAT, nft.KindDNAT} {
+		for id := range installed[kind] {
+			if live[id] {
+				continue
+			}
+			if err := conn.PurgeByCommentFor(instance, kind, id); err == nil {
 				purged = append(purged, id)
 			}
 		}
 	}
 	if len(purged) > 0 {
-		logf("[snat] nft 启动对账：已拆除 %d 条孤儿规则: %v", len(purged), purged)
+		logf("[snat] nft 启动对账：已拆除 %d 条本实例孤儿规则: %v", len(purged), purged)
 	}
 	m.reinstallDefaultDenyLocked(conn)
 }

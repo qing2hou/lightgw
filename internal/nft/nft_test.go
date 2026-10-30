@@ -24,11 +24,14 @@ func TestCommentRoundTrip(t *testing.T) {
 }
 
 func TestParseCommentRejects(t *testing.T) {
+	// 注意：`haweb-nft:anchor` 从 ParseCommentFull 引入后可解析（kind=anchor，
+	// Legacy=true），但 ParseComment（旧接口）**仍不返回锚点**——
+	// 锚点的 purge/对账走独立分支，不能与普通规则混在一起。
 	for _, bad := range []string{
 		"", "haweb-sn:5", "haweb-nft:snat:abc", "haweb-nft:snat",
 		"haweb-nft:snat:5:extra", "other:snat:5", "haweb-nft:anchor",
 	} {
-		if _, _, ok := ParseComment(bad); ok {
+		if k, _, ok := ParseComment(bad); ok && k != KindAnchor {
 			t.Fatalf("%q 不应解析成功", bad)
 		}
 	}
@@ -39,8 +42,15 @@ func TestAnchorCommentForm(t *testing.T) {
 	if got := Comment(KindAnchor, 0); got != "haweb-nft:anchor" {
 		t.Fatalf("锚点标记形态: %s", got)
 	}
-	if _, _, ok := ParseComment("haweb-nft:anchor"); ok {
-		t.Fatal("锚点标记（两段式）不应走普通解析——purge 逻辑独立处理")
+	// 新旧两种锚点形态都不应被 ParseComment 当成普通规则返回
+	for _, ud := range []string{"haweb-nft:anchor", "haweb-nft:0123456789abcdef:anchor"} {
+		if k, _, ok := ParseComment(ud); ok && k != KindAnchor {
+			t.Fatalf("%q 不应被当作普通规则解析（得到 kind=%q）", ud, k)
+		}
+	}
+	// 但 ParseCommentFull 必须能解析它们（对账需要判定实例归属）
+	if pc, ok := ParseCommentFull("haweb-nft:0123456789abcdef:anchor"); !ok || pc.Kind != KindAnchor {
+		t.Fatalf("ParseCommentFull 应解析新锚点，实际 %+v ok=%v", pc, ok)
 	}
 }
 

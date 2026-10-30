@@ -133,6 +133,7 @@ func BuildProxyOptions(cfg *config.Config) proxy.Options {
 		HealthWebhookURL:    cfg.Web.HealthWebhookURL,
 		GlobalUploadKBps:    int64(cfg.Tuning.GlobalUploadKBps),
 		GlobalDownloadKBps:  int64(cfg.Tuning.GlobalDownloadKBps),
+		NFTPurgeOrphans:     cfg.Tuning.NFTPurgeOrphans,
 		HealthLogRetentionDays: func() int {
 			// -1 = 跟随流量日志保留天数
 			if cfg.Tuning.HealthLogRetentionDays < 0 {

@@ -116,6 +116,8 @@ type Handler struct {
 	//
 	// 作为函数注入而不是让 handler 查库：handler 不许直接碰 db（§8.6）。
 	ACLGroupPrefixes func(ctx context.Context, groupID uint) ([]netip.Prefix, error)
+	// Status 提供运行状态（能力、计数）。为 nil 时 /api/status 返回 503。
+	Status StatusProvider
 }
 
 // Register 把路由挂到 gin 引擎。
@@ -134,6 +136,10 @@ func (h *Handler) Register(r gin.IRouter) {
 	g.POST("/sessions/kill-batch", h.killSessionsBatch)
 	// 名单组变更后踢匹配会话
 	g.POST("/acl-groups/:id/kick-sessions", h.kickACLGroupSessions)
+	// 运行状态。**必须挂在鉴权分组下**（D-12：详细信息不能进无鉴权的 /healthz）
+	g.GET("/status", h.status)
+	// 能力快照（轻量，供前端轮询降级状态）
+	g.GET("/capabilities", h.capsOnly)
 }
 
 // parseID 解析路径里的 uint 参数。
