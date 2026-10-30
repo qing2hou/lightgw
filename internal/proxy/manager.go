@@ -50,6 +50,20 @@ type Manager struct {
 	// 独立于 nftMu：探测/建连接不阻塞装载）
 	nftApplyMu sync.Mutex
 
+	// tcMu 串行化全部 tc 命令序列（htb 树/子类/filter 的 replace+del 组合）。
+	// 没有它时两条规则并发 Apply 会交错执行 tc，出现"半装"状态（如 A 刚建
+	// 子类、B 的清理循环把它删掉）。与 nftApplyMu 独立：nft 与 tc 是两套
+	// 内核面，互不阻塞能缩短持锁时间。
+	tcMu sync.Mutex
+	// tcOwnedClasses 每条规则在每张网卡上创建过的 htb 子类集合
+	// （key = ifname|ruleID）。清理旧子类时以此为准，绝不盲删区间——
+	// 同网卡多规则部署时盲删会删掉其他规则的保底子类。
+	tcOwnedClasses map[string]map[string]bool
+	// ifbOwners 每个 ifb 设备被哪些带宽包占用（key = 设备名，value = bwGroupID 集合）。
+	// 多规则共用同一 ifb 时，父类总额按最后写入者为准——需要知道谁在用、
+	// 拆除时是否该删设备。
+	ifbOwners map[string]map[uint]bool
+
 	// 出口探测循环（M3/T202）
 	egressDone      chan struct{}
 	egressReapply   chan struct{} // 出口翻转重算的聚批信号（S1）
@@ -101,27 +115,29 @@ func NewManager(db *gorm.DB, tlog *trafficlog.Writer, webPort int, opts Options)
 		opts.TCPDialTimeout = 10 * time.Second
 	}
 	m := &Manager{
-		db:            db,
-		tlog:          tlog,
-		webPort:       webPort,
-		tcpRules:      map[uint]*tcpEntry{},
-		udpRules:      map[uint]*udpEntry{},
-		snatRules:     map[uint]*snatEntry{},
-		snatBase:      map[uint]*snatBaseline{},
-		bwLimiters:    map[uint]*ratelimit.Limiter{},
-		snatAcc:       map[uint]int64{},
-		snatDone:      make(chan struct{}),
-		adoptedTCP:    map[uint]net.Listener{},
-		adoptedUDP:    map[uint]*net.UDPConn{},
-		bufs:          newBufferPool(opts.BufferSize),
-		udpBufs:       sync.Pool{New: func() any { b := make([]byte, 65535); return &b }},
-		globalConns:   newConnLimiter(opts.MaxGlobalConns),
-		stats:         map[uint]*ruleStats{},
-		health:        map[uint]*ruleHealth{},
-		healthDone:    make(chan struct{}),
-		deniedLast:    map[string]time.Time{},
-		egressDone:    make(chan struct{}),
-		egressReapply: make(chan struct{}, 1),
+		db:             db,
+		tlog:           tlog,
+		webPort:        webPort,
+		tcpRules:       map[uint]*tcpEntry{},
+		udpRules:       map[uint]*udpEntry{},
+		snatRules:      map[uint]*snatEntry{},
+		snatBase:       map[uint]*snatBaseline{},
+		bwLimiters:     map[uint]*ratelimit.Limiter{},
+		tcOwnedClasses: map[string]map[string]bool{},
+		ifbOwners:      map[string]map[uint]bool{},
+		snatAcc:        map[uint]int64{},
+		snatDone:       make(chan struct{}),
+		adoptedTCP:     map[uint]net.Listener{},
+		adoptedUDP:     map[uint]*net.UDPConn{},
+		bufs:           newBufferPool(opts.BufferSize),
+		udpBufs:        sync.Pool{New: func() any { b := make([]byte, 65535); return &b }},
+		globalConns:    newConnLimiter(opts.MaxGlobalConns),
+		stats:          map[uint]*ruleStats{},
+		health:         map[uint]*ruleHealth{},
+		healthDone:     make(chan struct{}),
+		deniedLast:     map[string]time.Time{},
+		egressDone:     make(chan struct{}),
+		egressReapply:  make(chan struct{}, 1),
 	}
 	m.optsStore.Store(&opts)
 	m.globalLimiter.Store(ratelimit.New(opts.GlobalUploadKBps*1024, opts.GlobalDownloadKBps*1024))
@@ -417,7 +433,7 @@ func (m *Manager) stopStaleProtocol(rule model.ForwardRule) {
 	if staleSNAT != nil {
 		staleSNAT.teardownSnat()
 		m.teardownSnatNFT(rule.ID) // nft 形态同拆（评审 M4——漏拆则残留到下次重启）
-		_ = staleSNAT.teardownSnatLimit()
+		_ = m.teardownSnatLimit(staleSNAT)
 		staleSNAT.teardownEgressRoute()
 	}
 }

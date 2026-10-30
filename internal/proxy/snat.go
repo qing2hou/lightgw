@@ -230,6 +230,7 @@ func (m *Manager) buildSnatSpec(rule model.ForwardRule) *snatRuleSpec {
 		DownloadKbps: rule.DownloadLimitKBps,
 		BWGroupKBps:  bwKBps,
 		MinKBps:      bwMinKBps, // 包级每源保底（0=默认 1024）
+		bwGroupID:    rule.BWGroupID,
 		EgressGw:     strings.TrimSpace(rule.EgressGw),
 	}
 }
@@ -279,7 +280,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		// （B1：出口 up/down 翻转与 egress_ids 变更不在 sameForwarding 维度内，
 		//  由 egressDirty 强制全路径——否则切换/回切/分担变化全部被吞）
 		if old != nil && !m.egressDirty.Load() && old.sameForwarding(spec) {
-			if err := spec.applySnatLimit(); err != nil {
+			if err := m.applySnatLimit(spec); err != nil {
 				logf("规则[%s#%d] tc 限速重建失败（保持原限速）: %v", rule.Name, rule.ID, err)
 			} else if spec.BWGroupKBps > 0 {
 				logf("规则[%s#%d] 带宽参数已热更新（iptables 未动，存量连接不受影响）", rule.Name, rule.ID)
@@ -299,7 +300,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		s := old.spec()
 		s.teardownSnat()
 		m.teardownSnatNFT(rule.ID)
-		_ = s.teardownSnatLimit()
+		_ = m.teardownSnatLimit(s)
 		m.teardownEgressRouteNFT(s.RtTable)
 		s.teardownEgressRoute() // exec 兜底（netlink 版失败/引擎不可用时）
 		// 停用/删除时掐断本规则的存量穿越会话：iptables 拆除后，基线的
@@ -360,7 +361,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 	if err := m.installSnatNFT(spec); err != nil {
 		return err
 	}
-	if err := spec.applySnatLimit(); err != nil {
+	if err := m.applySnatLimit(spec); err != nil {
 		// 限速失败不阻塞主功能：iptables 已装好，限速降级（状态里留痕）
 		logf("规则[%s#%d] tc 入向限速未生效（降级为不限速）: %v", rule.Name, rule.ID, err)
 	}
@@ -482,6 +483,7 @@ type snatRuleSpec struct {
 	DownloadKbps int64    // 出向限速 KB/s（0 = 不限；tc egress 挂出口网卡——穿越流量的下载方向）
 	BWGroupKBps  int64    // 所属带宽包合计额度 KB/s（>0 时 DownloadKbps 忽略——导入共享 class）
 	MinKBps      int64    // 成员保底带宽 KB/s（htb rate；闲时借用到包总额 ceil）
+	bwGroupID    uint     // 所属带宽包 ID（0 = 独立规则）；用于按包区分 ifb 设备
 	EgressGw     string   // 出口网关（可选）：非空时安装 per-规则策略路由，出向决策强制走出口网卡
 	RtTable      int      // 专属路由表号（EgressGw 非空时分配）
 }
@@ -864,103 +866,157 @@ func snatPurgeByComment(ruleID uint) {
 // applySnatLimit SNAT 限速（ADR-9：自身限速彻底移除，仅带宽包共享）：
 // 入包成员（BWGroupKBps>0）在入口网卡挂 per-包 htb 共享 class 1:100，
 // 全部成员 filter 汇聚导入——同额度共享（PoC 实证）。未入包不限速。
-func (s *snatRuleSpec) applySnatLimit() error {
-	_ = s.teardownSnatLimit()
+func (m *Manager) applySnatLimit(s *snatRuleSpec) error {
+	// 整个 tc 序列串行：两条规则并发 Apply 时 tc 命令交错会留下半装状态
+	// （A 刚建子类、B 的清理把它删掉）。nft 有独立的 nftApplyMu，互不阻塞。
+	m.tcMu.Lock()
+	defer m.tcMu.Unlock()
+
+	_ = m.teardownSnatLimitLocked(s)
 	if s.BWGroupKBps <= 0 || len(s.AllowSrcs) == 0 {
 		return nil
 	}
 
-	// ===== 限速实现：扁平 htb，default 直连限速类（无分类器依赖）=====
+	// ===== 下载方向（服务器→客户端）：出口网卡 egress 按客户端目的地址分类 =====
 	//
-	// 本环境（virtio + Linux 6.8）实测结论，两条都导致过"限速完全不生效"：
-	//  1) u32 filter 不参与分类：挂 `tc filter ... u32 match ... at 12/16`
-	//     后各 class 的 Sent 恒为 0、流量全走 default，把限速类压到 1Kbit
-	//     仍能 79.9MB/s 满速上传。
-	//  2) 父类下挂子类时，未被 filter 指定的包无法归入子类，内核直接走
-	//     direct queue 发出（direct_packets_stat 持续增长、class Sent 为 0、
-	//     overlimits 不涨）。删掉子类后同一测试立刻正常：direct 不增、
-	//     1:100 承载全部 33.5MB、overlimits 2424。
-	//
-	// 因此采用：qdisc default → 限速类 1:100（总额），不建子类、不做 filter
-	// 分类。语义为"该网卡全部出向转发流量共享带宽包额度"。
-	//
-	// 代价（已文档化）：放弃每源保底分摊（MinKBps 仅保留为配置值）。per-源
-	// 分配必须依赖 u32 分类或子类层级，两者在本环境均不可靠；细粒度限速
-	// 待换 BPF/leaky-bucket 方案后实现。
+	// 回程包在 egress 上 daddr=客户端真实 IP，可用 u32 match ip dst 精确
+	// 分类到该源的保底子类（实测 60MB 下载全部落入指定子类）。
 	s.ensureHTB(s.IfIn)
-	if err := s.applyHTBLimit(s.IfIn); err != nil {
+	if err := m.applyHTBLimit(s, s.IfIn); err != nil {
 		return err
 	}
-	// 上传方向：出口网卡与入口不同卡时另建一棵（同卡则上面已覆盖）
+	// 出口网卡与入口不同卡时另建一棵
 	if s.OutIP != "" && s.IfOut != s.IfIn {
 		s.ensureHTB(s.IfOut)
-		if err := s.applyHTBLimit(s.IfOut); err != nil {
+		if err := m.applyHTBLimit(s, s.IfOut); err != nil {
 			return err
 		}
+	}
+	// ===== 上传方向（客户端→服务器）：入口网卡 ingress 按客户端源地址分类 =====
+	//
+	// egress 上源地址已被 SNAT 改写为网关 IP，无法区分客户端；但 ingress 上
+	// src 仍是客户端真实 IP。故用 ingress + u32 match ip src 分类，mirred
+	// 重定向到 ifb 设备后在 ifb 的 egress 上做 htb 整形。
+	// ifb 建不起来（无模块权限）时降级：上传只受 egress 侧总额约束。
+	if err := m.applyIngressLimit(s, s.bwGroupID); err != nil {
+		logf("[snat] 规则#%d 上传方向每源保底未生效（ingress/ifb 不可用，仅总额受限）: %v", s.ID, err)
 	}
 	return nil
 }
 
-// applyHTBLimit 建立"限速总额类 + fq_codel 流公平"结构。
+// applyHTBLimit 建立"总额父类 + 每源保底子类 + fq_codel"的限速结构。
 //
-//	qdisc htb 1:   default 100                              ← 全部转向限速类
-//	class 1:100    rate=ceil=<带宽包总额>                     ← 总额硬限
-//	qdisc fq_codel 100: parent 1:100                        ← 流级公平调度
-//	class 1:30     rate=10gbit                              ← 占位（不承载流量）
+//	qdisc htb 1:      default 100                          ← 未分类流量进总额类
+//	class 1:100       rate=ceil=<带宽包总额>                ← 父类：总额硬上限
+//	qdisc fq_codel 100: parent 1:100                       ← 流级公平（子类之下再公平）
+//	class 1:1NN       parent 1:100 rate=<每源保底> ceil=<总额>  ← 每白名单源一个
+//	filter u32 match ip dst <客户端>/32 flowid 1:1NN        ← 下载方向（回程）分类
+//	class 1:30        rate=10gbit                           ← 占位（不承载流量）
 //
-// 为什么是"default 直连 + fq_codel"而不是按源分类（详见 nft/anchor.go 的
-// 长注释）：本环境所有按源分类的通路都不可用——u32 完全不参与分类；
-// fw 只认奇数小整数 handle 且要求 mark 无额外位；flower 不支持 skb mark。
-// 上传包在 egress 上源地址又已被 SNAT 改成网关 IP，按地址分类本就不可能。
+// 分类可行性（170 实测，Linux 6.8 + virtio）：
+//   - 下载方向（服务器→客户端）：egress 上回程包 daddr=客户端真实 IP，
+//     `tc filter ... u32 match ip dst <客户端> flowid <子类>` 精确分类。
+//     实测 60MB 下载全部落入指定子类、overlimits 正常增长。
+//   - 上传方向（客户端→服务器）：egress 上源地址已被 SNAT 改成网关 IP，
+//     所有客户端不可区分；但入口方向 ingress 上 src 仍是客户端真实 IP，
+//     故上传限速走 "ingress + u32 match ip src <客户端> + mirred → ifb"
+//     （由 applyIngressLimit 另行建立）。
 //
-// 实际保证：
-//   - 总额：严格受 htb rate 约束（实测 8MB/s 配置跑出 6.67MB/s，差额为 TCP 开销）
-//   - 公平：fq_codel 按流轮转，多连接并发时按流均分，单个源的多条连接
-//     不会整体饿死其他源
-//   - 每源硬保底（MinKBps）当前不生效，见 anchor.go 说明
+// 保底语义：子类 rate=MinKBps（拥塞时的下限），ceil=总额（空闲可借满）。
+// 多源并发时各自至少拿到保底，剩余额度按需争抢——这正是"保障带宽"。
 //
-// 幂等：class replace 自幂等；fq_codel 已存在则不重复添加（重复 add 会失败）；
-// 顺带清理历史遗留的 per-源子类（旧版本建的 1:2..1:249，会让流量走 direct
-// 路径绕过限速）。
-func (s *snatRuleSpec) applyHTBLimit(ifn string) error {
+// 幂等与清理：class/filter replace 自幂等；不在本次集合内的历史子类必须删除
+// （残留子类会让未分类流量走 direct 绕过限速），但**必须跳过 1:100 与 1:30**
+// ——早期版本从 1:2 遍历到 1:249 把刚建的限速类删掉，default 指向不存在的
+// class 导致限速彻底失效（实测 8MB/s 配置跑出 24MB/s）。
+func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 	totalBits := strconv.FormatInt(s.BWGroupKBps*1024*8, 10)
+	// 父类（总额）
 	if err := runQuiet("tc", "class", "replace", "dev", ifn, "parent", "1:",
 		"classid", bwGroupClassID, "htb",
 		"rate", totalBits, "ceil", totalBits,
 		"burst", "32k", "cburst", "32k"); err != nil {
 		return err
 	}
-	// fq_codel 挂在限速类下（幂等：已有则跳过）
+	// fq_codel 挂在父类下（幂等）
 	if out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output(); err == nil {
 		if !strings.Contains(string(out), "qdisc fq_codel 100:") {
 			_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "parent", bwGroupClassID,
 				"handle", "100:", "fq_codel")
 		}
 	}
-	// 清理历史 per-源子类（旧版本按源建的 1:2..1:249）。
-	// 注意必须跳过限速类 1:100 与占位类 1:30——早期版本这里从 2 遍历到 249，
-	// 把刚建好的 1:100 一并删掉，导致 default 0x100 指向不存在的 class，
-	// 内核把包全部走 direct 路径，限速彻底失效（实测 24MB/s 满速）。
-	for n := 2; n <= 249; n++ {
-		clsID := "1:" + strconv.Itoa(n)
-		if clsID == bwGroupClassID || clsID == "1:30" {
+	// 每源保底子类 + 下载方向分类
+	minKB := s.MinKBps
+	if minKB <= 0 {
+		minKB = 1024
+	}
+	if minKB > s.BWGroupKBps {
+		minKB = s.BWGroupKBps
+	}
+	minBits := strconv.FormatInt(minKB*1024*8, 10)
+	keep := map[string]bool{}
+	seen := map[string]string{} // clsID -> 首个占用它的源（碰撞检测）
+	for _, src := range s.AllowSrcs {
+		if src == "" {
+			continue
+		}
+		clsID := srcClassID(src)
+		if prev, dup := seen[clsID]; dup && prev != src {
+			// 同一规则内两个源撞到同一 class ID：保底额度会合并计算，
+			// 表现为"两源共享一份保底"。概率极低（248 槽）但不能静默。
+			logf("[snat] 规则#%d 源 %q 与 %q 的限速 class 碰撞（%s），两者共享保底额度",
+				s.ID, prev, src, clsID)
+		}
+		seen[clsID] = src
+		keep[clsID] = true
+		if err := runQuiet("tc", "class", "replace", "dev", ifn,
+			"parent", bwGroupClassID, "classid", clsID, "htb",
+			"rate", minBits, "ceil", totalBits,
+			"burst", "16k", "cburst", "32k"); err != nil {
+			return err
+		}
+		// 下载方向：回程包 daddr=客户端 → 本子类（rate=保底、ceil=总额）
+		if err := runQuiet("tc", "filter", "replace", "dev", ifn,
+			"parent", "1:", "protocol", "ip", "prio", "10", "u32",
+			"match", "ip", "dst", src, "flowid", clsID); err != nil {
+			return err
+		}
+	}
+	// 清理"本规则上次建过、这次不再需要"的子类。
+	//
+	// 绝对不能遍历 1:2..1:249 盲删——同网卡上还有其他规则（每条规则有自己的
+	// 源集合），盲删会把别的规则的保底子类删掉（多规则部署下必然发生）。
+	// 早期版本还因为区间包含 1:100 把限速父类自己也删了（限速彻底失效）。
+	// 正确判据：以上次 apply 记录的子类集合为差集基准。
+	// 调用方（applySnatLimit / teardownSnatLimit）已持 tcMu
+	key := ifn + "|" + strconv.FormatUint(uint64(s.ID), 10)
+	prev := m.tcOwnedClasses[key]
+	m.tcOwnedClasses[key] = keep
+	for clsID := range prev {
+		if keep[clsID] {
 			continue
 		}
 		_ = runQuiet("tc", "class", "del", "dev", ifn, "classid", clsID)
 	}
-	// 清理历史 u32/fw filter（本方案不依赖分类器，残留会干扰 direct 判定）
-	_ = runQuiet("tc", "filter", "del", "dev", ifn, "parent", "1:")
 	return nil
 }
 
 // srcClassID 源 IP -> 稳定 class ID（1:2..1:250）。限速绑定"源"而非规则：
 // 同一源 IP 出现在多条规则时共享同一 member class（无论走哪条规则/端口）。
 func srcClassID(src string) string {
-	sum := 0
-	for _, b := range []byte(src) {
-		sum += int(b)
+	// 用 FNV-1a（32 位）而非字节求和：求和碰撞极易发生（"1.2.3" 与 "2.1.3"
+	// 字节和相同），多规则同网卡部署下碰撞会让两条规则的源共用同一子类，
+	// 保底额度互相蚕食。FNV 分布均匀，且同输入恒同输出（幂等拆除依赖此性质）。
+	const (
+		offset32 = 2166136261
+		prime32  = 16777619
+	)
+	h := uint32(offset32)
+	for i := 0; i < len(src); i++ {
+		h ^= uint32(src[i])
+		h *= prime32
 	}
-	return fmt.Sprintf("1:%d", 2+sum%248)
+	return fmt.Sprintf("1:%d", 1+h%248)
 }
 
 // srcFilterPref 下载方向 filter pref（2..998；pref 1 固定保留）。
@@ -1053,18 +1109,28 @@ func ipCidrToU32(s string) (hex, mask string, ok bool) {
 //
 // per-网卡共享结构的生命周期（root/class）随本机全部 snat 规则退化；
 // 不做显式删除（空 htb 无行为差异，避免"拆 A 时把 B 拆掉"的互踩——评审必修2）。
-func (s *snatRuleSpec) teardownSnatLimit() error {
-	// 下载：删入口网卡自己源的 filter（pref 由源稳定 hash，不碰别人）。
-	// 上传：删出口网卡 OutIP 源 filter。root htb/class 保留（他规则可能共用）。
-	// 同卡部署（单臂网关）时 IfIn==IfOut，两个循环各自按 pref 精确命中，
-	// 因下载区段(2..998)与上传区段(1002..1998)不相交，互不误删。
+func (m *Manager) teardownSnatLimit(s *snatRuleSpec) error {
+	m.tcMu.Lock()
+	defer m.tcMu.Unlock()
+	return m.teardownSnatLimitLocked(s)
+}
+
+// teardownSnatLimitLocked 无锁版本（调用方已持 tcMu）。
+func (m *Manager) teardownSnatLimitLocked(s *snatRuleSpec) error {
+	// 下载方向：egress 上按 daddr=客户端 的分类 filter（每源一条）
 	for _, src := range s.AllowSrcs {
-		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "1:", "pref", strconv.Itoa(srcFilterPref(src)))
+		if src == "" {
+			continue
+		}
+		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "1:",
+			"protocol", "ip", "prio", "10", "u32", "match", "ip", "dst", src)
 	}
+	// 上传方向：ingress 重定向 filter + ifb 子类（teardown 内部自己加锁，
+	// 此处不持 tcMu——applySnatLimit 已持有时由 lockFree 变体处理）
+	m.teardownIngressLimitLocked(s)
+	// 历史形态清理（旧版上传在 egress 用 OutIP 分类）
 	if s.OutIP != "" {
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(uploadFilterPref(s.OutIP)))
-		// 旧版上传 filter 用的是 srcFilterPref 区段（升级前装的），同卡部署下
-		// 会与下载 filter 争用 pref——首次重装时一并清掉。
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(srcFilterPref(s.OutIP)))
 	}
 	return nil
@@ -1678,4 +1744,147 @@ func (m *Manager) StartSnatPolling() {
 // StopSnatPolling 停止轮询（升级交接父进程时调用，避免双进程双计数）。
 func (m *Manager) StopSnatPolling() {
 	m.snatStopOnce.Do(func() { close(m.snatDone) })
+}
+
+// ifbNameFor 返回某带宽包对应的 ifb 设备名。
+//
+// 必须**按带宽包隔离**：ifb 上的 htb 父类 1:100 承载"该包的总额度"，
+// 若多个带宽包共用一个 ifb，最后应用的包会把父类 rate 覆盖成自己的额度，
+// 先前的包额度静默失效（多包部署下的必现错误）。
+// 同一包的多条规则共用一个 ifb 是正确的——它们本就共享同一份额度。
+func ifbNameFor(bwGroupID uint) string {
+	if bwGroupID == 0 {
+		return "ifb-haweb0" // 独立规则（无包）保留通用设备
+	}
+	return "ifb-hw" + strconv.FormatUint(uint64(bwGroupID), 10)
+}
+
+// ifbDevice 兼容旧常量的默认设备名（历史代码/清理路径引用）。
+const ifbDevice = "ifb-haweb0"
+
+// applyIngressLimit 上传方向每源保底：ingress 按客户端源 IP 分类 → mirred → ifb → htb。
+//
+// 为什么必须走 ingress+ifb：上传包在出口网卡 egress 上源地址已被 SNAT 改成
+// 网关 IP，同一规则下所有客户端不可区分；而入口网卡 ingress 上 src 仍是
+// 客户端真实 IP，是唯一能按源分类的位置。ingress qdisc 本身没有整形能力，
+// 标准做法是 mirred 重定向到 ifb，在 ifb 的 egress 侧挂 htb（含保底+借用）。
+//
+// **ifb 按带宽包隔离**（ifbNameFor）：同一包的多条规则共用一棵树（共享额度），
+// 不同包用不同设备——否则父类 rate 会被后应用的包覆盖，先前包的额度失效。
+//
+// 结构（以带宽包 #3 为例）：
+//
+//	eth0 ingress (ffff:)  u32 match ip src <客户端>/32 action mirred redirect dev ifb-hw3
+//	ifb-hw3 htb 1:        default 100
+//	  class 1:100         rate=ceil=<该包总额>
+//	  class 1:1NN         parent 1:100 rate=<每源保底> ceil=<总额>
+//	  filter u32 match ip dst <客户端>/32 flowid 1:1NN
+//
+// 幂等：qdisc/class/filter 全部 replace。ifb 创建失败时返回错误，调用方降级
+// （只记日志，上传方向退化为仅受 egress 总额约束）。
+func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
+	dev := ifbNameFor(bwID)
+
+	// 1) 确保 ifb 设备存在并 up
+	if _, err := exec.Command("ip", "link", "show", dev).Output(); err != nil {
+		if err := runQuiet("ip", "link", "add", dev, "type", "ifb"); err != nil {
+			return fmt.Errorf("创建 %s 失败（ifb 模块未加载？）: %w", dev, err)
+		}
+		_ = runQuiet("ip", "link", "set", dev, "up", "txqueuelen", "10000")
+	} else {
+		_ = runQuiet("ip", "link", "set", dev, "up")
+	}
+
+	// 2) ingress qdisc（幂等）
+	_ = runQuiet("tc", "qdisc", "add", "dev", s.IfIn, "handle", "ffff:", "ingress")
+
+	// 3) ifb 上的 htb 树（父类 = 该包总额）
+	if out, err := exec.Command("tc", "qdisc", "show", "dev", dev).Output(); err == nil {
+		if !strings.Contains(string(out), "qdisc htb") {
+			_ = runQuiet("tc", "qdisc", "add", "dev", dev, "root",
+				"handle", "1:", "htb", "default", "100")
+		}
+	}
+	totalBits := strconv.FormatInt(s.BWGroupKBps*1024*8, 10)
+	if err := runQuiet("tc", "class", "replace", "dev", dev, "parent", "1:",
+		"classid", bwGroupClassID, "htb",
+		"rate", totalBits, "ceil", totalBits,
+		"burst", "32k", "cburst", "32k"); err != nil {
+		return err
+	}
+	minKB := s.MinKBps
+	if minKB <= 0 {
+		minKB = 1024
+	}
+	if minKB > s.BWGroupKBps {
+		minKB = s.BWGroupKBps
+	}
+	minBits := strconv.FormatInt(minKB*1024*8, 10)
+
+	// 4) 每源：ingress 重定向 + ifb 子类
+	key := dev + "|" + strconv.FormatUint(uint64(s.ID), 10)
+	keep := map[string]bool{}
+	for _, src := range s.AllowSrcs {
+		if src == "" {
+			continue
+		}
+		clsID := srcClassID(src)
+		keep[clsID] = true
+		if err := runQuiet("tc", "class", "replace", "dev", dev,
+			"parent", bwGroupClassID, "classid", clsID, "htb",
+			"rate", minBits, "ceil", totalBits,
+			"burst", "16k", "cburst", "32k"); err != nil {
+			return err
+		}
+		pref := strconv.Itoa(srcFilterPref(src))
+		if err := runQuiet("tc", "filter", "replace", "dev", s.IfIn,
+			"parent", "ffff:", "protocol", "ip", "pref", pref, "u32",
+			"match", "ip", "src", src,
+			"action", "mirred", "egress", "redirect", "dev", dev); err != nil {
+			return err
+		}
+		if err := runQuiet("tc", "filter", "replace", "dev", dev,
+			"parent", "1:", "protocol", "ip", "prio", "10", "u32",
+			"match", "ip", "dst", src, "flowid", clsID); err != nil {
+			return err
+		}
+	}
+	// 清理本规则上次建过、这次不需要的子类（按所有权差集，不盲删）
+	// 调用方已持 tcMu
+	prev := m.tcOwnedClasses[key]
+	m.tcOwnedClasses[key] = keep
+	for clsID := range prev {
+		if keep[clsID] {
+			continue
+		}
+		_ = runQuiet("tc", "class", "del", "dev", dev, "classid", clsID)
+	}
+	return nil
+}
+
+// teardownIngressLimit 拆除上传方向的 ingress 重定向与 ifb 子类。
+// ingress 上按 pref 精确删本规则的 filter；ifb 子类按所有权集合删。
+// ifb 设备与 ingress qdisc 保留（同包多规则共用）。
+func (m *Manager) teardownIngressLimit(s *snatRuleSpec) {
+	m.tcMu.Lock()
+	defer m.tcMu.Unlock()
+	m.teardownIngressLimitLocked(s)
+}
+
+// teardownIngressLimitLocked 无锁版本（调用方已持 tcMu）。
+func (m *Manager) teardownIngressLimitLocked(s *snatRuleSpec) {
+	dev := ifbNameFor(s.bwGroupID)
+	for _, src := range s.AllowSrcs {
+		if src == "" {
+			continue
+		}
+		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "ffff:",
+			"protocol", "ip", "pref", strconv.Itoa(srcFilterPref(src)))
+	}
+	key := dev + "|" + strconv.FormatUint(uint64(s.ID), 10)
+	owned := m.tcOwnedClasses[key]
+	delete(m.tcOwnedClasses, key)
+	for clsID := range owned {
+		_ = runQuiet("tc", "class", "del", "dev", dev, "classid", clsID)
+	}
 }
