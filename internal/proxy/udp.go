@@ -69,6 +69,9 @@ func (m *Manager) applyUDP(rule model.ForwardRule) error {
 	if entry != nil {
 		if old := entry.cfg.Load(); sameListen(old.rule.ListenAddr, rule.ListenAddr) {
 			entry.cfg.Store(cfg)
+			// ACL 收紧后断开不再允许的存量会话（与 TCP 同语义，
+			// 见 applyTCP 里的详细说明）。后台协程：Apply 持 m.mu。
+			go m.closeDeniedSessions(rule.ID, cfg.acl)
 			return nil
 		}
 	}
@@ -207,6 +210,15 @@ func (m *Manager) udpGetOrCreateSession(e *udpEntry, addr *net.UDPAddr, cfg *rul
 		sess:       m.registerSession(cfg, srcIP, srcPort, listenIP, listenPort),
 	}
 	s.sess.cfgPtr = &e.cfg // 热跟随通道（tcpPipeBackend 同源：每包取当前限速器）
+	// 注册强制断开钩子（会话表"掐断"与 ACL 变更共用）。
+	//
+	// UDP 没有"客户端连接"可关（监听 socket 是多会话共享的），但关掉
+	// backend 会让 udpPipeBackend 的 Read 返回错误并走 udpFinishSession
+	// 收尾——这正是会话结束的既有路径，信号量与流量日志都会被正确
+	// 释放/记录。不要在这里直接调 udpFinishSession：会重复释放信号量。
+	s.sess.setCloser(func() {
+		_ = s.backend.Close()
+	})
 	s.touch()
 
 	e.mu.Lock()

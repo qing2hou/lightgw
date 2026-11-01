@@ -64,10 +64,20 @@ func (m *Manager) applyTCP(rule model.ForwardRule) error {
 		}
 		return nil
 	}
-	// 监听地址未变：原子替换配置即可，现有连接不受影响
+	// 监听地址未变：原子替换配置即可，新连接立即用新配置
 	if entry != nil {
 		if old := entry.cfg.Load(); sameListen(old.rule.ListenAddr, rule.ListenAddr) {
 			entry.cfg.Store(cfg)
+			// ACL 收紧后，**存量连接**也要按新名单复核并断开不合规的。
+			//
+			// 为什么必须做：ACL 原本只在 accept 时判定一次，改了白名单
+			// 只影响新连接，正在跑的长传（scp/rsync/备份）会照常传完。
+			// 用户改了白名单期待"立刻没人能连"，实际看到的却是"还在传"
+			// ——安全控制给出错误的安全感比没有控制更危险。
+			// 与"停用规则即断流"（DrainTimeout 排空/强制关闭）同一语义。
+			//
+			// 放后台协程：断开可能涉及大量连接，不能阻塞 Apply（持 m.mu）。
+			go m.closeDeniedSessions(rule.ID, cfg.acl)
 			if healthCheckOn(rule) && m.opts().HealthCheckInterval > 0 {
 				go m.probeBackend(rule.ID, rule) // 目标可能已变，立即探测一次
 			}
@@ -216,6 +226,19 @@ func (m *Manager) handleTCPConn(e *tcpEntry, client net.Conn) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// 注册强制断开钩子（会话表"掐断"与 ACL 变更都要用它）。
+	//
+	// 只按 conntrack -D 删表项断不了端口映射：copyTCP/copyFast 协程
+	// 持有 client 与 backend 两个 socket，删表项后它们照常搬数据，
+	// 内核立刻重建 conntrack 条目——用户看到"掐断了还在传"。
+	// 必须真正 Close。cancel() 负责解除限速等待等可取消的阻塞点，
+	// Close 负责打断 Read/Write（copyFast 的 splice 不响应 ctx）。
+	sess.setCloser(func() {
+		cancel()
+		_ = client.Close()
+		_ = backend.Close()
+	})
 
 	var wg sync.WaitGroup
 	var upErr, downErr error

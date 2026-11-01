@@ -274,7 +274,20 @@ func encodeCTID(c *ctSession) string {
 	return base64.RawURLEncoding.EncodeToString([]byte(raw))
 }
 
-// KillSessionByID 按 ID 掐断（base64 解码回四元组 → conntrack -D）。
+// KillSessionByID 按 ID 掐断一条会话。
+//
+// 会话有两类，掐断手段不同：
+//
+//  1. **端口映射（tcp/udp，用户态转发）**：进程里有一对真实 socket，
+//     conntrack 只是它们在核内的影子。只删 conntrack 表项无效——
+//     copyTCP/copyFast 协程照常搬数据，内核立刻重建条目（实测：掐断后
+//     传输速率不变）。必须按 orig 四元组找到 session 并强制关闭连接。
+//
+//  2. **SNAT 穿越（纯内核转发）**：没有用户态 socket，删 conntrack 表项
+//     即断流，这是原有行为。
+//
+// 实现顺序：先试用户态会话（命中即真断），再回落 conntrack -D。
+// 两类都做，覆盖"用户态会话已结束但 conntrack 表项仍在 TIME_WAIT"的情况。
 func (m *Manager) KillSessionByID(id string) (int, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(id))
 	if err != nil {
@@ -288,11 +301,66 @@ func (m *Manager) KillSessionByID(id string) (int, error) {
 	if proto != "tcp" && proto != "udp" {
 		return 0, fmt.Errorf("会话协议 %q 不支持掐断", proto)
 	}
+
+	killed := 0
+	// ① 用户态会话：按 orig 四元组精确定位并强制断开。
+	//    入向段的 orig 就是「客户端 → 网关监听口」，与 encodeCTID 的编码一致。
+	if sp, err := strconv.Atoi(sport); err == nil {
+		if dp, err := strconv.Atoi(dport); err == nil {
+			if m.killUserSession(proto, src, sp, dst, dp) {
+				killed++
+			}
+		}
+	}
+
+	// ② conntrack 表项（SNAT 会话的唯一手段；端口映射顺带清影子条目）
 	c := &ctSession{proto: proto, origSrc: src, origSPort: sport, origDst: dst, origDPort: dport}
 	if deleteConntrackEntry(&snatRuleSpec{}, c) {
-		return 1, nil
+		if killed == 0 {
+			killed = 1
+		}
 	}
-	return 0, nil
+	return killed, nil
+}
+
+// killUserSession 按入向段四元组找到用户态会话并强制断开，返回是否命中。
+//
+// 匹配键（四个都要相等）：
+//
+//	proto、客户端 IP、客户端端口、监听 IP、监听端口
+//
+// 注意 UDP 会话的 srcIP/srcPort 记录的是**客户端**地址（与 TCP 一致），
+// 所以同一套匹配逻辑对两种协议都成立。
+func (m *Manager) killUserSession(proto, srcIP string, srcPort int, listenIP string, listenPort int) bool {
+	var hit *session
+	m.sessions.Range(func(_, v any) bool {
+		s, ok := v.(*session)
+		if !ok {
+			return true
+		}
+		if s.rule.Protocol != proto {
+			return true
+		}
+		if s.srcIP != srcIP || s.srcPort != srcPort {
+			return true
+		}
+		if s.listenIP != listenIP || s.listenPort != listenPort {
+			return true
+		}
+		hit = s
+		return false // 命中即停
+	})
+	if hit == nil {
+		return false
+	}
+	// forceClose 内部 Close 两个连接；会话的收尾（removeSession / 流量日志）
+	// 由 copy 协程的自然退出路径完成，这里不重复做。
+	if !hit.forceClose() {
+		return false
+	}
+	logf("规则[%s#%d] 会话已掐断: %s %s:%d → %s:%d",
+		hit.rule.Name, hit.rule.ID, proto, srcIP, srcPort, listenIP, listenPort)
+	return true
 }
 
 // isLocalSession 本机自营会话判定（orig/reply 目标侧均落在本机地址上——

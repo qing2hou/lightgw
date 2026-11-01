@@ -611,6 +611,65 @@ type session struct {
 	// （出向段的 src ip 恒为网关本机地址，端口才区分连接）。
 	// 0 表示 dial 尚未完成/失败（UDP 无此概念）。
 	dialLocalPort atomic.Int64
+	// closer 是"强制断开这条会话"的钩子（TCP 中由 handleConn 注册）。
+	//
+	// 为什么需要它：端口映射是用户态转发，conntrack 只是这条连接在
+	// 内核里的影子。删 conntrack 表项断不了进程里的两个 socket——
+	// copyTCP/copyFast 协程照样搬数据，内核立刻重建表项。必须真正
+	// Close 两个连接才能断流。
+	//
+	// 存成钩子而不是存 net.Conn：session 在 UDP 路径也会构造（没有连接
+	// 可关），且这样能让 manager 不持有连接引用的生命周期。
+	closer atomic.Value // func()
+}
+
+// setCloser 注册强制断开钩子（可调用多次，最后一次生效）。
+func (s *session) setCloser(fn func()) { s.closer.Store(fn) }
+
+// forceClose 强制断开这条会话。未注册钩子（UDP/测试构造）时返回 false。
+//
+// 必须幂等：ACL 变更与手动掐断可能同时命中同一条会话。
+func (s *session) forceClose() bool {
+	v := s.closer.Load()
+	if v == nil {
+		return false
+	}
+	if fn, ok := v.(func()); ok && fn != nil {
+		fn()
+		return true
+	}
+	return false
+}
+
+// closeDeniedSessions 按新 ACL 复核某规则的**存量连接**，断开不再允许的。
+//
+// 语义与 accept 时的判定完全一致（同一个 ACL.Allowed），只是作用于已建立的
+// 连接。用于"改白名单后立刻生效"，避免长传会话成为绕过安全控制的通道。
+//
+// 不阻塞调用方：由 Apply 起 goroutine 调用（Apply 持 m.mu，断开可能很慢）。
+func (m *Manager) closeDeniedSessions(ruleID uint, acl *ACL) {
+	if acl == nil || acl.mode == model.AclModeOff {
+		return // 放开限制时不主动断——不能因为"改成不限"就把在跑的流量切了
+	}
+	var victims []*session
+	m.sessions.Range(func(_, v any) bool {
+		s, ok := v.(*session)
+		if !ok || s.rule.ID != ruleID {
+			return true
+		}
+		if !acl.Allowed(parseIPOrZero(s.srcIP)) {
+			victims = append(victims, s)
+		}
+		return true
+	})
+	if len(victims) == 0 {
+		return
+	}
+	for _, s := range victims {
+		// 逐个断开：forceClose 只关连接，会话收尾由 copy 协程自然退出完成
+		s.forceClose()
+	}
+	logf("规则#%d ACL 收紧：已断开 %d 条不再允许的存量连接", ruleID, len(victims))
 }
 
 // touch 更新连接级活动时刻（任一方向收到数据即调用）。
