@@ -16,7 +16,9 @@ const routes = [
       { path: 'rules', name: 'rules', component: () => import('../views/RulesView.vue'), meta: { title: '端口映射' } },
       { path: 'snat-rules', name: 'snat-rules', component: () => import('../views/SnatRulesView.vue'), meta: { title: 'SNAT 穿越' } },
       { path: 'egresses', name: 'egresses', component: () => import('../views/EgressesView.vue'), meta: { title: '出口管理' } },
-      { path: 'dnat-rules', name: 'dnat-rules', component: () => import('../views/DnatRulesView.vue'), meta: { title: '端口发布' } },
+      // 端口发布（dnat）路由已下线。引擎代码保留在 internal/proxy/dnat_nft.go，
+      // 恢复入口时把下面这行与 AdminLayout 菜单项一起加回来即可：
+      // { path: 'dnat-rules', name: 'dnat-rules', component: () => import('../views/DnatRulesView.vue'), meta: { title: '端口发布' } },
       { path: 'fw-policies', name: 'fw-policies', component: () => import('../views/FwPoliciesView.vue'), meta: { title: '防火墙策略' } },
       { path: 'sessions', name: 'sessions', component: () => import('../views/SessionsView.vue'), meta: { title: '会话表' } },
       { path: 'bw-groups', name: 'bw-groups', component: () => import('../views/BWGroupsView.vue'), meta: { title: '带宽包' } },

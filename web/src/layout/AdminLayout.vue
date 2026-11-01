@@ -18,9 +18,9 @@
         <el-menu-item index="/egresses">
           <el-icon><Grid /></el-icon><span>出口管理</span>
         </el-menu-item>
-        <el-menu-item index="/dnat-rules">
-          <el-icon><Upload /></el-icon><span>端口发布</span>
-        </el-menu-item>
+        <!-- 端口发布（dnat）已下线，只保留端口映射（tcp/udp 用户态转发）。
+             引擎代码仍在（internal/proxy/dnat_nft.go），恢复入口时把菜单项与
+             router/index.js 里的 dnat-rules 路由一起加回来即可。 -->
         <el-menu-item index="/fw-policies">
           <el-icon><Lock /></el-icon><span>防火墙策略</span>
         </el-menu-item>
@@ -87,7 +87,7 @@
 <script setup>
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { Odometer, Connection, Document, List, Monitor, Box, Setting, User, ArrowDown, FolderOpened, Position, Histogram, Upload, Lock, Grid } from '@element-plus/icons-vue'
+import { Odometer, Connection, Document, List, Monitor, Box, Setting, User, ArrowDown, FolderOpened, Position, Histogram, Lock, Grid } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()

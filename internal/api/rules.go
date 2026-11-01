@@ -98,9 +98,17 @@ func (in *ruleInput) validate(h *handlers) error {
 	case model.ProtocolSNAT:
 		return h.validateSnat(in)
 	case model.ProtocolDNAT:
-		return h.validateDnat(in)
+		// 端口发布（dnat）已从产品入口下线，只保留端口映射（tcp/udp 用户态转发）。
+		//
+		// 引擎代码仍完整保留（internal/proxy/dnat_nft.go、
+		// internal/proxy/fw/compile_dnat.go），恢复入口时把这段 return 删掉、
+		// 前端菜单项与 router 路由加回来即可。
+		//
+		// 注意：这里拦的是**新建/修改**。存量 dnat 规则不会因此失效，
+		// 仍会按库中 enabled 状态装载——下线时需在管理后台逐条删除。
+		return fmt.Errorf("端口发布（dnat）功能已下线，请改用端口映射（tcp/udp）")
 	default:
-		return fmt.Errorf("协议必须是 tcp / udp / snat / dnat")
+		return fmt.Errorf("协议必须是 tcp / udp / snat")
 	}
 	host, portStr, err := net.SplitHostPort(in.ListenAddr)
 	if err != nil || (host != "" && net.ParseIP(host) == nil) {
@@ -208,6 +216,10 @@ func groupModeName(mode string) string {
 // listen_addr=完整 公网IP:端口（IP 必须归属本机网卡，含一卡多址）；target_addr=完整
 // 内网后端 IP:端口；源名单复用 acl 白名单；dnat_reject_mode 二选一默认 reject；
 // 不允许：dst_* 目标名单（穿越语义）、egress_gw/snat_ip（出口语义）。
+//
+// 【当前不可达】端口发布（dnat）已从产品入口下线，validate() 的
+// ProtocolDNAT 分支直接返回「功能已下线」，不再调用本函数。
+// 保留它是为了恢复入口时一行即可启用（见 validate 里的注释）。
 func (h *handlers) validateDnat(in *ruleInput) error {
 	if strings.TrimSpace(in.DstAclMode) != "" && in.DstAclMode != model.AclModeOff ||
 		strings.TrimSpace(in.DstAllowList) != "" || strings.TrimSpace(in.DstDenyList) != "" {
