@@ -23,5 +23,13 @@ config.local.yaml
 
 # TLS 运行时凭据（自签证书/私钥，绝不入库）
 /tls/
+
+# 发布包（构建产物，任何命名都不入库）
 lightgw-deploy-*.tar.gz
 lightgw-deploy-*.tar.gz.sha256
+lightgw-fwgateway-*.tar.gz
+lightgw-fwgateway-*.tar.gz.sha256
+
+# 仓库根有个叫 poc 的可执行文件（4.3MB ELF），不是目录；PoC 脚本一律放 /tmp/poc-*/
+# 注意：cmd/poc/ 是源码（要入库），只有根目录这个编译产物除外
+/poc
