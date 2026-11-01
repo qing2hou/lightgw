@@ -555,6 +555,80 @@ default 0xfa(250) → 叶子 1:250，fq_codel 挂 1:250
 | `TestSrcClassIDAvoidsReservedIDs` | 4000 个源地址穷举，不得产出 1:30 / 1:100 / 1:250 |
 | `TestSrcClassIDStable` | 同源恒同 class ID（幂等拆除依赖） |
 
+#### 3.7.5 修复后生产复验（2026-11-01，部署 commit `371903a`）
+
+**现场形态（全部正确）**：
+
+```
+$ tc qdisc show dev ifb-hw1
+qdisc htb 1: root refcnt 2 r2q 10 default 0x250 direct_packets_stat 0 direct_qlen 10000
+qdisc fq_codel 250: parent 1:250 limit 10240p flows 1024 ...   ← 首次真正挂上
+
+$ tc qdisc show dev eth0
+qdisc htb 1: root refcnt 2 r2q 10 default 0x250 direct_packets_stat 0 direct_qlen 1000
+qdisc fq_codel 250: parent 1:250 ...
+
+$ tc class show dev ifb-hw1
+1:100 root ...                           ← 总额父类
+1:167 parent 1:100 rate 8388Kbit ...     ← 新号段（旧版是 1:205/1:222）
+1:105 parent 1:100 rate 8388Kbit ...
+1:250 root ...                           ← 叶子兜底
+
+$ tc filter show dev ifb-hw1 parent 1:
+pref 1703 ... match c0a80a97/ffffffff at 12 *flowid 1:167
+pref 1704 ... match c0a80a98/ffffffff at 12 *flowid 1:105
+```
+
+规则数 8 → 8，nft 表仍是 `inet haweb` / `ip nat` / `ip filter` 三张。
+
+**单源复测**：
+
+```
+SEND rate=7.9180 MB/s
+RECV rate=7.6522 MB/s bytes=80285344 dur=10.006s peer=192.168.10.170
+```
+
+| 项 | 值 |
+|---|---|
+| **配置** | 8.0000 MB/s |
+| **实测** | **7.6522 MB/s** |
+| **误差** | **−4.35%** |
+
+与修复前（7.6548 / −4.32%）一致——结构改动不影响正常路径。
+
+**双源并发复测**：
+
+```
+A(192.168.10.151) RECV 3.8250 MB/s
+B(192.168.10.152) RECV 3.8398 MB/s
+                  合计 7.6648 MB/s
+```
+
+| 项 | 值 |
+|---|---|
+| **配置总额** | 8.0000 MB/s |
+| **实测合计** | **7.6648 MB/s** |
+| **误差** | **−4.19%** |
+| `direct_packets_stat` | **0**（零漏网） |
+| `1:250` 叶子 Sent | **0**（无流量落兜底，全部命中分类） |
+
+tc 计数自洽：`1:167` 439 pkt + `1:105` 396 pkt = **835** = 父类 `1:100` 835 pkt。
+
+#### 3.7.6 fail-open 闭合验证（生产树形态，故意删掉分类 filter）
+
+复刻生产修复后的树（`default 250` + 叶子 1:250 + fq_codel + 每源子类 1:167），
+在 netns 内对比"filter 存在"与"filter 被删"两种状态：
+
+| 场景 | 实测接收 | `1:167` Sent | `1:250` Sent | `direct` |
+|---|---|---|---|---|
+| ① 分类 filter 存在（正常） | 7.6647 MB/s | 51,803,744 | 70 | 0 |
+| ② 分类 filter 被删（故障） | **7.6542 MB/s** | 51,803,744（未增长） | **51,255,704** | **0** |
+
+对比 §3.7 B 组（**修复前**同一故障场景）：2575.3739 MB/s、`direct` 270363。
+
+**同样的故障输入，修复前 38.9 倍超速，修复后 −4.3% 精确限速、零 direct 漏网。**
+这是本次结构修复的核心价值——不是"正常时更快/更慢"，而是**故障时的行为从 fail-open 变成 fail-closed**。
+
 ---
 
 ## 4. 任务 B · `MinKBps` 到底是不是「保底」
