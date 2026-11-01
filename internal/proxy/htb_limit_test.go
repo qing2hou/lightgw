@@ -8,25 +8,33 @@ import (
 
 // TestHTBLimitStructure 限速结构的硬约束（本环境实测得出，改动前必读）。
 //
-// 背景：170 生产机（virtio + Linux 6.8）上，所有按源分类的 tc 通路都失效：
-//   - cls_u32 完全不参与分类（class Sent 恒 0，限速类压到 1Kbit 仍满速）
-//   - cls_fw 只匹配 mark 完整值且 handle 仅奇数有效（1/3/5/9/31 命中，
-//     2/16/32/50/100 失配），mark 带额外位也失配
-//   - cls_flower 不支持 skb mark
+// ⚠️ 订正（2026-10-30 真机 + 2026-11-01 生产复验）：本测试原先写着
+// 「cls_u32 完全不参与分类」「每源硬保底不生效」——**已被证伪**。
+// `u32` 在 192.168.10.170（KVM + virtio + Linux 6.8）实测可用：
+// 下载 `match ip dst` 跑 8.006507MB/s（配置 8MB/s，误差 +0.08%），
+// 上传 `match ip src` 跑 7.6548MB/s（配置 8MB/s，误差 −4.32%）。
+// 当年「u32 不参与分类」的观感，真因是上传 filter 写成了 `match ip dst`。
 //
-// 且上传包在 egress 上源地址已被 SNAT 改写，按 saddr 分类本就不可行。
-//
-// 因此限速必须是"扁平结构 + default 直连限速类 + fq_codel 流公平"。
-// 每源硬保底（MinKBps）当前不生效，仅保留配置项。
+// 必须保持的结构（每条都有实测反证，见 snat_htb_structure_test.go）：
+//   - 父类 1:100 承载总额（rate=ceil=BWGroupKBps）
+//   - 每源保底子类 parent 1:100，rate=MinKBps、ceil=总额
+//   - 叶子兜底类 1:250 是 `htb default` 的目标（**不能**是 1:100）
+//   - fq_codel 只挂叶子 1:250（挂内层会被内核拒绝）
 func TestHTBLimitStructure(t *testing.T) {
 	if bwGroupClassID != "1:100" {
-		t.Fatalf("限速类 ID 应为 1:100，实际 %s", bwGroupClassID)
+		t.Fatalf("限额父类 ID 应为 1:100，实际 %s", bwGroupClassID)
 	}
-	// 子类 ID 区段（历史清理范围 1:2..1:249）不得与限速类/占位类冲突
+	if leafClassID != "1:250" {
+		t.Fatalf("叶子兜底类 ID 应为 1:250，实际 %s", leafClassID)
+	}
+	if leafClassIDNum != 250 {
+		t.Fatalf("leafClassIDNum 应为 250，实际 %d", leafClassIDNum)
+	}
+	// 子类 ID 不得与保留类冲突（1:30 全速占位 / 1:100 总额父类 / 1:250 叶子兜底）
 	for _, src := range []string{"192.168.10.152", "10.0.0.0/8"} {
 		id := srcClassID(src)
-		if id == bwGroupClassID || id == "1:30" {
-			t.Fatalf("源 %s 的类 ID %s 与保留 class 冲突", src, id)
+		if why, bad := reservedClassIDs[id]; bad {
+			t.Fatalf("源 %s 的类 ID %s 与保留 class 冲突（%s）", src, id, why)
 		}
 	}
 }

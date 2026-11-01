@@ -349,9 +349,211 @@ LEND  1:208  lended=1346     borrowed=4090
 
 **任务 A 结论：修复有效，但必须同时做三件事，缺一不可**：
 
-1. ifb 侧分类 filter 用 `match ip src`（现码 `snat.go:1848` 仍写 `dst` —— **缺陷仍在工作区代码里**）
+1. ifb 侧分类 filter 用 `match ip src`
 2. `default` 必须指向 **叶子** 类（不能指向挂了子类的内层 `1:100`）
-3. `default` 指向的那个叶子类和每个每源叶子类都**必须挂 fq_codel**（内层类挂不上）
+3. `default` 指向的那个叶子类**必须挂 fq_codel**（内层类挂不上）
+
+### 3.6 生产落地复验（2026-11-01，192.168.10.170）
+
+第 1 项修复（`a6ae2a6`）已部署到生产机，本节是落地后的实测。
+
+**设备名澄清**：新代码 `ifbNameFor(bwGroupID)` 按带宽包隔离产出 `ifb-hw1`（包 #1），
+旧代码遗留的 `ifb-haweb` / `ifb-hw1` 之外的设备是历史残留。首次复验我查错了设备
+（查 `ifb-haweb`），误判"修复未生效"；实际正确设备是 `ifb-hw1`。
+
+#### 3.6.1 现场 tc 形态（修复生效的直接证据）
+
+```
+$ tc filter show dev eth0 parent ffff:
+filter protocol ip pref 703 u32 chain 0
+  match c0a80a97/ffffffff at 12            ← at 12 = src 偏移（正确）
+	action order 1: mirred (Egress Redirect to device ifb-hw1) stolen
+filter protocol ip pref 704 u32 chain 0
+  match c0a80a98/ffffffff at 12
+	action order 1: mirred (Egress Redirect to device ifb-hw1) stolen
+
+$ tc filter show dev ifb-hw1 parent 1:
+filter protocol ip pref 1703 u32 chain 0 fh 801::800 *flowid 1:205
+  match c0a80a97/ffffffff at 12            ← at 12 = src（正确）；pref 1703 在 1002..1998 上传段
+filter protocol ip pref 1704 u32 chain 0 fh 800::800 *flowid 1:222
+  match c0a80a98/ffffffff at 12            ← pref 1704
+
+$ tc -s class show dev ifb-hw1
+class htb 1:100 root rate 67108Kbit ceil 67108Kbit      ← 8192KB/s 总额
+class htb 1:222 parent 1:100 rate 8388Kbit ceil 67108Kbit ← 1024KB/s 保底
+class htb 1:205 parent 1:100 rate 8388Kbit ceil 67108Kbit
+```
+
+三处都对：`at 12`（src）、`pref` 1703/1704（上传段）、父类 67108Kbit=8192×1024×8。
+
+#### 3.6.2 单源实测（`192.168.10.152` → `172.16.30.10:9098`，10 秒）
+
+```
+配置: 带宽包总额 8192KB/s = 67.109 Mbit/s (8.00 MB/s)
+      每源保底 1024KB/s = 1.000 MB/s
+
+SEND rate=7.9229 MB/s bytes=83099648 dur=10.003s
+RECV rate=7.6548 MB/s bytes=80285232 dur=10.002s peer=192.168.10.170
+```
+
+| 项 | 值 |
+|---|---|
+| **配置** | 8.0000 MB/s |
+| **实测（靶子接收端）** | **7.6548 MB/s** |
+| **误差** | **−4.32%** |
+| 实测（客户端发送侧） | 7.9229 MB/s（−0.96%） |
+| 修复前（同机同配置） | 112.2485 MB/s（**+1303.1%，超 14.03 倍**） |
+| 收敛比 | 14.7× |
+
+**三重计数互证**（铁律 3 要求不只信速率）：
+
+```
+基线 → 并发后
+1:222  1875 B / 22 pkt  →  86890006 B / 346 pkt   (+86,888,131 B)
+1:205  3329 B / 19 pkt  →      3599 B / 22 pkt   (未承载本次流量)
+direct_packets_stat  6  →  6                      (零漏网)
+overlimits           0  →  10299                  (整形器确实在掐流)
+eth0 ingress pref 704 Sent +83,389,790 B / 346 pkt
+```
+
+`direct_packets_stat` 不变是关键：它统计"未命中任何分类、走 direct 绕过 HTB"的包。
+本次 346 个包全部进 `1:222`，一个都没漏。
+
+#### 3.6.3 双源并发（`.151` 与 `.152` 同时推 12 秒）
+
+```
+A(192.168.10.151) SEND 4.1911 MB/s  →  RECV 3.9540 MB/s
+B(192.168.10.152) SEND 4.0488 MB/s  →  RECV 3.8860 MB/s
+                  合计 RECV 7.8400 MB/s
+```
+
+| 项 | 值 |
+|---|---|
+| **配置总额** | 8.0000 MB/s |
+| **实测合计** | **7.8400 MB/s** |
+| **误差** | **−2.00%** |
+| 每源保底 | 1.000 MB/s，实测 3.95 / 3.89（各 3.9× 保底，未触底） |
+| 约束校验 | `Σ MinKBps` = 1024×2 = 2048 ≤ 8192 总额 ✅（满足 ADR-15 约束式语义） |
+
+tc 计数：`1:222` +53,428,374 B（634-356=278 pkt）、`1:205` +55,367,400 B（392-22=370 pkt），
+合计 +108,795,774 B ≈ 接收端 104,071,168 B（差额为 TCP/IP 头与重传）。
+
+**结论**：两源各约 3.9MB/s，合计收敛于 8.00 总额，不是 2×8=16。总额硬上限成立，
+每源保底成立（两源均远超 1MB/s 保底，因为总额有富余时允许借用）。
+
+### 3.7 复验中发现的新缺陷：`default` 指向"有子类的类"会完全绕过 HTB
+
+§3.6.1 的现场形态里有一处**看着对、实则 fail-open** 的配置：
+
+```
+$ tc qdisc show dev ifb-hw1
+qdisc htb 1: root ... default 0x100 ...            ← 指向 1:100
+$ tc class show dev ifb-hw1
+class htb 1:100 root ...                            ← 1:100 自己挂着子类 1:222 / 1:205
+class htb 1:222 parent 1:100 ...
+```
+
+生产环境所有包都命中了分类 filter，`default` 从未被走到，所以今天没爆。
+但只要某个源的 filter 建失败 / pref 被覆盖 / 源不在白名单，流量就落 `default`
+→ 无限速。用 netns 隔离把机制钉死（业务表全程 8 条规则未动）：
+
+| 组 | `default` 目标 | 该目标自身有子类 | 实测接收 | `direct_packets_stat` 增量 | 判定 |
+|---|---|---|---|---|---|
+| A | `1:100` | **无** | 7.6567 MB/s | 0 | 受限 ✅ |
+| B | `1:100` | **有**（1:222） | **2575.3739 MB/s** | 270363（= 总包数） | **完全绕过** ❌ |
+| C | `1:250`（叶子） | 无 | 7.6560 MB/s | 0 | 受限 ✅ |
+
+**机制**：判据是「`default` 目标**自身**有没有子类」，不是"内层还是外层"。
+
+- A 组说明：`default` 指向 1:100 **本身不构成问题**（1:100 无子类时正常整形）
+- B 组说明：同一个 1:100 一旦挂上子类，`default` 指它就让包走 `direct` 路径
+- 协议头注（AGENTS.md 硬约束 2）的表述「`default` 必须指向叶子类」结论正确，
+  但归因写成"内层类不能挂"不够精确——真实触发条件是**目标类有子类**
+
+B 组 `1:222 Sent=0` 且 `1:100 Sent=0`，而 `direct_packets_stat` 精确等于总包数
+（270363），说明一个包都没进 HTB。
+
+#### 3.7.1 同源的另外两个缺陷（一并修掉）
+
+**(1) `fq_codel` 从来没挂上过**
+
+老代码 `applyHTBLimit` 里：
+
+```go
+_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "parent", bwGroupClassID,
+    "handle", "100:", "fq_codel")     // parent = 1:100
+```
+
+生产机实测该命令被内核拒绝：
+
+```
+$ tc qdisc add dev ifb-hw1 parent 1:100 handle 999: fq_codel
+RTNETLINK answers: Invalid argument
+```
+
+`_ =` 把错误吞了，表现为"日志无异常、fq_codel 从未存在"。现场两个设备
+（`eth0`、`ifb-hw1`）上 `tc qdisc show | grep -c fq_codel` 都是 **0**。
+netns 补充验证：1:100 **无子类时**挂 fq_codel 成功；**有子类时**报 `Invalid argument`
+——与 `default` 的同一条内核规则（内层类不能作为叶子 qdisc 的父）。
+
+**(2) `srcClassID` 会产出 `1:100`（覆盖总额父类）**
+
+```go
+return fmt.Sprintf("1:%d", 1+h%248)   // 产出 1:1..1:248，包含 1:100
+```
+
+源哈希到 100 时执行 `tc class replace classid 1:100 rate=<MinKBps>`，
+把带宽包**总额父类**替换成该源的保底子类——整包总额静默消失
+（8192KB/s → 1024KB/s），且 `parent 1:100` 的每源子类全部挂到错误层级。
+
+#### 3.7.2 附带修掉的幂等判定错误
+
+```go
+// 老代码
+want := fmt.Sprintf("default 0x%x", leafClassIDNum)   // 250 → "0xfa"
+```
+
+内核实际打印（生产机实测，`default 250` 与 `default 0x250` 两种写法输出一致）：
+
+```
+qdisc htb 1: root refcnt 2 r2q 10 default 0x250 direct_packets_stat 0 ...
+```
+
+`0xfa` ≠ `0x250` → 幂等判定永远失败 → 每个 apply 周期都 `qdisc del` + `qdisc add` 重建，
+重建瞬间无 qdisc（流量无限速）。改为固定 token `"default 0x250"` 并加测试锁死。
+
+#### 3.7.3 修复后结构（netns 验证）
+
+```
+default 0xfa(250) → 叶子 1:250，fq_codel 挂 1:250
+
+########## 修复前形态：default 0x100，fq_codel 挂内层 ##########
+  fq_codel 挂 1:100: OK           ← 1:100 无子类时能挂上
+  recv: rate=7.6574 MB/s
+  direct_packets_stat 0
+  1:100   Sent=51529724
+
+########## 修复后形态：default 0xfa(250)，fq_codel 挂叶子 ##########
+  fq_codel 挂 1:250: OK
+  recv: rate=7.6545 MB/s
+  direct_packets_stat 0
+  1:100   Sent=0                  ← 总额父类不再直接承载（正确：流量经子类）
+  1:250   Sent=50981544
+```
+
+两形态速率一致（都受限），差别在**故障时**：修复后任何未分类流量落 1:250 仍受限；
+修复前落一个有子类的 1:100 会直接绕过（B 组 2575 MB/s）。
+
+#### 3.7.4 回归测试（新增 6 个，全部绿）
+
+| 测试 | 锁住的约束 |
+|---|---|
+| `TestHTBDefaultPointsToLeafClass_Constraint2` | `default` 不得为目标为 `100`/`199`/`30` 的写法 |
+| `TestFqCodelOnlyOnLeafClass_Constraint3` | `fq_codel` 的 parent 不得是 `bwGroupClassID` |
+| `TestHTBDefaultTokenMatchesKernel` | 幂等 token 必须能在内核实际输出里匹配到 |
+| `TestLeafClassIDConsistentWithToken` | `leafClassID` / `leafClassIDNum` / token 三者同源 |
+| `TestSrcClassIDAvoidsReservedIDs` | 4000 个源地址穷举，不得产出 1:30 / 1:100 / 1:250 |
+| `TestSrcClassIDStable` | 同源恒同 class ID（幂等拆除依赖） |
 
 ---
 

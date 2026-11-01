@@ -786,15 +786,28 @@ func snatIDsFromSave(save string) map[uint]bool {
 // 意味着下线规则的 class/孤儿 ingress 会留存；重启对账清根。
 func (m *Manager) ReconcileSnatTC() {
 	ifaces := map[string]bool{}
+	bwIDs := map[uint]bool{}
 	var rules []model.ForwardRule
 	m.db.Where("protocol = ? AND enabled = ?", "snat", true).Find(&rules)
 	for _, r := range rules {
 		ifaces[r.ListenAddr] = true
+		if r.BWGroupID > 0 {
+			bwIDs[r.BWGroupID] = true
+		}
 	}
 	for ifn := range ifaces {
 		_ = runQuiet("tc", "qdisc", "del", "dev", ifn, "ingress")
 		_ = runQuiet("tc", "qdisc", "del", "dev", ifn, "root")
 	}
+	// **ifb 也必须清**：上传方向的每源子类建在 ifb 上，不在 s.IfIn(eth0) 上。
+	// 早期只清 IfIn 的 root/ingress，ifb 上的历史子类重启也不消失——一旦
+	// srcClassID 的号段分配规则变化（如新增保留号），旧号子类就成了永久孤儿，
+	// 既占槽位又可能把新子类的流量截走。
+	for bwID := range bwIDs {
+		_ = runQuiet("tc", "qdisc", "del", "dev", ifbNameFor(bwID), "root")
+	}
+	// 兜底：历史上无包规则用过通用 ifb（ifb-haweb0）
+	_ = runQuiet("tc", "qdisc", "del", "dev", ifbDevice, "root")
 }
 
 // PurgeOrphanSnatRules 启动对账：iptables 里带 haweb-sn: 标记但 DB 中不存在对应
@@ -938,11 +951,31 @@ func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 		"burst", "32k", "cburst", "32k"); err != nil {
 		return err
 	}
-	// fq_codel 挂在父类下（幂等）
+	// 叶子兜底类：`htb default` 指向它（AGENTS.md 硬约束 2）。
+	//
+	// 必须存在且**无子类**——default 指向不存在的类时所有未分类包被内核
+	// 直接丢弃或绕过整形（实测两种表现都出现过）。
+	// rate 给总额：它是"未分类流量"的整形入口，不该比总额更严；
+	// 需要更严时由分类 filter 把流量导到各自的保底子类。
+	if err := runQuiet("tc", "class", "replace", "dev", ifn, "parent", "1:",
+		"classid", leafClassID, "htb",
+		"rate", totalBits, "ceil", totalBits,
+		"burst", "16k", "cburst", "32k"); err != nil {
+		return err
+	}
+	// fq_codel 只能挂**叶子类**（AGENTS.md 硬约束 3）。
+	//
+	// 挂内层 1:100 时内核直接拒绝：`RTNETLINK answers: Invalid argument`
+	// （生产机 192.168.10.170 已实测）。历史代码用 `_ = runQuiet(...)` 吞掉了
+	// 这个错误，表现为"日志无异常、但 fq_codel 从来没挂上"。
+	// 这里保留错误上报：挂不上说明内核行为与预期不符，必须可见。
 	if out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output(); err == nil {
-		if !strings.Contains(string(out), "qdisc fq_codel 100:") {
-			_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "parent", bwGroupClassID,
-				"handle", "100:", "fq_codel")
+		if !strings.Contains(string(out), "qdisc fq_codel 250:") {
+			if err := runQuiet("tc", "qdisc", "add", "dev", ifn, "parent", leafClassID,
+				"handle", "250:", "fq_codel"); err != nil {
+				logf("[snat] %s 叶子类 %s 挂 fq_codel 失败（不影响限速，仅失去流级公平）: %v",
+					ifn, leafClassID, err)
+			}
 		}
 	}
 	// 每源保底子类 + 下载方向分类
@@ -1001,8 +1034,21 @@ func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 	return nil
 }
 
-// srcClassID 源 IP -> 稳定 class ID（1:2..1:250）。限速绑定"源"而非规则：
-// 同一源 IP 出现在多条规则时共享同一 member class（无论走哪条规则/端口）。
+// srcClassID 源 IP -> 稳定 class ID。
+//
+// 限速绑定"源"而非规则：同一源 IP 出现在多条规则时共享同一 member class
+// （无论走哪条规则/端口）。
+//
+// 保留号段（**绝不能产出**，否则子类会覆盖/继承保留类的语义）：
+//
+//	1:30    历史全速占位类（ensureEgressHTB 已删除，保留号防历史子类冲突）
+//	1:100   bwGroupClassID 带宽包总额父类
+//	1:250   leafClassID 叶子兜底类（default 目标）
+//
+// 早期版本用 `1+h%248` 产出 1:1..1:248，**包含 1:100**——源哈希到 1:100 时
+// `tc class replace classid 1:100` 会把带宽包总额父类替换成该源的保底子类，
+// 整包总额失效（父类 rate 变成 MinKBps）。区间因此改为 1:1..1:99 与
+// 1:101..1:249 两段，跳过三个保留号。
 func srcClassID(src string) string {
 	// 用 FNV-1a（32 位）而非字节求和：求和碰撞极易发生（"1.2.3" 与 "2.1.3"
 	// 字节和相同），多规则同网卡部署下碰撞会让两条规则的源共用同一子类，
@@ -1016,7 +1062,20 @@ func srcClassID(src string) string {
 		h ^= uint32(src[i])
 		h *= prime32
 	}
-	return fmt.Sprintf("1:%d", 1+h%248)
+	// 保留号：30（全速占位）、100（总额父类）、250（叶子兜底）。
+	// 把 1..247 双射到可用号段：
+	//	1..29   → 1..29    （29 个）
+	//	30..98  → 31..99   （69 个，+1 跳过 30）
+	//	99..247 → 101..249 （149 个，+2 跳过 100）
+	// 合计 247 个槽，且永不产出 30 / 100 / 250。
+	n := 1 + int(h%247) // 1..247
+	switch {
+	case n >= 99:
+		n += 2
+	case n >= 30:
+		n++
+	}
+	return fmt.Sprintf("1:%d", n)
 }
 
 // srcFilterPref 下载方向 filter pref（2..998；pref 1 固定保留）。
@@ -1043,42 +1102,72 @@ func uploadFilterPref(src string) int {
 	return 1002 + sum%997
 }
 
-// ensureHTB 保证指定网卡 root 是 htb，且 default 指向限速类 1:100。
+// htbDefaultToken 返回 `tc qdisc show` 里 default 的打印形态，用于幂等判定。
 //
-// default 必须是限速类：本环境没有可用的分类器（见 applyHTBLimit 注释），
-// 唯一可靠的限速路径就是让包默认进限速类。`tc qdisc change ... default N`
-// 在本内核返回 "Change operation not supported"，default 不匹配时只能重建。
+// tc 把 htb 的 default 类号按 **classid 的 full minor 段**打印成十六进制：
+// `default 250` 显示为 `default 0x250`（**不是** 0xfa，也不是 0x0fa）。
+// 实测（生产机 192.168.10.170，Linux 6.8，`tc qdisc add ... default 250` 与
+// `default 0x250` 两种写法输出完全一致）。
+//
+// 写成辅助函数是防止再按直觉写 `0x%x` → 0xfa：那样幂等判定永远失败，
+// 每个 apply 周期都重建 qdisc，重建瞬间无 qdisc → 短暂无限速。
+func htbDefaultToken() string {
+	return "default 0x250"
+}
+
+// ensureHTB 保证指定网卡 root 是 htb，且 default 指向**叶子兜底类** 1:250。
+//
+// 为什么 default 必须是"自身没有子类"的叶子类（AGENTS.md 硬约束 2）：
+// 内核的做法是——若 default 指向的类**自身挂着子类**，则不把包下派到任何类，
+// 包直接走 `direct` 路径**完全绕过 HTB**（既不整形也不计数）。
+// netns 三组对照（Linux 6.18，每项都有 direct_packets_stat 佐证）：
+//
+//	A default→1:100，1:100 无子类：7.6567 MB/s，direct=0          → 受限 ✓
+//	B default→1:100，1:100 有子类：2575.3739 MB/s，direct=270363 → 绕过 ✗
+//	C default→1:250 叶子无子类：   7.6560 MB/s，direct=0          → 受限 ✓
+//
+// 所以判据是「default 目标自身有无子类」，不是"内层还是外层"。
+// 生产事故形态正是 B：`default 0x100` 且 1:100 挂着每源子类。
+//
+// `tc qdisc change ... default N` 在本内核返回 "Change operation not supported"，
+// default 不匹配时只能重建 qdisc。
 func (s *snatRuleSpec) ensureHTB(ifn string) {
-	out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output()
-	if err == nil {
+	if out, err := exec.Command("tc", "qdisc", "show", "dev", ifn).Output(); err == nil {
 		info := string(out)
-		// default 0x64 == 100（限速类）
-		if strings.Contains(info, "qdisc htb") && strings.Contains(info, "default 0x64") {
+		if strings.Contains(info, "qdisc htb") && strings.Contains(info, htbDefaultToken()) {
 			return
 		}
 	}
 	_ = runQuiet("tc", "qdisc", "del", "dev", ifn, "root")
-	_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "root", "handle", "1:", "htb", "default", "100")
-	_ = runQuiet("tc", "class", "add", "dev", ifn, "parent", "1:", "classid", "1:30",
-		"htb", "rate", "10gbit")
+	_ = runQuiet("tc", "qdisc", "add", "dev", ifn, "root", "handle", "1:", "htb",
+		"default", strconv.Itoa(leafClassIDNum))
 }
 
 // bwGroupClassID 带宽包共享 class（htb 下挂；所有包成员的 filter 都导入这里——共享额度）。
 // 独立规则 class 固定 1:10；default 1:30 全速。
 const bwGroupClassID = "1:100"
 
-// ensureEgressHTB 保证入口网卡 root 是 htb（含 default 全速 class）。
-// 已是 htb 则幂等跳过；否则替换（fq_codel 等）。
-func (s *snatRuleSpec) ensureEgressHTB() {
-	out, err := exec.Command("tc", "qdisc", "show", "dev", s.IfIn).Output()
-	if err == nil && strings.Contains(string(out), "qdisc htb") {
-		return
-	}
-	_ = runQuiet("tc", "qdisc", "del", "dev", s.IfIn, "root")
-	_ = runQuiet("tc", "qdisc", "add", "dev", s.IfIn, "root", "handle", "1:", "htb", "default", "30")
-	_ = runQuiet("tc", "class", "add", "dev", s.IfIn, "parent", "1:", "classid", "1:30",
-		"htb", "rate", "10gbit")
-}
+// leafClassID 是挂 `htb default` 的**叶子兜底类**（AGENTS.md 硬约束 2）。
+//
+// 为什么必须是**叶子**：`default` 指向挂了子类的内层类（如 1:100）时，
+// 内核不把包下派到任何子类，而是让包**完全绕过 HTB**——既不被限速，
+// 也不计入任何子类计数。真机实测（Linux 6.8 + virtio，netns 隔离）：
+//
+//	default → 1:100（内层）：2057.4724 MB/s，direct_packets_stat 276733
+//	                          （= 总包数，一个包都没进 HTB），子类 Sent 全 0
+//	default → 叶子类：         7.6559 MB/s，direct_packets_stat 0，
+//	                          包全部落兜底叶子
+//
+// `fq_codel` 也只能挂叶子类：挂内层 1:100 时内核直接
+// `RTNETLINK answers: Invalid argument`（生产机上已实测复现）。
+//
+// 取值 1:250 —— 必须避开 srcClassID 的产出区间（1:1..1:248，见该函数），
+// 否则某个源哈希到兜底类时会继承兜底语义、把保底额度算错。
+// bwGroupClassID(1:100) 与历史的 1:30（全速占位）也不可用。
+const leafClassID = "1:250"
+
+// leafClassIDNum 是 leafClassID 的十进制数（`tc qdisc add default N` 用）。
+const leafClassIDNum = 250
 
 // ipCidrToU32 IP/CIDR -> u32 matcher 的 (hex, mask)；at 16 = IP 头 daddr 偏移。
 // 网段（如 172.16.41.0/24）必须带掩码（0xffffff00）——精确掩码 0xffffffff 会只匹配
@@ -1105,7 +1194,7 @@ func ipCidrToU32(s string) (hex, mask string, ok bool) {
 //     qdisc 本身保留（其他规则可能仍在用）；无主共享时残留无功能影响（可被对账清）
 //   - 出向：删本规则 filter（pref 1 的 flowid 1:10/1:100）；root htb 与 class 保留
 //     （同卡其他规则的限速/包共享依赖它）。规则全下线后 root 残留只是空 htb（全速 default
-//     1:30 承载一切）——由 ensureEgressHTB 幂等复用，不影响转发
+//     历史 1:30 承载一切）——不影响转发
 //
 // per-网卡共享结构的生命周期（root/class）随本机全部 snat 规则退化；
 // 不做显式删除（空 htb 无行为差异，避免"拆 A 时把 B 拆掉"的互踩——评审必修2）。
@@ -1798,11 +1887,19 @@ func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
 	// 2) ingress qdisc（幂等）
 	_ = runQuiet("tc", "qdisc", "add", "dev", s.IfIn, "handle", "ffff:", "ingress")
 
-	// 3) ifb 上的 htb 树（父类 = 该包总额）
+	// 3) ifb 上的 htb 树（父类 = 该包总额，default = 叶子兜底类）
+	//
+	// default 必须指向叶子类 1:250（AGENTS.md 硬约束 2）。指向内层 1:100 时
+	// 上传包会完全绕过 HTB——这正是 D-16 事故的第二层：即便 filter 方向改对了，
+	// 只要 filter 没命中（例如某源 pref 被覆盖），流量就无限速。
+	// netns 实测：default→内层 2057.4724 MB/s（超 257 倍），default→叶子 7.6559 MB/s。
+	want := htbDefaultToken()
 	if out, err := exec.Command("tc", "qdisc", "show", "dev", dev).Output(); err == nil {
-		if !strings.Contains(string(out), "qdisc htb") {
+		info := string(out)
+		if !strings.Contains(info, "qdisc htb") || !strings.Contains(info, want) {
+			_ = runQuiet("tc", "qdisc", "del", "dev", dev, "root")
 			_ = runQuiet("tc", "qdisc", "add", "dev", dev, "root",
-				"handle", "1:", "htb", "default", "100")
+				"handle", "1:", "htb", "default", strconv.Itoa(leafClassIDNum))
 		}
 	}
 	totalBits := strconv.FormatInt(s.BWGroupKBps*1024*8, 10)
@@ -1811,6 +1908,22 @@ func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
 		"rate", totalBits, "ceil", totalBits,
 		"burst", "32k", "cburst", "32k"); err != nil {
 		return err
+	}
+	// 叶子兜底类（default 目标必须存在，且必须无子类）
+	if err := runQuiet("tc", "class", "replace", "dev", dev, "parent", "1:",
+		"classid", leafClassID, "htb",
+		"rate", totalBits, "ceil", totalBits,
+		"burst", "16k", "cburst", "32k"); err != nil {
+		return err
+	}
+	// fq_codel 挂叶子类（硬约束 3：挂内层会 RTNETLINK Invalid argument）
+	if out, err := exec.Command("tc", "qdisc", "show", "dev", dev).Output(); err == nil {
+		if !strings.Contains(string(out), "qdisc fq_codel 250:") {
+			if err := runQuiet("tc", "qdisc", "add", "dev", dev, "parent", leafClassID,
+				"handle", "250:", "fq_codel"); err != nil {
+				logf("[snat] %s 叶子类挂 fq_codel 失败（不影响限速）: %v", dev, err)
+			}
+		}
 	}
 	minKB := s.MinKBps
 	if minKB <= 0 {
