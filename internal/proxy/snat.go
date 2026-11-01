@@ -1843,9 +1843,23 @@ func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
 			"action", "mirred", "egress", "redirect", "dev", dev); err != nil {
 			return err
 		}
+		// ★ ifb 侧分类必须 match ip src（D-16）。
+		//
+		// 上传包经 mirred 重定向进 ifb 后，**daddr 是公网服务器、saddr 才是
+		// 客户端**。所以这里用 `dst` 会 100% 不命中 —— 包落到 default 类
+		// （`htb default 100`），整棵每源保底子类从此不承载任何流量。
+		//
+		// 真机实测（docs/poc-result.md §3.1）：配置 8MB/s 跑出 112.2485MB/s，
+		// 超 14 倍；`direct_packets_stat` 增量与总包数完全相等（942MB 一个包
+		// 都没进 HTB）；所有子类 `Sent = 0`。改成 `src` 后立刻 8.09MB/s。
+		//
+		// pref 用 uploadFilterPref 而不是写死 10（D-17）：单臂网关下上传与
+		// 下载 filter 共用一个 qdisc，pref 必须分段（下载 2..998 / 上传
+		// 1002..1998），否则 `tc filter replace` 互相覆盖导致某方向静默失效。
 		if err := runQuiet("tc", "filter", "replace", "dev", dev,
-			"parent", "1:", "protocol", "ip", "prio", "10", "u32",
-			"match", "ip", "dst", src, "flowid", clsID); err != nil {
+			"parent", "1:", "protocol", "ip",
+			"pref", strconv.Itoa(uploadFilterPref(src)), "u32",
+			"match", "ip", "src", src, "flowid", clsID); err != nil {
 			return err
 		}
 	}
