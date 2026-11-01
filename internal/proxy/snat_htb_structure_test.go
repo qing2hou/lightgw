@@ -161,3 +161,67 @@ func TestLeafClassIDConsistentWithToken(t *testing.T) {
 		t.Fatalf("★ leafClassID=%s 与 leafClassIDNum=%d 不一致", leafClassID, leafClassIDNum)
 	}
 }
+
+// TestLeafClassIsPassthrough 断言叶子兜底类**不限速**。
+//
+// 回归（2026-11-01 生产实测）：叶子类曾用带宽包总额（8192KB/s），
+// 导致 eth0 上所有未分类流量被这 8MB/s 桶收走——端口映射 #33
+// （172.16.40.10:2222 → 172.16.30.20:22，规则自身「不限/不限」）
+// 实测只有 6.98 MB/s（= 上限的 85%，差额是 TCP/IP 开销）。
+//
+// 带宽包是「绑定它的规则」的额度，不是整卡限速：
+// 规则没绑包 = 不限速，这条语义必须在 tc 层成立。
+func TestLeafClassIsPassthrough(t *testing.T) {
+	if leafClassRateBits != "10gbit" {
+		t.Fatalf("★ 叶子兜底类必须直通（10gbit），实际 %q。\n"+
+			"用带宽包总额会让同网卡上未绑包的流量（如端口映射）被误限。", leafClassRateBits)
+	}
+	// 代码里叶子类建类时不能再用 totalBits。
+	// 取"每个 classid=leafClassID 建类语句往后 300 字节"作为断言窗口——
+	// 语句本体跨 3~4 行，300 字节足够覆盖且不会误伤远处代码。
+	body := readSnatGo(t)
+	const anchor = `"classid", leafClassID, "htb"`
+	if !strings.Contains(body, anchor) {
+		t.Fatal("找不到叶子类建类语句")
+	}
+	found := 0
+	for rest := body; ; {
+		i := strings.Index(rest, anchor)
+		if i < 0 {
+			break
+		}
+		found++
+		end := i + 300
+		if end > len(rest) {
+			end = len(rest)
+		}
+		win := rest[i:end]
+		if strings.Contains(win, "totalBits") {
+			t.Fatalf("★ 叶子兜底类的 rate/ceil 不能用带宽包总额 totalBits。\n"+
+				"它就是那个把端口映射限到 6.98MB/s 的 bug。片段:\n%s", win)
+		}
+		if !strings.Contains(win, "leafClassRateBits") {
+			t.Fatalf("★ 叶子兜底类的 rate 应为 leafClassRateBits。片段:\n%s", win)
+		}
+		rest = rest[i+len(anchor):]
+	}
+	if found < 2 {
+		t.Fatalf("★ 应有两处建叶子类（applyHTBLimit + applyIngressLimit），实际 %d 处", found)
+	}
+}
+
+// TestBothHTBSitesUsePassthroughLeaf 断言两处建 HTB 的地方（egress 与 ifb）
+// 都用直通叶子类——只改一处会留下同一个 bug 的另一个入口。
+func TestBothHTBSitesUsePassthroughLeaf(t *testing.T) {
+	body := readSnatGo(t)
+	n := strings.Count(body, "leafClassRateBits")
+	// 1 处是常量定义，其余是使用点：applyHTBLimit + applyIngressLimit 至少 2 处
+	if n < 3 {
+		t.Fatalf("★ leafClassRateBits 出现 %d 次（含定义），"+
+			"applyHTBLimit 与 applyIngressLimit 都应使用它", n)
+	}
+	if strings.Contains(body, `"rate", totalBits, "ceil", totalBits,
+		"burst", "16k", "cburst", "32k"`) {
+		t.Fatal("★ 仍有地方用 totalBits 建叶子类（应为 leafClassRateBits）")
+	}
+}

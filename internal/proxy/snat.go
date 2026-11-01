@@ -955,11 +955,14 @@ func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 	//
 	// 必须存在且**无子类**——default 指向不存在的类时所有未分类包被内核
 	// 直接丢弃或绕过整形（实测两种表现都出现过）。
-	// rate 给总额：它是"未分类流量"的整形入口，不该比总额更严；
-	// 需要更严时由分类 filter 把流量导到各自的保底子类。
+	//
+	// rate = leafClassRateBits（10gbit = 直通），**不是带宽包总额**：
+	// 带宽包只限"本规则白名单内的源"，同网卡上的端口映射等其它流量
+	// 与本包无关，绝不能被它限住。用总额会误伤——生产实测过：
+	// 端口映射 #33 配「不限/不限」却被卡在 6.98 MB/s（= 8MB/s 上限的 85%）。
 	if err := runQuiet("tc", "class", "replace", "dev", ifn, "parent", "1:",
 		"classid", leafClassID, "htb",
-		"rate", totalBits, "ceil", totalBits,
+		"rate", leafClassRateBits, "ceil", leafClassRateBits,
 		"burst", "16k", "cburst", "32k"); err != nil {
 		return err
 	}
@@ -1122,12 +1125,16 @@ func htbDefaultToken() string {
 // 包直接走 `direct` 路径**完全绕过 HTB**（既不整形也不计数）。
 // netns 三组对照（Linux 6.18，每项都有 direct_packets_stat 佐证）：
 //
-//	A default→1:100，1:100 无子类：7.6567 MB/s，direct=0          → 受限 ✓
+//	A default→1:100，1:100 无子类：7.6567 MB/s，direct=0          → 走该类的 rate
 //	B default→1:100，1:100 有子类：2575.3739 MB/s，direct=270363 → 绕过 ✗
-//	C default→1:250 叶子无子类：   7.6560 MB/s，direct=0          → 受限 ✓
+//	C default→1:250 叶子无子类：   7.6560 MB/s，direct=0          → 走该类的 rate
 //
 // 所以判据是「default 目标自身有无子类」，不是"内层还是外层"。
 // 生产事故形态正是 B：`default 0x100` 且 1:100 挂着每源子类。
+//
+// 本实现的叶子类 rate = leafClassRateBits（10gbit 直通），因为未分类流量
+// 不属于本带宽包。A/C 两组的"7.65 MB/s"是因为当时叶子 rate 也设成了总额，
+// 数字本身只证明"整形生效"，不证明"应该限速"。
 //
 // `tc qdisc change ... default N` 在本内核返回 "Change operation not supported"，
 // default 不匹配时只能重建 qdisc。
@@ -1149,25 +1156,39 @@ const bwGroupClassID = "1:100"
 
 // leafClassID 是挂 `htb default` 的**叶子兜底类**（AGENTS.md 硬约束 2）。
 //
-// 为什么必须是**叶子**：`default` 指向挂了子类的内层类（如 1:100）时，
-// 内核不把包下派到任何子类，而是让包**完全绕过 HTB**——既不被限速，
-// 也不计入任何子类计数。真机实测（Linux 6.8 + virtio，netns 隔离）：
+// 语义：**未被任何分类 filter 命中的流量**落这里。必须是**直通（不限速）**：
+// 带宽包只约束"该规则白名单内的源"，同网卡上的其它流量（端口映射 tcp/udp、
+// 其它规则的后端流量）与本带宽包无关，不能被它限住。
 //
-//	default → 1:100（内层）：2057.4724 MB/s，direct_packets_stat 276733
-//	                          （= 总包数，一个包都没进 HTB），子类 Sent 全 0
-//	default → 叶子类：         7.6559 MB/s，direct_packets_stat 0，
-//	                          包全部落兜底叶子
+// 为什么必须是叶子（AGENTS.md 硬约束 2）：default 指向"自身挂着子类"的类时，
+// 内核不把包下派到任何子类，直接走 `direct` 路径**完全绕过 HTB**。
+// netns 三组对照（Linux 6.18，每项都有 direct_packets_stat 佐证）：
+//
+//	A default→1:100，1:100 无子类：7.6567 MB/s，direct=0          → 受限
+//	B default→1:100，1:100 有子类：2575.3739 MB/s，direct=270363  → 绕过
+//	C default→1:250 叶子无子类：   7.6560 MB/s，direct=0          → 受限
+//
+// 所以 default 必须指向无子类的叶子；本实现让它**不限速**（见 leafClassCeilBits），
+// SNAT 自身的额度由每源子类（parent 1:100）保证——filter 没命中的 SNAT 流量
+// 不会无限速，因为它根本不在白名单内、本来就不该被这个带宽包限。
 //
 // `fq_codel` 也只能挂叶子类：挂内层 1:100 时内核直接
-// `RTNETLINK answers: Invalid argument`（生产机上已实测复现）。
+// `RTNETLINK answers: Invalid argument`（生产机已实测）。
 //
-// 取值 1:250 —— 必须避开 srcClassID 的产出区间（1:1..1:248，见该函数），
-// 否则某个源哈希到兜底类时会继承兜底语义、把保底额度算错。
-// bwGroupClassID(1:100) 与历史的 1:30（全速占位）也不可用。
+// 取值 1:250 —— 必须避开 srcClassID 的产出区间（1:1..1:249，见该函数）。
 const leafClassID = "1:250"
 
 // leafClassIDNum 是 leafClassID 的十进制数（`tc qdisc add default N` 用）。
 const leafClassIDNum = 250
+
+// leafClassRateBits 是叶子兜底类的速率：**不限速**（10gbit 视为直通）。
+//
+// 历史 bug（2026-11-01 生产实测）：这里曾用带宽包总额（8192KB/s），
+// 导致 eth0 上所有未分类流量——包括端口映射 #33（172.16.40.10:2222 →
+// 172.16.30.20:22，规则自身"不限/不限"）——全被这个 8MB/s 桶收走，
+// 实测 6.98 MB/s（= 上限的 85%，差额为 TCP/IP 开销）。
+// 带宽包是"给绑定它的规则用的额度"，不是整卡限速。
+const leafClassRateBits = "10gbit"
 
 // ipCidrToU32 IP/CIDR -> u32 matcher 的 (hex, mask)；at 16 = IP 头 daddr 偏移。
 // 网段（如 172.16.41.0/24）必须带掩码（0xffffff00）——精确掩码 0xffffffff 会只匹配
@@ -1909,10 +1930,14 @@ func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
 		"burst", "32k", "cburst", "32k"); err != nil {
 		return err
 	}
-	// 叶子兜底类（default 目标必须存在，且必须无子类）
+	// 叶子兜底类（default 目标必须存在，且必须无子类）。
+	//
+	// rate = 直通（10gbit），不是带宽包总额：ifb 只承接本带宽包白名单源的
+	// 上传流量（ingress mirred 按 src 精确重定向），落到 default 的是
+	// **不该被限的流量**（如 mirred filter 未覆盖的源），必须直通。
 	if err := runQuiet("tc", "class", "replace", "dev", dev, "parent", "1:",
 		"classid", leafClassID, "htb",
-		"rate", totalBits, "ceil", totalBits,
+		"rate", leafClassRateBits, "ceil", leafClassRateBits,
 		"burst", "16k", "cburst", "32k"); err != nil {
 		return err
 	}
