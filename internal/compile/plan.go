@@ -163,6 +163,13 @@ type Rule struct {
 	// 留空表示由 adapter 按默认规则推断（向后兼容）。
 	WorkChain string
 
+	// IfIn / IfOut 是入/出口网卡前置条件（iifname / oifname）。
+	//
+	// 空表示不匹配该维度。SNAT 规则需要它：生产配置把「eth0 进、eth0 出」
+	// 写进规则里（单臂网关），漏掉会让规则匹配到不该匹配的流量。
+	IfIn  string
+	IfOut string
+
 	// IcmpFamily 非空（"ipv4"/"ipv6"）时，该规则匹配 ICMP 类型集合 IcmpTypes。
 	//
 	// 用于默认拒绝的 ICMP 差错报文豁免（技术方案 §3.3(c)）：

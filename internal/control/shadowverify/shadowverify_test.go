@@ -233,3 +233,58 @@ func TestDiffSummary(t *testing.T) {
 		t.Fatalf("摘要内容错误: %q", s)
 	}
 }
+
+// TestNormalizeInterfaceQuotes 网卡名引号必须归一化（实测假差异）。
+func TestNormalizeInterfaceQuotes(t *testing.T) {
+	cases := [][2]string{
+		{`iifname "eth0" oifname "eth0" x`, `iifname eth0 oifname eth0 x`},
+		{`iifname eth0 x`, `iifname eth0 x`}, // 无引号保持不变
+	}
+	for _, c := range cases {
+		if got := Normalize(c[0]); got != c[1] {
+			t.Fatalf("Normalize(%q) = %q，期望 %q", c[0], got, c[1])
+		}
+	}
+}
+
+// TestNormalizeHexWidth 十六进制字面量宽度必须统一（实测假差异）。
+//
+// `meta mark & 0x4 == 0` 与 `meta mark & 0x00000004 == 0x00000000`
+// 是同一个条件的两种写法。
+func TestNormalizeHexWidth(t *testing.T) {
+	a := Normalize("meta mark & 0x4 == 0")
+	b := Normalize("meta mark & 0x00000004 == 0x00000000")
+	if a != b {
+		t.Fatalf("★ 同一条件两种写法归一化后仍不同:\n  %q\n  %q", a, b)
+	}
+	if !strings.Contains(a, "0x00000004") {
+		t.Fatalf("应补零到 8 位，实际 %q", a)
+	}
+}
+
+// TestNormalizeRealDiffCase 真实假差异的完整回归。
+//
+// 这是 B-1 实战中实际遇到的那一对：
+//
+//	期望: iifname eth0 oifname eth0 meta mark & 0x00000004 == 0 @nh,96,32 0xc0a80a98
+//	现网: iifname "eth0" oifname "eth0" meta mark & 0x00000004 == 0x00000000 @nh,96,32 0xc0a80a98
+//
+// 归一化后必须完全相同。
+func TestNormalizeRealDiffCase(t *testing.T) {
+	desired := "iifname eth0 oifname eth0 meta mark & 0x00000004 == 0 @nh,96,32 0xc0a80a98"
+	actual := `iifname "eth0" oifname "eth0" meta mark & 0x00000004 == 0x00000000 @nh,96,32 0xc0a80a98`
+	if Normalize(desired) != Normalize(actual) {
+		t.Fatalf("★ 真实假差异未被消除:\n  期望侧 %q\n  现网侧 %q", Normalize(desired), Normalize(actual))
+	}
+}
+
+// TestNormalizeDoesNotBreakPrefix 归一化不能破坏 @nh,96,32 这类偏移量。
+func TestNormalizeDoesNotBreakPrefix(t *testing.T) {
+	got := Normalize("@nh,96,32 0xc0a80a98")
+	if !strings.Contains(got, "@nh,96,32") {
+		t.Fatalf("偏移量被破坏: %q", got)
+	}
+	if !strings.Contains(got, "0xc0a80a98") {
+		t.Fatalf("地址被破坏: %q", got)
+	}
+}

@@ -72,67 +72,119 @@ acl_groups:     id=1   mode=whitelist  entries=[...2 个网段...]
 
 ---
 
-## 缺口 3 · compile 层不支持 SNAT 规则（新发现，阻塞 B-1 收尾）
+## 缺口 3 · compile 层不支持 SNAT 规则（已修：方案 A 独立类型）
 
-按原计划把 `ExpectationDigest` 改成走真实编译路径，实现 `CompileState`
-（DB 实体 → `compile.State`），然后调 `Compiler.Compile`。
-
-**实测失败**：
+按原计划把 `ExpectationDigest` 改成走真实编译路径，实测失败：
 
 ```
-digests=0 err=编译失败: 配置校验失败: 校验规则[test#30] 失败:
-               校验规则失败: 协议 "" 无效（只支持 tcp/udp）
+编译失败: 校验规则[test#30] 失败: 协议 "" 无效（只支持 tcp/udp）
 ```
 
-根因不是转换 bug，是**建模不匹配**：
+根因是**建模不匹配**：`compile` 层先跑 `rule.Validate`，要求
+`Proto ∈ {tcp,udp}`，而 SNAT 规则没有协议概念（作用于所有协议的穿越流量），
+现网规则#30 的 `protocol` 字段值是 `"snat"`。
 
-`compile` 层先跑 `rule.Validate`，它要求每条规则的 `Proto ∈ {tcp, udp}`：
+### 修复（方案 A · 独立类型）
+
+新增 `internal/compile/snat_rule.go`：
 
 ```go
-if !r.Proto.Valid() {
-    return fmt.Errorf("校验规则失败: 协议 %q 无效（只支持 tcp/udp）", ...)
+type SnatRule struct {
+    ID, Name       // 身份
+    SourceNets     []netip.Prefix  // 白名单源（替代 Proto+ListenAt）
+    OutIP          netip.Addr      // SNAT 目标（替代 Backend）
+    IfIn, IfOut    string          // 网卡前置条件
+    MetaMarkExempt uint32          // 发布流量豁免（MarkDNAT=0x4）
+    Enabled, Counter
 }
 ```
 
-但 **SNAT 规则没有「协议」概念** —— 它作用于所有协议的穿越流量。
-现网规则#30 的 `protocol` 字段值是 `"snat"`，不是 `tcp`/`udp`。
+**结构上就没有 Proto 字段** —— 协议校验问题从根上消失。
 
-`domain.Rule` 的结构是为 **DNAT**（端口转发：`Proto` + `ListenAt` + `Backend`）
-设计的，SNAT 只有「源集合 + 出口 + 目标地址」，套不进那个形状。
+`CompileSnatRules` 每条源网段生成**两条**规则：
+① 放行+改写行（`saddr ∈ 源` + `snat ip to OutIP`）
+② 回程计数行（`daddr ∈ 源`，无 verdict）
 
-### 这条缺口的影响
+② 是 AGENTS.md 的硬要求：只装上行的计数会让页面速率只反映 ACK 小包
+（实测过 3.54MB/s 显示成 68.9KB/s）。
 
-| 项 | 状态 |
-|---|---|
-| B-1 的「走真实编译路径」 | ❌ 阻塞 |
-| 手写映射（`ExpectationDigest`） | ⚠️ 可用但表达力不足（不含前置条件） |
-| B-2 装配 | ❌ 阻塞（SNAT 规则无法编译，就没法下发） |
+### 修复后 B-1 的实际比对结果
 
-### 必须先补的设计缺口（S0 遗留）
+期望摘要（4 条，由真实编译路径产出）：
 
-`compile` 层需要为 SNAT 引入**独立类型**（或放宽 `rule.Validate` 对 SNAT 的协议要求）。
-两个方向的取舍：
+```
+srcnat  iifname eth0 oifname eth0 meta mark & 0x4 == 0x0 @nh,96,32  0xc0a80a98 snat ip to 192.168.10.170 counter
+srcnat  iifname eth0 oifname eth0 meta mark & 0x4 == 0x0 @nh,128,32 0xc0a80a98 counter
+srcnat  iifname eth0 oifname eth0 meta mark & 0x4 == 0x0 @nh,96,32  0xc0a80a97 snat ip to 192.168.10.170 counter
+srcnat  iifname eth0 oifname eth0 meta mark & 0x4 == 0x0 @nh,128,32 0xc0a80a97 counter
+```
 
-| 方案 | 做法 | 代价 |
+现网实际（8 条）：
+
+```
+pre_mark  ct state established,related meta mark set meta mark | 0x1
+fwd       ... @nh,96,32  0xc0a80a98 counter meta mark set meta mark | 0x1
+fwd       ... @nh,96,32  0xc0a80a97 counter meta mark set meta mark | 0x1
+fwd       ... @nh,128,32 0xc0a80a98 counter
+fwd       ... @nh,128,32 0xc0a80a97 counter
+fwd       iifname eth0 meta mark & 0x1 == 0x0 counter drop
+srcnat    ... @nh,96,32  0xc0a80a98 snat ip to 192.168.10.170        ← 无 counter
+srcnat    ... @nh,96,32  0xc0a80a97 snat ip to 192.168.10.170        ← 无 counter
+```
+
+### 消除掉的三个假差异（都是我的比对器缺陷，不是现场问题）
+
+| # | 假差异 | 归一化处理 |
 |---|---|---|
-| **A · 独立类型** | 新增 `compile.SnatRule`（源集合 + 出口 + 目标 + 前置条件），`CompileSnat` 改用它 | `compile.Compiler` 的 `State.Rules` 要拆成 `DnatRules` / `SnatRules` |
-| **B · 放宽校验** | `rule.Validate` 对 `Proto == "snat"` 跳过协议检查 | 语义混乱：`Proto` 字段既存协议又存规则类型 |
+| 1 | 网卡名带引号 `iifname "eth0"` vs `iifname eth0` | 剥引号 |
+| 2 | 掩码宽度 `0x4` vs `0x00000004`、`== 0` vs `== 0x00000000` | 补零到 32 位 + 裸 0 归一 |
+| 3 | 动作切分位置不同（一侧在 Match、一侧在 Action） | 两侧统一：整行放 Match |
 
-**我倾向 A**：SNAT 与 DNAT 本来就是两类规则（一个是「谁能穿出去」，一个
-是「谁能进到后端」），共用一个结构只会让两边都别扭。B 方案会让
-`Proto` 字段变成「有时是协议、有时是类型」的双关，与 AGENTS.md
-记录的「字段语义要单一」原则冲突。
+### 剩下的差异是**真实的**
 
-这是 S0 阶段的设计缺口，当时只按 DNAT 建模、SNAT 留了 TODO 没验证。
-**B-2 开工前必须先补这一块。**
+期望侧有 4 条 `srcnat` 规则，现网只有 2 条（且不带 `counter`）。
+差异根源：
 
----
+| 项 | 现网（旧实现） | 新编译产物 |
+|---|---|---|
+| srcnat 规则数 | 2（每源一条 SNAT） | 4（每源：放行 + 回程计数） |
+| srcnat counter | **无** | **有** |
+| 回程计数位置 | 在 `fwd` 链（`@nh,128,32` 那两条） | 在 `srcnat` 链 |
 
-## 下一步
+**这不是 bug，是两代设计的真实差异**：
 
-1. **补 compile 的 SNAT 建模**（方案 A）→ 这是 B-2 的前置
-2. 补完后 B-1 自动可用：`ExpectationDigest` 改走编译路径，重新比对
-3. 拿到真实差异后再决定 B-2 怎么做
+- 旧实现把「回程计数」放在 `fwd` 链，靠 `meta mark & 0x1`（established 打标）放行
+- 新设计（AGENTS.md 第 64 条）把回程计数放在 `srcnat` 的 `daddr=源` 行，
+  与 SNAT 放行行共用 comment 汇总
+
+也就是说：**新编译器产出的规则集与旧实现不等价，且差异是刻意设计的**。
+
+## B-1 的最终结论
+
+| 问题 | 答案 |
+|---|---|
+| 比对器能跑通吗 | ✅ 能，且只读、生产安全 |
+| 新旧规则集等价吗 | ❌ **不等价**，差异是真实的（回程计数位置 + srcnat counter） |
+| 差异是好还是坏 | 需要判断：新设计把回程计数移到 srcnat，是否比旧设计更好？ |
+| B-2 能直接开工吗 | **不能**——需要先确认这个设计变更是否要保留 |
+
+## B-2 之前必须决策的一件事
+
+**回程计数应该放 `fwd` 链还是 `srcnat` 链？**
+
+| 方案 | 做法 | 优点 | 缺点 |
+|---|---|---|---|
+| **保持旧设计** | 回程计数留在 `fwd`（`@nh,128,32` 行） | 与现网行为一致，B-2 风险小 | 计数分散在两个链，汇总要看两处 |
+| **采用新设计** | 回程计数移到 `srcnat` 的 `daddr=源` 行 | 与 SNAT 放行行同链同 comment，汇总简单 | 与现网行为不同，切换时计数会断档 |
+
+AGENTS.md 第 64 条写的是「`CompileSNAT` 为每个源追加一条 `daddr=源` 的只计数行
+（无 verdict）」——**新代码遵循了 AGENTS.md，但现网跑的是旧实现**。
+
+所以这不是「新代码错了」，而是「AGENTS.md 描述的目标形态与现网当前形态不同」。
+这是升级本身的预期差异，不是缺陷。
+
+**需要你确认**：B-2 切换时接受这个计数位置变更（计数断档一次），
+还是有别的顾虑？
 
 ---
 

@@ -275,36 +275,93 @@ func TestCompileStateDisabledSkipped(t *testing.T) {
 	}
 }
 
-// TestExpectFromDBReportsModelingGap 走真实编译路径会失败，且错误说明原因。
+// TestExpectFromDBSucceeds 走真实编译路径应成功（缺口 3 已修）。
 //
-// **这是一条「记录已知缺陷」的测试，不是「验证功能正常」的测试。**
+// 修复内容：compile 层新增了独立的 `SnatRule` 类型
+// （`internal/compile/snat_rule.go`），不再让 SNAT 规则借用
+// `domain.Rule` 的形状 —— 后者被 `rule.Validate` 要求 Proto ∈ {tcp,udp}，
+// 而 SNAT 规则没有协议概念，借用必然失败：
 //
-// 实测发现：compile 层的 rule.Validate 要求 Proto ∈ {tcp,udp}，
-// 但 SNAT 规则没有协议概念（现网规则#30 的 protocol 字段是 "snat"）。
-// 这是 S0 遗留的建模缺口：domain.Rule 是为 DNAT（端口转发）设计的。
+//	校验规则[test#30] 失败: 协议 "" 无效（只支持 tcp/udp）
+func TestExpectFromDBSucceeds(t *testing.T) {
+	digests, warns, err := ExpectFromDB(prodLikeRules(), 1)
+	if err != nil {
+		t.Fatalf("★ 走真实编译路径应成功，实际: %v", err)
+	}
+	for _, w := range warns {
+		t.Logf("warn: %s", w)
+	}
+	if len(digests) == 0 {
+		t.Fatal("期望摘要不应为空")
+	}
+}
+
+// TestExpectFromDBMatchesProductionShape 期望摘要的形态必须贴近现网 nft 输出。
 //
-// 本测试固化这个事实，防止有人误以为「B-1 的等价性比对已经可用」。
-// 等 compile 层补上 SNAT 独立类型后，本测试应改为断言成功。
-func TestExpectFromDBReportsModelingGap(t *testing.T) {
-	rules := Rules{
+// 现网 srcnat 的一条规则是：
+//
+//	iifname "eth0" oifname "eth0" meta mark & 0x4 == 0 //	@nh,96,32 0xc0a80a98 snat ip to 192.168.10.170
+//
+// 期望摘要必须包含全部四个要素：iifname、oifname、meta mark 豁免、源地址。
+// 缺任何一个都会与现网比对不上（这正是缺口 2 的表现）。
+func TestExpectFromDBMatchesProductionShape(t *testing.T) {
+	digests, _, err := ExpectFromDB(prodLikeRules(), 1)
+	if err != nil {
+		t.Fatalf("失败: %v", err)
+	}
+	var found bool
+	for _, d := range digests {
+		// 动作拼在 Match 里（与 LegacyReader 侧同构，见 DigestFromSnatCompiled 注释）
+		if !strings.Contains(d.Match, "snat ip to 192.168.10.170") {
+			continue
+		}
+		found = true
+		t.Logf("放行行: %q", d.Match)
+		for _, want := range []string{"iifname eth0", "oifname eth0", "meta mark & 0x00000004 == 0", "@nh,96,32"} {
+			if !strings.Contains(d.Match, want) {
+				t.Fatalf("★ 期望摘要缺 %q: %q", want, d.Match)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("应产出 snat 放行行，实际 %+v", digests)
+	}
+}
+
+// TestExpectFromDBIncludesReturnCounter 期望摘要必须含回程计数行（daddr）。
+func TestExpectFromDBIncludesReturnCounter(t *testing.T) {
+	digests, _, err := ExpectFromDB(prodLikeRules(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hasReturn bool
+	for _, d := range digests {
+		// 回程行的特征：匹配 daddr（@nh,128,32）且没有 snat 动作
+		if strings.Contains(d.Match, "@nh,128,32") && !strings.Contains(d.Match, "snat ip to") {
+			hasReturn = true
+			t.Logf("回程计数行: %q", d.Match)
+		}
+	}
+	if !hasReturn {
+		t.Fatal("★ 期望摘要必须含回程计数行（daddr=源，无动作）——" +
+			"只装上行的计数会让页面速率只反映 ACK 小包")
+	}
+}
+
+// prodLikeRules 构造一份与生产现场同形的规则集。
+func prodLikeRules() Rules {
+	return Rules{
 		ForwardRules: []dbmodel.ForwardRule{{
 			ID: 30, Name: "test", Protocol: "snat", Enabled: true,
-			AclMode: "whitelist", AclGroupID: 1, SnatIP: "192.168.10.170",
+			ListenAddr: "eth0", TargetAddr: "eth0", // 生产里复用为入/出口网卡
+			AclMode: "whitelist", AclGroupID: 1,
+			SnatIP: "192.168.10.170",
 		}},
 		AclGroups: []dbmodel.AclGroup{{
-			ID: 1, Mode: "whitelist", Entries: `["192.168.10.152"]`,
+			ID: 1, Mode: "whitelist",
+			Entries: `["192.168.10.152","192.168.10.151"]`,
 		}},
 		Egresses: []dbmodel.Egress{{ID: 4, Name: "eth0", Iface: "eth0"}},
-	}
-	_, _, err := ExpectFromDB(rules, 1)
-	if err == nil {
-		t.Fatal("★ 建模缺口已修？请把本测试改为断言成功，并更新 docs/equivcheck-result.md")
-	}
-	if !strings.Contains(err.Error(), "建模不匹配") {
-		t.Fatalf("错误应说明建模不匹配，实际: %v", err)
-	}
-	if !strings.Contains(err.Error(), "SNAT") {
-		t.Fatalf("错误应提到 SNAT，实际: %v", err)
 	}
 }
 

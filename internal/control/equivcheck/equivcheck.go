@@ -554,40 +554,168 @@ func prefixToHex(p netip.Prefix) string {
 	return fmt.Sprintf("0x%02x%02x%02x%02x", b[0], b[1], b[2], b[3])
 }
 
-// ExpectFromDB 尝试走真实编译路径生成期望摘要。
+// ExpectFromDB 走真实编译路径生成期望摘要。
 //
-// **⚠️ 当前不可用（已实测确认），原因见下。**
+// 路径：DB 实体 → compile.SnatRule（独立类型）→ CompileSnatRules → 摘要。
 //
-// 实测发现：`compile.Compiler.Compile` 会先跑 `rule.Validate`，而它要求
-// 每条规则的 `Proto` 是 `tcp`/`udp`：
-//
-//	校验规则[test#30] 失败: 协议 "" 无效（只支持 tcp/udp）
-//
-// 但 **SNAT 规则没有「协议」概念** —— 它作用于所有协议的穿越流量
-// （现网规则#30 的 protocol 字段是 "snat"，不是 tcp/udp）。
-//
-// 这不是转换 bug，是**建模不匹配**：
-// `domain.Rule` 是为 DNAT（端口转发：proto + listen_port + backend）设计的，
-// SNAT 只有「源集合 + 出口 + 目标地址」，套不进那个结构。
-//
-// 影响：
-//   - B-1 的「走真实编译路径」暂时做不到
-//   - `compile` 层需要为 SNAT 引入独立类型（或放宽 Proto 校验），
-//     这是 S0 遗留的设计缺口，B-2 之前必须补
-//
-// 在此之前，比对只能用 `ExpectationDigest`（手写映射），
-// 而它有已知的表达力不足（不含 meta mark 前置条件等）。
-//
-// 返回的 error 会明确说明这一点，而不是静默返回空摘要。
+// 为什么用 SnatRule 而不是复用 domain.Rule：
+// `domain.Rule` 是为 DNAT（Proto + ListenAt + Backend）设计的，
+// 而 SNAT 规则没有协议概念（作用于所有协议的穿越流量）。
+// 复用会导致 `rule.Validate` 报「协议 "" 无效」（实测过，缺口 3）。
+// SNAT 现在有独立类型（`compile/snat_rule.go`），不再借用 DNAT 的形状。
 func ExpectFromDB(r Rules, version uint64) ([]shadowverify.RuleDigest, []string, error) {
-	st, warns := CompileState(r, version)
-	compiler := &compile.Compiler{Caps: compile.Caps{TcNetlink: true, Ifb: true, PerSrcLimit: true}}
-	plan, err := compiler.Compile(st)
-	if err != nil {
-		return nil, warns, fmt.Errorf(
-			"走 compile 路径失败（SNAT 规则与 domain.Rule 建模不匹配，"+
-				"compile 层需为 SNAT 引入独立类型）: %w", err)
+	snatRules, warns := BuildSnatRules(r)
+	if len(snatRules) == 0 {
+		return nil, warns, nil
 	}
-	warns = append(warns, plan.Warnings...)
-	return DigestFromPlan(plan), warns, nil
+	compiled, err := compile.CompileSnatRules(snatRules)
+	if err != nil {
+		return nil, warns, fmt.Errorf("编译 SNAT 规则失败: %w", err)
+	}
+	var out []shadowverify.RuleDigest
+	for _, c := range compiled {
+		out = append(out, DigestFromSnatCompiled(c))
+	}
+	return out, warns, nil
+}
+
+// BuildSnatRules 把 DB 实体转成 compile.SnatRule。
+//
+// 这是 B-2 装配时也要用的代码：SNAT 规则的「DB → 编译输入」只有这一处。
+func BuildSnatRules(r Rules) ([]compile.SnatRule, []string) {
+	var out []compile.SnatRule
+	var warns []string
+
+	// 名单组：ID → 网段列表
+	groupPrefixes := make(map[uint][]netip.Prefix, len(r.AclGroups))
+	for _, g := range r.AclGroups {
+		pfx, w := parsePrefixes(splitList(g.Entries))
+		warns = append(warns, prefixWarns("名单组", g.ID, w)...)
+		groupPrefixes[g.ID] = pfx
+	}
+
+	for _, fr := range r.ForwardRules {
+		if !fr.Enabled {
+			continue
+		}
+		if strings.ToLower(fr.Protocol) != "snat" {
+			continue // tcp/udp 是用户态转发，不进 nft
+		}
+
+		// 源：直配 allow_list + 引用的名单组（两条路径都要走）
+		srcs, w1 := parsePrefixes(splitList(fr.AllowList))
+		warns = append(warns, prefixWarns("规则白名单", fr.ID, w1)...)
+		if fr.AclGroupID != 0 {
+			g, ok := groupPrefixes[fr.AclGroupID]
+			if !ok {
+				warns = append(warns, fmt.Sprintf(
+					"snat 规则#%d 引用的名单组#%d 不存在，跳过该规则", fr.ID, fr.AclGroupID))
+				continue
+			}
+			srcs = append(srcs, g...)
+		}
+		if len(srcs) == 0 {
+			warns = append(warns, fmt.Sprintf("snat 规则#%d 没有源网段，跳过", fr.ID))
+			continue
+		}
+
+		// 出口地址：优先规则的 snat_ip，否则取出口实体的 SourceIP
+		var outIP netip.Addr
+		if fr.SnatIP != "" {
+			a, err := netip.ParseAddr(fr.SnatIP)
+			if err != nil {
+				warns = append(warns, fmt.Sprintf(
+					"snat 规则#%d 的 snat_ip %q 无法解析，跳过", fr.ID, fr.SnatIP))
+				continue
+			}
+			outIP = a
+		}
+		if !outIP.IsValid() {
+			warns = append(warns, fmt.Sprintf("snat 规则#%d 没有出口地址，跳过", fr.ID))
+			continue
+		}
+
+		sr, err := compile.SnatRulesFromModel(fr.ID, fr.Name, srcs, outIP,
+			fr.ListenAddr, // IfIn（生产配置里 listen_addr 复用为入口网卡）
+			fr.TargetAddr, // IfOut（target_addr 复用为出口网卡）
+			markDNATExempt)
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("snat 规则#%d 构造失败: %v", fr.ID, err))
+			continue
+		}
+		out = append(out, sr)
+	}
+	return out, warns
+}
+
+// markDNATExempt 是发布流量豁免 SNAT 的 meta mark 掩码（MarkDNAT = 0x4）。
+//
+// 必须带上：否则发布流量（DNAT 会话）的回程包会被 SNAT 错误改写，
+// 发布直接断。AGENTS.md 与现网规则都依赖这个豁免。
+const markDNATExempt uint32 = 0x4
+
+// parsePrefixes 解析一组地址/网段字符串。
+func parsePrefixes(items []string) ([]netip.Prefix, []string) {
+	var out []netip.Prefix
+	var warns []string
+	for _, s := range items {
+		if p, err := netip.ParsePrefix(s); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(s); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		warns = append(warns, s)
+	}
+	return out, warns
+}
+
+func prefixWarns(what string, id uint, bad []string) []string {
+	var out []string
+	for _, b := range bad {
+		out = append(out, fmt.Sprintf("%s#%d 的条目 %q 无法解析为地址/网段", what, id, b))
+	}
+	return out
+}
+
+// DigestFromSnatCompiled 把一条编译好的 SNAT 规则转成可比对摘要。
+//
+// 输出形态刻意贴近 `nft list` 的文本，便于与现网比对。
+func DigestFromSnatCompiled(r compile.Rule) shadowverify.RuleDigest {
+	var parts []string
+	// nft 输出里 iifname/oifname 在最前
+	if r.IfIn != "" {
+		parts = append(parts, "iifname "+r.IfIn)
+	}
+	if r.IfOut != "" {
+		parts = append(parts, "oifname "+r.IfOut)
+	}
+	if r.MetaMarkNotSet != nil {
+		parts = append(parts, fmt.Sprintf("meta mark & 0x%08x == 0", *r.MetaMarkNotSet))
+	}
+	for _, p := range r.Src.Prefixes {
+		parts = append(parts, "@nh,96,32 "+prefixToHex(p))
+	}
+	for _, p := range r.Dst.Prefixes {
+		parts = append(parts, "@nh,128,32 "+prefixToHex(p))
+	}
+
+	if r.SnatTo.IsValid() {
+		parts = append(parts, "snat ip to "+r.SnatTo.String())
+	}
+	if r.Counter {
+		parts = append(parts, "counter")
+	}
+
+	// 动作拼进 Match、Action 留空。
+	//
+	// 为什么这样：`LegacyReader` 把 nft 输出的整行放进 Match（可靠切分
+	// 「匹配 … 动作」需要完整表达式解析）。两侧必须同构，否则同一个语义
+	// 会因为「切分位置不同」被判成差异——这是 B-1 实战遇到的第三个假差异。
+	return shadowverify.RuleDigest{
+		Chain: "srcnat",
+		Match: shadowverify.Normalize(strings.Join(parts, " ")),
+	}
 }

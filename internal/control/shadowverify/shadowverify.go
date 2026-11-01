@@ -113,15 +113,117 @@ func sortDigests(rs []RuleDigest) {
 
 // Normalize 把一段规则描述归一化，供比对用。
 //
-// 具体做三件事：
+// 具体做五件事（每一条都对应一个实测出来的假差异）：
 //  1. 折叠连续空白为单个空格
 //  2. 去掉 counter 及其数值（`counter packets 123 bytes 456` → `counter`）
 //  3. 去掉 comment 里的实例 ID 段（`haweb-nft:<16hex>:` → `haweb-nft:`）
+//  4. 去掉网卡名两边的引号（`iifname "eth0"` → `iifname eth0`）
+//     —— nft list 输出带引号，代码生成的不带，语义相同
+//  5. 统一十六进制字面量宽度（`0x4` / `0x00000004` → `0x00000004`）
+//     —— 同一个掩码的两种写法，语义相同
 func Normalize(s string) string {
 	s = strings.Join(strings.Fields(s), " ")
 	s = stripCounterCounts(s)
 	s = stripInstanceID(s)
+	s = stripInterfaceQuotes(s)
+	s = normalizeHexLiterals(s)
+	s = normalizeZeroLiteral(s)
 	return s
+}
+
+// normalizeZeroLiteral 把比较运算右侧的裸 0 统一成 0x00000000。
+//
+// 起因（实测假差异）：同一个条件有两种写法
+//
+//	代码生成：meta mark & 0x00000004 == 0        （十进制 0）
+//	nft 输出：meta mark & 0x00000004 == 0x00000000
+//
+// 只把 `== 0` 精确替换（不动独立的 0 参数，比如 `@nh,96,32` 里的数字）。
+func normalizeZeroLiteral(s string) string {
+	// 只在 "== 0" 且后面是词边界/结尾时替换
+	var out strings.Builder
+	i := 0
+	for i < len(s) {
+		j := strings.Index(s[i:], "== 0")
+		if j < 0 {
+			out.WriteString(s[i:])
+			break
+		}
+		j += i
+		out.WriteString(s[i:j])
+		rest := s[j+len("== 0"):]
+		// 后面还有十六进制位则不是裸 0（如 "== 0x1"），原样输出
+		if len(rest) > 0 && (rest[0] == 'x' || rest[0] == 'X' || isHexDigitByte(rest[0])) {
+			out.WriteString("== 0")
+			i = j + len("== 0")
+			continue
+		}
+		out.WriteString("== 0x00000000")
+		i = j + len("== 0")
+	}
+	return out.String()
+}
+
+func isHexDigitByte(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+// stripInterfaceQuotes 去掉网卡名两边的引号。
+//
+// `nft list` 会输出 `iifname "eth0"`，而代码构造的是 `iifname eth0`。
+// 两者语义完全相同，不归一化会产生满屏假差异。
+func stripInterfaceQuotes(s string) string {
+	for _, kw := range []string{"iifname ", "oifname "} {
+		// 循环处理多处出现
+		for {
+			i := strings.Index(s, kw+"\"")
+			if i < 0 {
+				break
+			}
+			start := i + len(kw) + 1 // 跳过开引号
+			j := strings.Index(s[start:], "\"")
+			if j < 0 {
+				break
+			}
+			name := s[start : start+j]
+			s = s[:i] + kw + name + s[start+j+1:]
+		}
+	}
+	return s
+}
+
+// normalizeHexLiterals 把十六进制字面量统一成 32 位补零形式。
+//
+// `0x4` 与 `0x00000004` 是同一个值；`tc`/`nft` 的不同输出路径会给出不同宽度。
+// 只处理 0x 开头、长度 ≤ 10 的形式（避免误伤大数或非十六进制内容）。
+func normalizeHexLiterals(s string) string {
+	fields := strings.Fields(s)
+	for i, f := range fields {
+		// 去掉可能粘着的尾部标点
+		trail := ""
+		for len(f) > 0 && (f[len(f)-1] == ',' || f[len(f)-1] == ';') {
+			trail = string(f[len(f)-1]) + trail
+			f = f[:len(f)-1]
+		}
+		if len(f) > 2 && f[0] == '0' && (f[1] == 'x' || f[1] == 'X') {
+			hexPart := f[2:]
+			ok := true
+			for _, c := range hexPart {
+				if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+					ok = false
+					break
+				}
+			}
+			if ok && len(hexPart) <= 8 {
+				// 补零到 8 位
+				padded := strings.Repeat("0", 8-len(hexPart)) + strings.ToLower(hexPart)
+				fields[i] = "0x" + padded + trail
+				continue
+			}
+		}
+		fields[i] = f + trail
+	}
+	return strings.Join(fields, " ")
 }
 
 // stripCounterCounts 去掉 counter 的 packets/bytes 数值。
