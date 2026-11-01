@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+
+	"haproxyweb/internal/proxy"
 )
 
 // ctSessionView 会话列表行（契约 API-C1）。
@@ -22,6 +24,11 @@ type ctSessionView struct {
 }
 
 // listSessions 会话列表（?proto=&q=&limit=）。
+// listSessions 会话列表（?proto=&q=&limit=）。
+//
+// **只返回 ESTABLISHED 状态的会话**（产品决定 2026-11-01）。
+// 过滤放在后端而不是前端：`total` 要是真实的 ESTABLISHED 条数，
+// 且掐断接口按 id 操作——前端隐藏行、后端仍返回会让两处语义打架。
 func (h *handlers) listSessions(c *gin.Context) {
 	sessions := h.Mgr.SnapshotSessions()
 	proto := strings.ToLower(strings.TrimSpace(c.Query("proto")))
@@ -30,8 +37,27 @@ func (h *handlers) listSessions(c *gin.Context) {
 	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 && v <= 5000 {
 		limit = v
 	}
+	items := filterSessions(sessions, proto, q, limit)
+	c.JSON(200, gin.H{"items": items, "total": len(items)})
+}
+
+// filterSessions 把 conntrack 快照筛成会话表行。
+//
+// 抽成纯函数而不是写在 handler 里：过滤规则（尤其"只留 ESTABLISHED"）
+// 是产品语义，必须有单元测试盯着——写在 handler 里就只能靠起 HTTP 服务测。
+//
+// 过滤顺序：状态 → 协议 → 关键词 → 截断。
+// 状态过滤放在最前，保证 limit 截的是真实活跃会话，而不是被 TIME_WAIT 占满。
+func filterSessions(sessions []proxy.CTSnapshot, proto, q string, limit int) []ctSessionView {
 	items := make([]ctSessionView, 0, len(sessions))
 	for _, s := range sessions {
+		// 只保留 ESTABLISHED（产品决定 2026-11-01）：其余状态
+		// （TIME_WAIT / SYN_SENT / CLOSE_WAIT / FIN_WAIT ...）已无数据流，
+		// 混在会话表里既淹没真实连接，又让"共 N 条"失去意义。
+		// 生产实测：9 条 conntrack 表项里 7 条是 TIME_WAIT。
+		if s.State != ctStateEstablished {
+			continue
+		}
 		if proto != "" && s.Proto != proto {
 			continue
 		}
@@ -48,11 +74,17 @@ func (h *handlers) listSessions(c *gin.Context) {
 		}
 		items = append(items, v)
 	}
-	if len(items) > limit {
+	if limit > 0 && len(items) > limit {
 		items = items[:limit]
 	}
-	c.JSON(200, gin.H{"items": items, "total": len(items)})
+	return items
 }
+
+// ctStateEstablished 是内核 conntrack 的「已建立」状态字面量。
+//
+// 取自 /proc/net/nf_conntrack 与 `conntrack -L` 输出里状态列原文（两者格式
+// 一致，见 proxy 包的解析）。内核输出全大写，比较必须大小写敏感。
+const ctStateEstablished = "ESTABLISHED"
 
 // killSession 掐断单会话（契约 API-C2：按 id 掐断）。
 func (h *handlers) killSession(c *gin.Context) {

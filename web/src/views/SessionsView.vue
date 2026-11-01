@@ -3,7 +3,7 @@
     <el-card>
       <div class="toolbar">
         <div class="toolbar-left">
-          <span class="tip">内核转发会话表（conntrack）——穿越（snat）与发布（dnat）的活跃会话；可单条掐断</span>
+          <span class="tip">内核转发会话表（conntrack）——仅显示已建立（ESTABLISHED）的穿越（snat）会话；可单条掐断</span>
         </div>
         <div class="toolbar-right">
           <el-select v-model="proto" clearable placeholder="协议" style="width: 90px" @change="load">
