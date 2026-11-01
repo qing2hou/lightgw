@@ -4,11 +4,13 @@ package api
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
+	"haproxyweb/internal/model"
 	"haproxyweb/internal/proxy"
 )
 
@@ -19,8 +21,71 @@ type ctSessionView struct {
 	Src      string `json:"src"`       // 客户端 源ip:port（穿越/发布前）
 	Dst      string `json:"dst"`       // 目标 ip:port（DNAT 前）
 	SrcAfter string `json:"src_after"` // NAT 改写后的源（snat 出口 IP；dnat 为空）
-	Router   string `json:"router"`    // 归属：snat:<规则源网卡> / dnat:<发布IP> / policy / other
-	State    string `json:"state"`
+	// Backend 是**实际后端地址** ip:port（端口映射转发到的目标）。
+	//
+	// 为什么需要它：conntrack 只记录 NAT 前后的四元组，端口映射（tcp/udp）
+	// 是**用户态重新 dial** 后端，conntrack 里根本没有后端信息——
+	// 会话看起来只是「客户端 → 网关监听口」。后端地址只在进程内
+	// 会话表（ActiveSessions 的 TargetAddr）里有。
+	// 关联键 = (src ip, src port, listen ip, listen port)，见 buildBackendIndex。
+	//
+	// 空串表示无法关联（内核转发的 snat/dnat 会话，或会话已结束）。
+	Backend string `json:"backend"`
+	Router  string `json:"router"` // 归属：snat:<规则源网卡> / dnat:<发布IP> / policy / other
+	State   string `json:"state"`
+}
+
+// backendIndex 是「conntrack 四元组 → 后端地址」索引。
+//
+// key 由 4 个字段拼成（src ip|src port|listen ip|listen port），
+// 与 conntrack 行的 orig 元组一一对应：客户端发起连接到网关的监听口。
+// 端口映射是用户态转发，这条 conntrack 记录的就是「客户端 ↔ 网关」，
+// 后端地址在进程内会话里，只能靠这个键关联。
+type backendIndex map[string]string
+
+// backendKey 拼关联键。用 \x00 分隔避免 IP/端口的字符串歧义。
+func backendKey(srcIP string, srcPort int, listenIP string, listenPort int) string {
+	return srcIP + "\x00" + strconv.Itoa(srcPort) + "\x00" +
+		listenIP + "\x00" + strconv.Itoa(listenPort)
+}
+
+// buildBackendIndex 从用户态会话表建关联索引。
+//
+// 只收 target_addr 非空的会话（tcp/udp 端口映射才有后端；snat/dnat 走内核，
+// 不会有对应 session 条目）。
+func buildBackendIndex(sessions []model.SessionInfo) backendIndex {
+	idx := make(backendIndex, len(sessions))
+	for _, s := range sessions {
+		if s.TargetAddr == "" {
+			continue
+		}
+		idx[backendKey(s.SourceIP, s.SourcePort, s.ListenIP, s.ListenPort)] = s.TargetAddr
+	}
+	return idx
+}
+
+// lookupBackend 按 conntrack 视图里的 src/dst 反查后端地址。
+//
+// src/dst 是 "ip:port" 形式（net.JoinHostPort 产出）。解析失败返回空串——
+// 宁可少显示一列，也不能因为格式异常让整个会话表 500。
+func (b backendIndex) lookupBackend(src, dst string) string {
+	if len(b) == 0 {
+		return ""
+	}
+	sip, sport, err := net.SplitHostPort(src)
+	if err != nil {
+		return ""
+	}
+	dip, dport, err := net.SplitHostPort(dst)
+	if err != nil {
+		return ""
+	}
+	sp, err1 := strconv.Atoi(sport)
+	dp, err2 := strconv.Atoi(dport)
+	if err1 != nil || err2 != nil {
+		return ""
+	}
+	return b[backendKey(sip, sp, dip, dp)]
 }
 
 // listSessions 会话列表（?proto=&q=&limit=）。
@@ -37,7 +102,9 @@ func (h *handlers) listSessions(c *gin.Context) {
 	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 && v <= 5000 {
 		limit = v
 	}
-	items := filterSessions(sessions, proto, q, limit)
+	// 用户态会话表只用来反查后端地址（端口映射的后端只有这里知道）。
+	idx := buildBackendIndex(h.Mgr.ActiveSessions())
+	items := filterSessions(sessions, idx, proto, q, limit)
 	c.JSON(200, gin.H{"items": items, "total": len(items)})
 }
 
@@ -48,7 +115,9 @@ func (h *handlers) listSessions(c *gin.Context) {
 //
 // 过滤顺序：状态 → 协议 → 关键词 → 截断。
 // 状态过滤放在最前，保证 limit 截的是真实活跃会话，而不是被 TIME_WAIT 占满。
-func filterSessions(sessions []proxy.CTSnapshot, proto, q string, limit int) []ctSessionView {
+//
+// backend 索引可为 nil（无用户态会话时）——此时 Backend 列留空，不影响其它列。
+func filterSessions(sessions []proxy.CTSnapshot, backend backendIndex, proto, q string, limit int) []ctSessionView {
 	items := make([]ctSessionView, 0, len(sessions))
 	for _, s := range sessions {
 		// 只保留 ESTABLISHED（产品决定 2026-11-01）：其余状态
@@ -64,10 +133,12 @@ func filterSessions(sessions []proxy.CTSnapshot, proto, q string, limit int) []c
 		v := ctSessionView{
 			ID: s.ID, Proto: s.Proto,
 			Src: s.Src, Dst: s.Dst, SrcAfter: s.SrcAfter,
-			Router: s.Router, State: s.State,
+			Backend: backend.lookupBackend(s.Src, s.Dst),
+			Router:  s.Router, State: s.State,
 		}
 		if q != "" {
-			blob := strings.ToLower(v.Proto + " " + v.Src + " " + v.Dst + " " + v.SrcAfter + " " + v.Router)
+			blob := strings.ToLower(v.Proto + " " + v.Src + " " + v.Dst + " " +
+				v.SrcAfter + " " + v.Backend + " " + v.Router)
 			if !strings.Contains(blob, q) {
 				continue
 			}

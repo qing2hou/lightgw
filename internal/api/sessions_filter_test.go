@@ -4,6 +4,7 @@ package api
 import (
 	"testing"
 
+	"haproxyweb/internal/model"
 	"haproxyweb/internal/proxy"
 )
 
@@ -32,7 +33,7 @@ func TestSessionsOnlyEstablished(t *testing.T) {
 		ct("9", "tcp", "172.16.30.10:1008", "192.168.10.152:80", ""),
 		ct("10", "tcp", "172.16.30.10:1009", "192.168.10.152:80", "established"),
 	}
-	got := filterSessions(in, "", "", 500)
+	got := filterSessions(in, nil, "", "", 500)
 
 	// 只有 id 1（tcp ESTABLISHED）与 id 8（udp ESTABLISHED）应保留。
 	// id 10 是小写的 "established"——内核输出全大写，必须按字节比较判为不匹配。
@@ -62,7 +63,7 @@ func TestSessionsStateFilterRunsBeforeLimit(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		in = append(in, ct("live", "tcp", "10.0.0.2:2000", "192.168.10.152:80", "ESTABLISHED"))
 	}
-	got := filterSessions(in, "", "", 10) // limit 远小于总数
+	got := filterSessions(in, nil, "", "", 10) // limit 远小于总数
 	if len(got) != 3 {
 		t.Fatalf("★ limit=10 也应保留全部 3 条真实会话（过滤先于截断），实际 %d 条", len(got))
 	}
@@ -81,26 +82,132 @@ func TestSessionsProtoAndSearchStillWork(t *testing.T) {
 		ct("t2", "tcp", "10.9.9.9:2000", "192.168.10.152:80", "ESTABLISHED"),
 	}
 
-	if got := filterSessions(in, "udp", "", 500); len(got) != 1 || got[0].ID != "u1" {
+	if got := filterSessions(in, nil, "udp", "", 500); len(got) != 1 || got[0].ID != "u1" {
 		t.Fatalf("proto=udp 应只剩 u1，实际 %+v", got)
 	}
-	if got := filterSessions(in, "", "10.9.9.9", 500); len(got) != 1 || got[0].ID != "t2" {
+	if got := filterSessions(in, nil, "", "10.9.9.9", 500); len(got) != 1 || got[0].ID != "t2" {
 		t.Fatalf("搜索 10.9.9.9 应只剩 t2，实际 %+v", got)
 	}
 	// 搜一个只存在于 TIME_WAIT 行里的地址——必须返回空（状态过滤优先）
 	in2 := append(in, ct("tw", "tcp", "10.7.7.7:3000", "192.168.10.152:80", "TIME_WAIT"))
-	if got := filterSessions(in2, "", "10.7.7.7", 500); len(got) != 0 {
+	if got := filterSessions(in2, nil, "", "10.7.7.7", 500); len(got) != 0 {
 		t.Fatalf("★ 搜索命中 TIME_WAIT 行时也应返回空，实际 %+v", got)
 	}
 }
 
 // TestSessionsEmptyInput 空输入不应 panic，且返回非 nil 切片（JSON 序列化成 [] 而非 null）。
 func TestSessionsEmptyInput(t *testing.T) {
-	got := filterSessions(nil, "", "", 500)
+	got := filterSessions(nil, nil, "", "", 500)
 	if got == nil {
 		t.Fatal("应返回空切片而非 nil（JSON 应序列化为 [] 而不是 null）")
 	}
 	if len(got) != 0 {
 		t.Fatalf("空输入应返回 0 条，实际 %d", len(got))
+	}
+}
+
+// TestSessionsShowRealBackend 端口映射的会话必须显示实际后端地址。
+//
+// 背景：conntrack 只有 NAT 前后四元组，端口映射是用户态重新 dial 后端，
+// conntrack 里看起来只是「客户端 → 网关监听口」。后端地址只在进程内
+// 会话表（ActiveSessions 的 TargetAddr）里，靠四元组关联。
+//
+// 生产实例：客户端 172.16.30.3:63886 → VIP 172.16.40.10:2222（规则 #33），
+// 实际后端 172.16.30.20:22。
+func TestSessionsShowRealBackend(t *testing.T) {
+	snaps := []proxy.CTSnapshot{{
+		ID: "s1", Proto: "tcp",
+		Src: "172.16.30.3:63886", Dst: "172.16.40.10:2222",
+		State: "ESTABLISHED",
+	}}
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63886,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr: "172.16.30.20:22",
+	}})
+	got := filterSessions(snaps, idx, "", "", 500)
+	if len(got) != 1 {
+		t.Fatalf("应返回 1 条，实际 %d", len(got))
+	}
+	if got[0].Backend != "172.16.30.20:22" {
+		t.Fatalf("★ 实际后端应为 172.16.30.20:22，实际 %q", got[0].Backend)
+	}
+}
+
+// TestSessionsBackendEmptyWhenUnrelated 关联不上时 Backend 留空，不能串到别人的后端。
+//
+// 三类必须留空的场景：
+//   - 内核转发的 snat 会话（本来就没有应用层后端）
+//   - 端口号相同但客户端端口不同（不是同一条连接）
+//   - 监听 IP 不同
+func TestSessionsBackendEmptyWhenUnrelated(t *testing.T) {
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63886,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr: "172.16.30.20:22",
+	}})
+
+	cases := []struct {
+		name, src, dst string
+	}{
+		{"源端口不同", "172.16.30.3:63887", "172.16.40.10:2222"},
+		{"源 IP 不同", "172.16.30.4:63886", "172.16.40.10:2222"},
+		{"监听 IP 不同", "172.16.30.3:63886", "172.16.40.11:2222"},
+		{"监听端口不同", "172.16.30.3:63886", "172.16.40.10:2223"},
+		{"完全无关的 snat 会话", "192.168.10.152:33668", "42.237.113.74:443"},
+	}
+	for _, c := range cases {
+		if got := idx.lookupBackend(c.src, c.dst); got != "" {
+			t.Fatalf("★ %s 不应关联到后端，实际 %q", c.name, got)
+		}
+	}
+}
+
+// TestSessionsBackendMalformedInput 畸形地址不能 panic、不能返回错误后端。
+func TestSessionsBackendMalformedInput(t *testing.T) {
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63886,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr: "172.16.30.20:22",
+	}})
+	for _, c := range [][2]string{
+		{"", ""},
+		{"no-port", "172.16.40.10:2222"},
+		{"172.16.30.3:abc", "172.16.40.10:2222"},
+		{"172.16.30.3:63886", "bad"},
+	} {
+		if got := idx.lookupBackend(c[0], c[1]); got != "" {
+			t.Fatalf("畸形输入 %v 应返回空，实际 %q", c, got)
+		}
+	}
+}
+
+// TestSessionsSkipSessionsWithoutTarget 无 target_addr 的会话不进索引
+// （snat/dnat 走内核，没有 Redis 意义上的"后端"）。
+func TestSessionsSkipSessionsWithoutTarget(t *testing.T) {
+	idx := buildBackendIndex([]model.SessionInfo{
+		{SourceIP: "10.0.0.1", SourcePort: 1, ListenIP: "10.0.0.2", ListenPort: 2},
+	})
+	if len(idx) != 0 {
+		t.Fatalf("target_addr 为空的会话不应进索引，实际 %d 条", len(idx))
+	}
+}
+
+// TestSessionsSearchMatchesBackend 搜索框要能按后端地址过滤——
+// 排查"谁在连某台后端"是最常见用法。
+func TestSessionsSearchMatchesBackend(t *testing.T) {
+	snaps := []proxy.CTSnapshot{
+		{ID: "a", Proto: "tcp", Src: "172.16.30.3:1000", Dst: "172.16.40.10:2222", State: "ESTABLISHED"},
+		{ID: "b", Proto: "tcp", Src: "172.16.30.4:1001", Dst: "172.16.40.10:2222", State: "ESTABLISHED"},
+	}
+	idx := buildBackendIndex([]model.SessionInfo{
+		{SourceIP: "172.16.30.3", SourcePort: 1000, ListenIP: "172.16.40.10", ListenPort: 2222,
+			TargetAddr: "172.16.30.20:22"},
+		{SourceIP: "172.16.30.4", SourcePort: 1001, ListenIP: "172.16.40.10", ListenPort: 2222,
+			TargetAddr: "192.168.10.152:80"},
+	})
+	got := filterSessions(snaps, idx, "", "172.16.30.20", 500)
+	if len(got) != 1 || got[0].ID != "a" {
+		t.Fatalf("★ 搜后端 172.16.30.20 应只剩会话 a，实际 %+v", got)
 	}
 }

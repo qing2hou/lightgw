@@ -31,6 +31,12 @@
             <span v-else class="sub">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="实际后端" min-width="180">
+          <template #default="{ row }">
+            <code v-if="row.backend">{{ row.backend }}</code>
+            <span v-else class="sub" title="内核转发的会话（snat）没有应用层后端；端口映射的会话需仍在进程中">—</span>
+          </template>
+        </el-table-column>
         <el-table-column label="归属" width="180" show-overflow-tooltip>
           <template #default="{ row }">
             <el-tag v-if="row.router && row.router !== 'other'" size="small" type="success">{{ row.router }}</el-tag>
