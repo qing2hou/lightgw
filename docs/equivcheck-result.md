@@ -72,20 +72,67 @@ acl_groups:     id=1   mode=whitelist  entries=[...2 个网段...]
 
 ---
 
-## 下一步（B-1 补完）
+## 缺口 3 · compile 层不支持 SNAT 规则（新发现，阻塞 B-1 收尾）
 
-把 `ExpectationDigest` 从「手写映射」改成「走 compile 编译」：
+按原计划把 `ExpectationDigest` 改成走真实编译路径，实现 `CompileState`
+（DB 实体 → `compile.State`），然后调 `Compiler.Compile`。
 
-1. 新增 `BuildCompileState(Rules) compile.State`：
-   DB 实体 → `compile.State`（`model.Rule` 用 `netip.AddrPort`，需解析地址）
-2. `ExpectationDigest` 改为：
-   `Compiler.Compile(state)` → 遍历 `Plan.Nft.Snat/Dnat/Forward` →
-   每个 `compile.Rule` 转成 `RuleDigest`（**包含** Src/Dst/MetaMarkNotSet 等条件）
-3. 重新比对；若仍不等价，差异就是真实的「新编译器与旧实现的语义差异」，
-   那才是 B-2 之前真正要讨论的
+**实测失败**：
 
-这样做的额外收益：`BuildCompileState` 是 B-2 装配时**必须要有**的代码，
-现在写正好复用。
+```
+digests=0 err=编译失败: 配置校验失败: 校验规则[test#30] 失败:
+               校验规则失败: 协议 "" 无效（只支持 tcp/udp）
+```
+
+根因不是转换 bug，是**建模不匹配**：
+
+`compile` 层先跑 `rule.Validate`，它要求每条规则的 `Proto ∈ {tcp, udp}`：
+
+```go
+if !r.Proto.Valid() {
+    return fmt.Errorf("校验规则失败: 协议 %q 无效（只支持 tcp/udp）", ...)
+}
+```
+
+但 **SNAT 规则没有「协议」概念** —— 它作用于所有协议的穿越流量。
+现网规则#30 的 `protocol` 字段值是 `"snat"`，不是 `tcp`/`udp`。
+
+`domain.Rule` 的结构是为 **DNAT**（端口转发：`Proto` + `ListenAt` + `Backend`）
+设计的，SNAT 只有「源集合 + 出口 + 目标地址」，套不进那个形状。
+
+### 这条缺口的影响
+
+| 项 | 状态 |
+|---|---|
+| B-1 的「走真实编译路径」 | ❌ 阻塞 |
+| 手写映射（`ExpectationDigest`） | ⚠️ 可用但表达力不足（不含前置条件） |
+| B-2 装配 | ❌ 阻塞（SNAT 规则无法编译，就没法下发） |
+
+### 必须先补的设计缺口（S0 遗留）
+
+`compile` 层需要为 SNAT 引入**独立类型**（或放宽 `rule.Validate` 对 SNAT 的协议要求）。
+两个方向的取舍：
+
+| 方案 | 做法 | 代价 |
+|---|---|---|
+| **A · 独立类型** | 新增 `compile.SnatRule`（源集合 + 出口 + 目标 + 前置条件），`CompileSnat` 改用它 | `compile.Compiler` 的 `State.Rules` 要拆成 `DnatRules` / `SnatRules` |
+| **B · 放宽校验** | `rule.Validate` 对 `Proto == "snat"` 跳过协议检查 | 语义混乱：`Proto` 字段既存协议又存规则类型 |
+
+**我倾向 A**：SNAT 与 DNAT 本来就是两类规则（一个是「谁能穿出去」，一个
+是「谁能进到后端」），共用一个结构只会让两边都别扭。B 方案会让
+`Proto` 字段变成「有时是协议、有时是类型」的双关，与 AGENTS.md
+记录的「字段语义要单一」原则冲突。
+
+这是 S0 阶段的设计缺口，当时只按 DNAT 建模、SNAT 留了 TODO 没验证。
+**B-2 开工前必须先补这一块。**
+
+---
+
+## 下一步
+
+1. **补 compile 的 SNAT 建模**（方案 A）→ 这是 B-2 的前置
+2. 补完后 B-1 自动可用：`ExpectationDigest` 改走编译路径，重新比对
+3. 拿到真实差异后再决定 B-2 怎么做
 
 ---
 

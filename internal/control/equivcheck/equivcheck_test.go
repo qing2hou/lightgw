@@ -3,8 +3,11 @@ package equivcheck
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"strings"
 	"testing"
+
+	dbmodel "haproxyweb/internal/model"
 )
 
 // realNftOutput 是 .170 上 `nft -a list table inet haweb` 的真实输出形态。
@@ -194,5 +197,159 @@ func TestSplitList(t *testing.T) {
 				t.Fatalf("splitList(%q) = %v，期望 %v", c.in, got, c.want)
 			}
 		}
+	}
+}
+
+// TestCompileStateExpandsACLGroup 名单组必须被展开（缺口 1 的回归）。
+func TestCompileStateExpandsACLGroup(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 30, Protocol: "snat", Enabled: true,
+			AclMode: "whitelist", AllowList: "", AclGroupID: 1,
+			SnatIP: "192.168.10.170",
+		}},
+		AclGroups: []dbmodel.AclGroup{{
+			ID: 1, Mode: "whitelist",
+			Entries: `["192.168.10.152","192.168.10.151"]`,
+		}},
+	}
+	st, warns := CompileState(rules, 1)
+	for _, w := range warns {
+		t.Logf("warn: %s", w)
+	}
+	if len(st.Rules) != 1 {
+		t.Fatalf("应转换出 1 条规则，实际 %d", len(st.Rules))
+	}
+	if len(st.Rules[0].ACL) != 2 {
+		t.Fatalf("★ 名单组应展开成 2 个源，实际 %d: %v", len(st.Rules[0].ACL), st.Rules[0].ACL)
+	}
+}
+
+// TestCompileStateMissingGroupSkips 引用的名单组不存在时跳过并告警（不当作无源）。
+func TestCompileStateMissingGroup(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 30, Protocol: "snat", Enabled: true, AclGroupID: 99,
+			SnatIP: "192.168.10.170",
+		}},
+	}
+	st, warns := CompileState(rules, 1)
+	if len(st.Rules) != 0 {
+		t.Fatalf("组不存在应跳过，实际转换出 %d 条", len(st.Rules))
+	}
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "名单组#99") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("应告警说明组#99 不存在，实际 %v", warns)
+	}
+}
+
+// TestCompileStateSkipsUserlandRules tcp/udp 规则不进 nft 比对面。
+func TestCompileStateSkipsUserlandRules(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 3, Protocol: "tcp", Enabled: true,
+		}},
+	}
+	st, _ := CompileState(rules, 1)
+	if len(st.Rules) != 0 {
+		t.Fatalf("tcp 规则不应进 compile.State.Rules，实际 %d 条", len(st.Rules))
+	}
+}
+
+// TestCompileStateDisabledSkipped 禁用规则不参与编译。
+func TestCompileStateDisabledSkipped(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 30, Protocol: "snat", Enabled: false, SnatIP: "192.168.10.170",
+			AllowList: `["192.168.10.152"]`,
+		}},
+	}
+	st, _ := CompileState(rules, 1)
+	if len(st.Rules) != 0 {
+		t.Fatal("禁用规则不应参与编译")
+	}
+}
+
+// TestExpectFromDBReportsModelingGap 走真实编译路径会失败，且错误说明原因。
+//
+// **这是一条「记录已知缺陷」的测试，不是「验证功能正常」的测试。**
+//
+// 实测发现：compile 层的 rule.Validate 要求 Proto ∈ {tcp,udp}，
+// 但 SNAT 规则没有协议概念（现网规则#30 的 protocol 字段是 "snat"）。
+// 这是 S0 遗留的建模缺口：domain.Rule 是为 DNAT（端口转发）设计的。
+//
+// 本测试固化这个事实，防止有人误以为「B-1 的等价性比对已经可用」。
+// 等 compile 层补上 SNAT 独立类型后，本测试应改为断言成功。
+func TestExpectFromDBReportsModelingGap(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 30, Name: "test", Protocol: "snat", Enabled: true,
+			AclMode: "whitelist", AclGroupID: 1, SnatIP: "192.168.10.170",
+		}},
+		AclGroups: []dbmodel.AclGroup{{
+			ID: 1, Mode: "whitelist", Entries: `["192.168.10.152"]`,
+		}},
+		Egresses: []dbmodel.Egress{{ID: 4, Name: "eth0", Iface: "eth0"}},
+	}
+	_, _, err := ExpectFromDB(rules, 1)
+	if err == nil {
+		t.Fatal("★ 建模缺口已修？请把本测试改为断言成功，并更新 docs/equivcheck-result.md")
+	}
+	if !strings.Contains(err.Error(), "建模不匹配") {
+		t.Fatalf("错误应说明建模不匹配，实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "SNAT") {
+		t.Fatalf("错误应提到 SNAT，实际: %v", err)
+	}
+}
+
+// TestCompileStateProducesRule 转换本身能产出规则（缺口在 Compile 不在转换）。
+func TestCompileStateProducesRule(t *testing.T) {
+	rules := Rules{
+		ForwardRules: []dbmodel.ForwardRule{{
+			ID: 30, Name: "test", Protocol: "snat", Enabled: true,
+			AclGroupID: 1, SnatIP: "192.168.10.170",
+		}},
+		AclGroups: []dbmodel.AclGroup{{
+			ID: 1, Mode: "whitelist", Entries: `["192.168.10.152"]`,
+		}},
+		Egresses: []dbmodel.Egress{{ID: 4, Name: "eth0", Iface: "eth0"}},
+	}
+	st, warns := CompileState(rules, 1)
+	for _, w := range warns {
+		t.Logf("warn: %s", w)
+	}
+	if len(st.Rules) != 1 {
+		t.Fatalf("转换应产出 1 条规则，实际 %d", len(st.Rules))
+	}
+	r := st.Rules[0]
+	if r.Pool.Len() != 1 {
+		t.Fatalf("SNAT 目标池应有 1 个地址，实际 %d", r.Pool.Len())
+	}
+	if len(r.ACL) != 1 {
+		t.Fatalf("白名单应有 1 个源，实际 %d", len(r.ACL))
+	}
+}
+
+// TestPrefixToHex 网段转十六进制。
+func TestPrefixToHex(t *testing.T) {
+	cases := [][2]string{
+		{"192.168.10.152/32", "0xc0a80a98"},
+		{"10.0.0.0/8", "0x0a000000"},
+	}
+	for _, c := range cases {
+		p := netip.MustParsePrefix(c[0])
+		if got := prefixToHex(p); got != c[1] {
+			t.Fatalf("prefixToHex(%q) = %q，期望 %q", c[0], got, c[1])
+		}
+	}
+	// IPv6 原样返回（B-1 只处理 v4）
+	if got := prefixToHex(netip.MustParsePrefix("2001:db8::/32")); got != "2001:db8::/32" {
+		t.Fatalf("IPv6 应原样返回，实际 %q", got)
 	}
 }
