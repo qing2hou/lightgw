@@ -22,7 +22,7 @@
              引擎代码仍在（internal/proxy/dnat_nft.go），恢复入口时把菜单项与
              router/index.js 里的 dnat-rules 路由一起加回来即可。 -->
         <el-menu-item index="/fw-policies">
-          <el-icon><Lock /></el-icon><span>防火墙策略</span>
+          <el-icon><Lock /></el-icon><span>全局防火墙策略</span>
         </el-menu-item>
         <el-menu-item index="/sessions">
           <el-icon><Connection /></el-icon><span>会话表</span>

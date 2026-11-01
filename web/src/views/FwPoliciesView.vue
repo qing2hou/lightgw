@@ -4,7 +4,7 @@
       <div class="toolbar">
         <div class="toolbar-left">
           <el-button type="primary" :icon="Plus" @click="openCreate">新建策略</el-button>
-          <span class="tip">有序访问策略（先命中先适用）：drop 终结拒绝，accept 放行打标——已建会话不受影响</span>
+          <span class="tip">全局策略（作用于全部转发流量，非某条规则）：先命中先适用；drop 终结拒绝，accept 放行打标</span>
         </div>
         <el-button :icon="Refresh" circle @click="load" />
       </div>
