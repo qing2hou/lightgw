@@ -603,6 +603,14 @@ type session struct {
 	// cfgPtr 规则运行时配置的原子指针（TCP[tcpEntry.cfg] / 该指针变化时存量
 	// 会话的热跟随通道）。nil 时 currentLimiter 走快照回退（测试构造兼容）。
 	cfgPtr *atomic.Pointer[ruleConfig]
+	// dialLocal 是网关拨后端时内核分配的本地端口（int）。
+	//
+	// 用途：端口映射是用户态转发，conntrack 里有**两条**记录——
+	// 入向段（客户端 → 网关监听口）与出向段（网关 dial 来源端口 → 后端）。
+	// 会话表要把这两段合并成一条展示，关联键就是出向段的本地端口
+	// （出向段的 src ip 恒为网关本机地址，端口才区分连接）。
+	// 0 表示 dial 尚未完成/失败（UDP 无此概念）。
+	dialLocalPort atomic.Int64
 }
 
 // touch 更新连接级活动时刻（任一方向收到数据即调用）。
@@ -668,6 +676,7 @@ func (m *Manager) ActiveSessions() []model.SessionInfo {
 			ListenIP:      s.listenIP,
 			ListenPort:    s.listenPort,
 			TargetAddr:    s.rule.TargetAddr,
+			DialLocalPort: int(s.dialLocalPort.Load()),
 			UploadBytes:   s.up.Load(),
 			DownloadBytes: s.down.Load(),
 			StartedAt:     s.start,

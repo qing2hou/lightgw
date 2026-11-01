@@ -34,7 +34,7 @@
         <el-table-column label="实际后端" min-width="180">
           <template #default="{ row }">
             <code v-if="row.backend">{{ row.backend }}</code>
-            <span v-else class="sub" title="内核转发的会话（snat）没有应用层后端；端口映射的会话需仍在进程中">—</span>
+            <span v-else class="sub" title="该会话没有应用层后端（SNAT 穿越是纯内核转发），或网关拨号尚未完成">—</span>
           </template>
         </el-table-column>
         <el-table-column label="归属" width="180" show-overflow-tooltip>

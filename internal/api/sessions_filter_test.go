@@ -157,8 +157,8 @@ func TestSessionsBackendEmptyWhenUnrelated(t *testing.T) {
 		{"完全无关的 snat 会话", "192.168.10.152:33668", "42.237.113.74:443"},
 	}
 	for _, c := range cases {
-		if got := idx.lookupBackend(c.src, c.dst); got != "" {
-			t.Fatalf("★ %s 不应关联到后端，实际 %q", c.name, got)
+		if got := idx.lookupSession(c.src, c.dst); got != nil {
+			t.Fatalf("★ %s 不应关联到后端，实际 %+v", c.name, got)
 		}
 	}
 }
@@ -176,8 +176,8 @@ func TestSessionsBackendMalformedInput(t *testing.T) {
 		{"172.16.30.3:abc", "172.16.40.10:2222"},
 		{"172.16.30.3:63886", "bad"},
 	} {
-		if got := idx.lookupBackend(c[0], c[1]); got != "" {
-			t.Fatalf("畸形输入 %v 应返回空，实际 %q", c, got)
+		if got := idx.lookupSession(c[0], c[1]); got != nil {
+			t.Fatalf("畸形输入 %v 应返回空，实际 %+v", c, got)
 		}
 	}
 }
@@ -188,8 +188,8 @@ func TestSessionsSkipSessionsWithoutTarget(t *testing.T) {
 	idx := buildBackendIndex([]model.SessionInfo{
 		{SourceIP: "10.0.0.1", SourcePort: 1, ListenIP: "10.0.0.2", ListenPort: 2},
 	})
-	if len(idx) != 0 {
-		t.Fatalf("target_addr 为空的会话不应进索引，实际 %d 条", len(idx))
+	if len(idx.byClient) != 0 {
+		t.Fatalf("target_addr 为空的会话不应进索引，实际 %d 条", len(idx.byClient))
 	}
 }
 
@@ -209,5 +209,99 @@ func TestSessionsSearchMatchesBackend(t *testing.T) {
 	got := filterSessions(snaps, idx, "", "172.16.30.20", 500)
 	if len(got) != 1 || got[0].ID != "a" {
 		t.Fatalf("★ 搜后端 172.16.30.20 应只剩会话 a，实际 %+v", got)
+	}
+}
+
+// TestSessionsMergeDialLeg 端口映射的一条逻辑连接在 conntrack 里是两段，
+// 会话表必须合并成**一行**。
+//
+// 生产实例（规则 #33，VIP 172.16.40.10:2222 → 后端 172.16.30.20:22）：
+//
+//	入向段: src=172.16.30.3:63858 dst=172.16.40.10:2222
+//	出向段: src=172.16.40.10:56191 dst=172.16.30.20:22   ← 网关 dial 的本地端口
+//
+// 两段本是同一条连接，用户之前反馈"这两个不是一条流量吗"。
+func TestSessionsMergeDialLeg(t *testing.T) {
+	snaps := []proxy.CTSnapshot{
+		{ID: "client", Proto: "tcp",
+			Src: "172.16.30.3:63858", Dst: "172.16.40.10:2222", State: "ESTABLISHED"},
+		{ID: "dial", Proto: "tcp",
+			Src: "172.16.40.10:56191", Dst: "172.16.30.20:22", State: "ESTABLISHED"},
+	}
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63858,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr:    "172.16.30.20:22",
+		DialLocalPort: 56191,
+	}})
+
+	got := filterSessions(snaps, idx, "", "", 500)
+	if len(got) != 1 {
+		t.Fatalf("★ 两段应合并成 1 行，实际 %d 行: %+v", len(got), got)
+	}
+	if got[0].ID != "client" {
+		t.Fatalf("保留的应是入向段（client），实际 %q", got[0].ID)
+	}
+	if got[0].Backend != "172.16.30.20:22" {
+		t.Fatalf("后端应为 172.16.30.20:22，实际 %q", got[0].Backend)
+	}
+}
+
+// TestSessionsDialLegPortReuseGuard dial 端口会被内核复用，仅凭端口命中
+// 不得把无关连接误判成出向段而隐藏掉——目的地址必须也匹配。
+func TestSessionsDialLegPortReuseGuard(t *testing.T) {
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63858,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr:    "172.16.30.20:22",
+		DialLocalPort: 56191,
+	}})
+
+	// 源端口撞上 56191，但目的地址不是该会话的后端 → 不是出向段，必须保留
+	snaps := []proxy.CTSnapshot{
+		{ID: "client", Proto: "tcp",
+			Src: "172.16.30.3:63858", Dst: "172.16.40.10:2222", State: "ESTABLISHED"},
+		{ID: "unrelated", Proto: "tcp",
+			Src: "172.16.40.10:56191", Dst: "8.8.8.8:443", State: "ESTABLISHED"},
+	}
+	got := filterSessions(snaps, idx, "", "", 500)
+	if len(got) != 2 {
+		t.Fatalf("★ 目的地址不匹配时不得合并（端口复用保护），应保留 2 行，实际 %d", len(got))
+	}
+	var sawUnrelated bool
+	for _, v := range got {
+		if v.ID == "unrelated" {
+			sawUnrelated = true
+		}
+	}
+	if !sawUnrelated {
+		t.Fatal("★ 无关连接被误判成出向段而隐藏了")
+	}
+}
+
+// TestSessionsNoDialLocalPortKeepsBothLegs DialLocalPort=0（dial 未完成/失败）
+// 时无法合并，两段各自显示——宁可多一行，不能凭空吞掉一条连接。
+func TestSessionsNoDialLocalPortKeepsBothLegs(t *testing.T) {
+	snaps := []proxy.CTSnapshot{
+		{ID: "client", Proto: "tcp",
+			Src: "172.16.30.3:63858", Dst: "172.16.40.10:2222", State: "ESTABLISHED"},
+		{ID: "dial", Proto: "tcp",
+			Src: "172.16.40.10:56191", Dst: "172.16.30.20:22", State: "ESTABLISHED"},
+	}
+	idx := buildBackendIndex([]model.SessionInfo{{
+		SourceIP: "172.16.30.3", SourcePort: 63858,
+		ListenIP: "172.16.40.10", ListenPort: 2222,
+		TargetAddr: "172.16.30.20:22",
+		// DialLocalPort 故意为 0
+	}})
+	got := filterSessions(snaps, idx, "", "", 500)
+	if len(got) != 2 {
+		t.Fatalf("★ 无 dial 端口时不应合并，应保留 2 行，实际 %d", len(got))
+	}
+	// 但入向段仍应拿到后端地址
+	for _, v := range got {
+		if v.ID == "client" && v.Backend != "172.16.30.20:22" {
+			t.Fatalf("入向段仍应显示后端，实际 %q", v.Backend)
+		}
 	}
 }

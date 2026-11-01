@@ -217,15 +217,22 @@ type AuditLog struct {
 
 // SessionInfo 活跃会话实时信息（仅内存，不落库）。
 type SessionInfo struct {
-	ID            int64     `json:"id"`
-	RuleID        uint      `json:"rule_id"`
-	RuleName      string    `json:"rule_name"`
-	Protocol      string    `json:"protocol"`
-	SourceIP      string    `json:"source_ip"`
-	SourcePort    int       `json:"source_port"`
-	ListenIP      string    `json:"listen_ip"`
-	ListenPort    int       `json:"listen_port"`
-	TargetAddr    string    `json:"target_addr"`
+	ID         int64  `json:"id"`
+	RuleID     uint   `json:"rule_id"`
+	RuleName   string `json:"rule_name"`
+	Protocol   string `json:"protocol"`
+	SourceIP   string `json:"source_ip"`
+	SourcePort int    `json:"source_port"`
+	ListenIP   string `json:"listen_ip"`
+	ListenPort int    `json:"listen_port"`
+	TargetAddr string `json:"target_addr"`
+	// DialLocalPort 是网关拨后端时内核分配的本地端口（0 = 未知/UDP）。
+	//
+	// 端口映射是用户态转发，conntrack 里是两条独立连接：
+	//   入向段：客户端 ip:port → 网关监听 ip:port
+	//   出向段：网关拨号源 ip:DialLocalPort → 后端 TargetAddr
+	// 会话表用它把两段合并成一条展示，避免同一逻辑连接出现两行。
+	DialLocalPort int       `json:"dial_local_port"`
 	UploadBytes   int64     `json:"upload_bytes"`
 	DownloadBytes int64     `json:"download_bytes"`
 	StartedAt     time.Time `json:"started_at"`

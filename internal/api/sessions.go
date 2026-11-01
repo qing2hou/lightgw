@@ -35,13 +35,24 @@ type ctSessionView struct {
 	State   string `json:"state"`
 }
 
-// backendIndex 是「conntrack 四元组 → 后端地址」索引。
+// backendIndex 是「conntrack 记录 → 用户态会话」的关联索引。
 //
-// key 由 4 个字段拼成（src ip|src port|listen ip|listen port），
-// 与 conntrack 行的 orig 元组一一对应：客户端发起连接到网关的监听口。
-// 端口映射是用户态转发，这条 conntrack 记录的就是「客户端 ↔ 网关」，
-// 后端地址在进程内会话里，只能靠这个键关联。
-type backendIndex map[string]string
+// 端口映射是用户态转发，一条逻辑连接在 conntrack 里是**两条**：
+//
+//	入向段（clientLeg）：客户端 ip:sport → 网关监听 ip:dport
+//	出向段（dialLeg）：  网关 dial 源 ip:lport → 后端 ip:dport
+//
+// 会话表要展示成一行，所以需要两种关联：
+//
+//	byClient  四元组(客户端 + 监听口) → 会话，用于给入向段补后端地址
+//	byDialPort dial 本地端口           → 会话，用于识别并**吞掉**出向段那一行
+//
+// 出向段只按端口匹配：它的源 ip 恒为网关本机地址，端口才是唯一区分键。
+// （同一网关同时有多个端口映射时，不同连接的 dial 端口必然不同。）
+type backendIndex struct {
+	byClient   map[string]*model.SessionInfo // key = backendKey(...)
+	byDialPort map[int]*model.SessionInfo    // key = dial 本地端口
+}
 
 // backendKey 拼关联键。用 \x00 分隔避免 IP/端口的字符串歧义。
 func backendKey(srcIP string, srcPort int, listenIP string, listenPort int) string {
@@ -52,43 +63,82 @@ func backendKey(srcIP string, srcPort int, listenIP string, listenPort int) stri
 // buildBackendIndex 从用户态会话表建关联索引。
 //
 // 只收 target_addr 非空的会话（tcp/udp 端口映射才有后端；snat/dnat 走内核，
-// 不会有对应 session 条目）。
-func buildBackendIndex(sessions []model.SessionInfo) backendIndex {
-	idx := make(backendIndex, len(sessions))
-	for _, s := range sessions {
+// 不会有对应 session 条目）。DialLocalPort 为 0 的会话不进 byDialPort
+// （dial 尚未完成或失败），此时出向段无法合并，会单独显示。
+func buildBackendIndex(sessions []model.SessionInfo) *backendIndex {
+	idx := &backendIndex{
+		byClient:   make(map[string]*model.SessionInfo, len(sessions)),
+		byDialPort: make(map[int]*model.SessionInfo, len(sessions)),
+	}
+	for i := range sessions {
+		s := &sessions[i]
 		if s.TargetAddr == "" {
 			continue
 		}
-		idx[backendKey(s.SourceIP, s.SourcePort, s.ListenIP, s.ListenPort)] = s.TargetAddr
+		idx.byClient[backendKey(s.SourceIP, s.SourcePort, s.ListenIP, s.ListenPort)] = s
+		if s.DialLocalPort > 0 {
+			idx.byDialPort[s.DialLocalPort] = s
+		}
 	}
 	return idx
 }
 
-// lookupBackend 按 conntrack 视图里的 src/dst 反查后端地址。
+// lookupSession 按入向段的 src/dst 反查会话。
 //
-// src/dst 是 "ip:port" 形式（net.JoinHostPort 产出）。解析失败返回空串——
+// src/dst 是 "ip:port" 形式（net.JoinHostPort 产出）。解析失败返回 nil——
 // 宁可少显示一列，也不能因为格式异常让整个会话表 500。
-func (b backendIndex) lookupBackend(src, dst string) string {
-	if len(b) == 0 {
-		return ""
+func (b *backendIndex) lookupSession(src, dst string) *model.SessionInfo {
+	if b == nil || len(b.byClient) == 0 {
+		return nil
 	}
 	sip, sport, err := net.SplitHostPort(src)
 	if err != nil {
-		return ""
+		return nil
 	}
 	dip, dport, err := net.SplitHostPort(dst)
 	if err != nil {
-		return ""
+		return nil
 	}
 	sp, err1 := strconv.Atoi(sport)
 	dp, err2 := strconv.Atoi(dport)
 	if err1 != nil || err2 != nil {
-		return ""
+		return nil
 	}
-	return b[backendKey(sip, sp, dip, dp)]
+	return b.byClient[backendKey(sip, sp, dip, dp)]
 }
 
-// listSessions 会话列表（?proto=&q=&limit=）。
+// dialLegOwner 判断某条 conntrack 行是否是「端口映射的出向段」，
+// 是则返回它归属的会话（该行应被合并、不单独展示）。
+//
+// 判据（两个都必须满足）：
+//  1. 该行的**源端口**命中某会话的 DialLocalPort
+//  2. 该行的**目的地址**等于该会话的 TargetAddr
+//
+// 第 2 条是必要的双保险：dial 端口会被内核复用，仅凭端口命中有可能
+// 把一条无关连接（恰好复用了同端口）误判成出向段而隐藏掉。
+func (b *backendIndex) dialLegOwner(src, dst string) *model.SessionInfo {
+	if b == nil || len(b.byDialPort) == 0 {
+		return nil
+	}
+	_, sport, err := net.SplitHostPort(src)
+	if err != nil {
+		return nil
+	}
+	sp, err := strconv.Atoi(sport)
+	if err != nil {
+		return nil
+	}
+	s := b.byDialPort[sp]
+	if s == nil {
+		return nil
+	}
+	// 目的地址必须与会话的后端一致（大小写归一：IPv6 十六进制可能不同写法）
+	if !strings.EqualFold(dst, s.TargetAddr) {
+		return nil
+	}
+	return s
+}
+
 // listSessions 会话列表（?proto=&q=&limit=）。
 //
 // **只返回 ESTABLISHED 状态的会话**（产品决定 2026-11-01）。
@@ -110,14 +160,16 @@ func (h *handlers) listSessions(c *gin.Context) {
 
 // filterSessions 把 conntrack 快照筛成会话表行。
 //
-// 抽成纯函数而不是写在 handler 里：过滤规则（尤其"只留 ESTABLISHED"）
-// 是产品语义，必须有单元测试盯着——写在 handler 里就只能靠起 HTTP 服务测。
+// 抽成纯函数而不是写在 handler 里：过滤规则（尤其"只留 ESTABLISHED"、
+// "合并两段"）是产品语义，必须有单元测试盯着——写在 handler 里就只能
+// 靠起 HTTP 服务测。
 //
-// 过滤顺序：状态 → 协议 → 关键词 → 截断。
+// 过滤顺序：状态 → 协议 → **合并出向段** → 关键词 → 截断。
 // 状态过滤放在最前，保证 limit 截的是真实活跃会话，而不是被 TIME_WAIT 占满。
 //
-// backend 索引可为 nil（无用户态会话时）——此时 Backend 列留空，不影响其它列。
-func filterSessions(sessions []proxy.CTSnapshot, backend backendIndex, proto, q string, limit int) []ctSessionView {
+// backend 可为 nil（无用户态会话时）——此时 Backend 列留空、两段不合并，
+// 每条 conntrack 记录各占一行（退化行为，不影响其它列）。
+func filterSessions(sessions []proxy.CTSnapshot, backend *backendIndex, proto, q string, limit int) []ctSessionView {
 	items := make([]ctSessionView, 0, len(sessions))
 	for _, s := range sessions {
 		// 只保留 ESTABLISHED（产品决定 2026-11-01）：其余状态
@@ -130,11 +182,18 @@ func filterSessions(sessions []proxy.CTSnapshot, backend backendIndex, proto, q 
 		if proto != "" && s.Proto != proto {
 			continue
 		}
+		// 端口映射的出向段（网关 → 后端）不单独成行：它是同一逻辑连接的
+		// 后半段，后端信息已经并到入向段那一行。留着会让一条连接显示两行。
+		if backend.dialLegOwner(s.Src, s.Dst) != nil {
+			continue
+		}
 		v := ctSessionView{
 			ID: s.ID, Proto: s.Proto,
 			Src: s.Src, Dst: s.Dst, SrcAfter: s.SrcAfter,
-			Backend: backend.lookupBackend(s.Src, s.Dst),
-			Router:  s.Router, State: s.State,
+			Router: s.Router, State: s.State,
+		}
+		if owner := backend.lookupSession(s.Src, s.Dst); owner != nil {
+			v.Backend = owner.TargetAddr
 		}
 		if q != "" {
 			blob := strings.ToLower(v.Proto + " " + v.Src + " " + v.Dst + " " +

@@ -200,6 +200,12 @@ func (m *Manager) handleTCPConn(e *tcpEntry, client net.Conn) {
 		return
 	}
 	defer backend.Close()
+	// 记录 dial 的本地端口：会话表据此把 conntrack 的入向段与出向段合并成
+	// 一条（端口映射是用户态转发，内核里是两条独立连接）。
+	// 出向段的源 ip 恒为网关本机地址，端口才是区分不同连接的键。
+	if la, ok := backend.LocalAddr().(*net.TCPAddr); ok {
+		sess.dialLocalPort.Store(int64(la.Port))
+	}
 	// panic 隔离：转发协程异常退出时补记一条流量日志，不让进程崩溃
 	defer func() {
 		if r := recover(); r != nil {
