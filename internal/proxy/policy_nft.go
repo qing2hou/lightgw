@@ -289,7 +289,25 @@ func encodeCTID(c *ctSession) string {
 // 实现顺序：先试用户态会话（命中即真断），再回落 conntrack -D。
 // 两类都做，覆盖"用户态会话已结束但 conntrack 表项仍在 TIME_WAIT"的情况。
 func (m *Manager) KillSessionByID(id string) (int, error) {
-	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(id))
+	trimmed := strings.TrimSpace(id)
+	// 进程内会话（端口映射）的 id 形如 "u:<ruleID>:<srcIP>:<srcPort>"。
+	// 这类会话不经过 conntrack，必须走用户态强制关闭路径。
+	if rest, ok := strings.CutPrefix(trimmed, "u:"); ok {
+		parts := strings.SplitN(rest, ":", 3)
+		if len(parts) != 3 {
+			return 0, fmt.Errorf("会话 id 内容无效")
+		}
+		srcIP, sportStr := parts[1], parts[2]
+		sp, err := strconv.Atoi(sportStr)
+		if err != nil {
+			return 0, fmt.Errorf("会话 id 内容无效")
+		}
+		if m.killUserSessionBySrc(srcIP, sp) {
+			return 1, nil
+		}
+		return 0, nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(trimmed)
 	if err != nil {
 		return 0, fmt.Errorf("会话 id 格式错误")
 	}
@@ -331,6 +349,33 @@ func (m *Manager) KillSessionByID(id string) (int, error) {
 //
 // 注意 UDP 会话的 srcIP/srcPort 记录的是**客户端**地址（与 TCP 一致），
 // 所以同一套匹配逻辑对两种协议都成立。
+// killUserSessionBySrc 按「客户端 IP + 客户端端口」找到进程内会话并强制断开。
+//
+// 用于会话表里 "u:" 前缀的 id（端口映射会话，不经过 conntrack）。
+// 客户端 IP+端口在一条连接的生命周期内唯一，足以定位。
+func (m *Manager) killUserSessionBySrc(srcIP string, srcPort int) bool {
+	var hit *session
+	m.sessions.Range(func(_, v any) bool {
+		s, ok := v.(*session)
+		if !ok {
+			return true
+		}
+		if s.srcIP == srcIP && s.srcPort == srcPort {
+			hit = s
+			return false
+		}
+		return true
+	})
+	if hit == nil {
+		return false
+	}
+	if !hit.forceClose() {
+		return false
+	}
+	logf("规则[%s#%d] 会话已掐断（用户态）: %s:%d", hit.rule.Name, hit.rule.ID, srcIP, srcPort)
+	return true
+}
+
 func (m *Manager) killUserSession(proto, srcIP string, srcPort int, listenIP string, listenPort int) bool {
 	var hit *session
 	m.sessions.Range(func(_, v any) bool {

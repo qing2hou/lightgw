@@ -144,6 +144,15 @@ func (b *backendIndex) dialLegOwner(src, dst string) *model.SessionInfo {
 // **只返回 ESTABLISHED 状态的会话**（产品决定 2026-11-01）。
 // 过滤放在后端而不是前端：`total` 要是真实的 ESTABLISHED 条数，
 // 且掐断接口按 id 操作——前端隐藏行、后端仍返回会让两处语义打架。
+//
+// 数据源是**两个**，必须合并：
+//
+//	conntrack         —— 内核转发的会话（SNAT 穿越、DNAT 发布）
+//	进程内 sessions   —— 用户态转发的会话（端口映射 tcp/udp）
+//
+// 端口映射由网关进程 accept 后重新 dial 后端，**完全不经过 netfilter 的
+// conntrack 钩子**（实测：重装后 conntrack_count=0，而端口映射正在跑 1.7GB
+// 流量）。只查 conntrack 会让会话表对端口映射永远显示"共 0 条"。
 func (h *handlers) listSessions(c *gin.Context) {
 	sessions := h.Mgr.SnapshotSessions()
 	proto := strings.ToLower(strings.TrimSpace(c.Query("proto")))
@@ -152,9 +161,13 @@ func (h *handlers) listSessions(c *gin.Context) {
 	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 && v <= 5000 {
 		limit = v
 	}
-	// 用户态会话表只用来反查后端地址（端口映射的后端只有这里知道）。
-	idx := buildBackendIndex(h.Mgr.ActiveSessions())
+	// 用户态会话：既用于给 conntrack 行补后端地址，也用于**独立成行**
+	// （端口映射根本不进 conntrack，见 listSessions 的说明）。
+	userSessions := h.Mgr.ActiveSessions()
+	idx := buildBackendIndex(userSessions)
 	items := filterSessions(sessions, idx, proto, q, limit)
+	// 合并进程内会话：端口映射的会话不在 conntrack 里，必须单独补进来。
+	items = appendUserSessions(items, userSessions, proto, q, limit)
 	c.JSON(200, gin.H{"items": items, "total": len(items)})
 }
 
@@ -236,4 +249,45 @@ func (h *handlers) killSession(c *gin.Context) {
 	}
 	h.Audit.Record(h.username(c), "session_kill", fmt.Sprintf("掐断会话 %s", in.ID), h.clientIP(c))
 	c.JSON(200, gin.H{"killed": killed})
+}
+
+// appendUserSessions 把进程内会话（端口映射）补进会话表。
+//
+// 为什么必须单独补：端口映射由网关进程 accept 后重新 dial 后端，
+// **不经过 netfilter 的 conntrack 钩子**。实测（2026-11-02 重装后）：
+// 端口映射正在传 1.7GB，但 `conntrack -L` 返回 "0 flow entries"，
+// 会话表因此永远显示"共 0 条"——用户以为没生效。
+//
+// 这些行的 ID 用进程内会话 id 的稳定编码（带 "u:" 前缀区分于 conntrack 的
+// base64 四元组），掐断接口据此识别走哪条路径。
+func appendUserSessions(items []ctSessionView, userSessions []model.SessionInfo, proto, q string, limit int) []ctSessionView {
+	for _, s := range userSessions {
+		if proto != "" && s.Protocol != proto {
+			continue
+		}
+		// ID 前缀 "u:" 标明这是进程内会话，KillSessionByID 据此走用户态关闭路径。
+		// 用 rule_id + 源端口做稳定标识（同一连接在生命周期内不变）。
+		id := fmt.Sprintf("u:%d:%s:%d", s.RuleID, s.SourceIP, s.SourcePort)
+		v := ctSessionView{
+			ID:      id,
+			Proto:   s.Protocol,
+			Src:     net.JoinHostPort(s.SourceIP, strconv.Itoa(s.SourcePort)),
+			Dst:     net.JoinHostPort(s.ListenIP, strconv.Itoa(s.ListenPort)),
+			Backend: s.TargetAddr,
+			// 用户态转发的会话归属就是端口映射本身，不带 snat/dnat 前缀
+			Router: "portmap",
+			State:  ctStateEstablished, // 进程内会话只要在表里就是活跃的
+		}
+		if q != "" {
+			blob := strings.ToLower(v.Proto + " " + v.Src + " " + v.Dst + " " + v.Backend + " " + v.Router)
+			if !strings.Contains(blob, q) {
+				continue
+			}
+		}
+		items = append(items, v)
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items
 }
