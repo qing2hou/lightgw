@@ -230,8 +230,19 @@
         </el-form-item>
 
         <el-divider content-position="left">限速</el-divider>
-        <el-form-item label="限速方式">
-          <span class="sub">本规则不限速——加入带宽包后由包统一配置（合计额度与每源保底在「带宽包」编辑中设置）</span>
+        <el-form-item label="带宽包">
+          <el-select v-model="form.bw_group_id" clearable placeholder="不绑定（不限速）" style="width: 100%">
+            <el-option
+              v-for="g in bwGroups"
+              :key="g.id"
+              :label="`${g.name}（合计 ${fmtKBps(g.total_kbps)} / 每源保底 ${fmtKBps(g.min_kbps)}）`"
+              :value="g.id"
+            />
+          </el-select>
+          <div class="form-tip">
+            选定后本规则受该包额度约束（额度与保底在「带宽包」页配置）。
+            也可以在「带宽包」页把规则加入成员——两条路径等价，都写同一处归属。
+          </div>
         </el-form-item>
         <el-form-item v-if="form.protocol !== 'snat'" label="连接上限">
           <el-input-number v-model="form.max_conns" :min="0" :max="100000" :step="100" />
@@ -361,6 +372,7 @@ const emptyForm = () => ({
   allow: [],
   deny: [],
   acl_group_id: 0,
+  bw_group_id: 0,
   upload_limit_kbps: 0,
   download_limit_kbps: 0,
   max_conns: 0,
@@ -407,6 +419,22 @@ async function loadGroups() {
     const { data } = await api.get('/acl-groups')
     aclGroups.value = data.items || []
   } catch (e) { /* 名单组加载失败不阻塞规则页 */ }
+}
+
+// 带宽包列表：规则表单里可直接绑定/解绑归属。
+// 历史缺陷：这个选择器此前**根本不存在**，后端也忽略 bw_group_id，
+// 用户在规则里"加了带宽包"实际没有绑定，限速永远不生效。
+const bwGroups = ref([])
+async function loadBWGroups() {
+  try {
+    const { data } = await api.get('/bandwidth-groups')
+    bwGroups.value = data.items || []
+  } catch (e) { /* 带宽包加载失败不阻塞规则页 */ }
+}
+const fmtKBps = (kb) => {
+  if (!kb) return '0'
+  if (kb >= 1024) return (kb / 1024).toFixed(kb % 1024 ? 1 : 0) + ' MB/s'
+  return kb + ' KB/s'
 }
 
 const fmtBytes = formatBytes
@@ -479,6 +507,7 @@ function openCreate() {
   allowInput.value = ''
   denyInput.value = ''
   loadGroups()
+  loadBWGroups()
   loadIfaces()
   dialogVisible.value = true
 }
@@ -511,6 +540,7 @@ function openEdit(row) {
     allow: parseListJSON(row.allow_list),
     deny: parseListJSON(row.deny_list),
     acl_group_id: row.acl_group_id || 0,
+    bw_group_id: row.bw_group_id || 0,
     upload_limit_kbps: row.upload_limit_kbps,
     download_limit_kbps: row.download_limit_kbps,
     max_conns: row.max_conns || 0,
@@ -522,6 +552,7 @@ function openEdit(row) {
   allowInput.value = ''
   denyInput.value = ''
   loadGroups()
+  loadBWGroups()
   loadIfaces()
   dialogVisible.value = true
 }
@@ -563,6 +594,8 @@ async function save() {
     // 名单与模式严格对应：未选中的名单不提交，后端亦校验互斥；
     // 引用名单组时直配名单不提交（条目完全来自组）
     acl_group_id: form.acl_mode !== 'off' ? form.acl_group_id || 0 : 0,
+    // 带宽包归属：0 = 不绑包（不限速）。后端白名单已含该列。
+    bw_group_id: form.bw_group_id || 0,
     allow_list: form.acl_mode === 'whitelist' && !form.acl_group_id && form.allow.length ? JSON.stringify(form.allow) : '',
     deny_list: form.acl_mode === 'blacklist' && !form.acl_group_id && form.deny.length ? JSON.stringify(form.deny) : '',
     upload_limit_kbps: 0,
@@ -741,6 +774,7 @@ function openHealth(row) {
 onMounted(() => {
   load()
   loadGroups()
+  loadBWGroups()
   timer = setInterval(() => {
     // 轻量刷新实时统计与后端健康，不闪表格 loading
     const params = { page: page.value, page_size: pageSize.value, protocol: 'tcp,udp' }

@@ -36,6 +36,15 @@ type ruleInput struct {
 	EgressIDs         string `json:"egress_ids"`
 	EgressGw          string `json:"egress_gw"`
 	MinKBps           int64  `json:"min_kbps"`
+	// BWGroupID 所属带宽包（0 = 不绑包）。
+	//
+	// 历史坑：这个字段曾**完全不接受**——规则编辑里的带宽包选择被静默丢弃，
+	// 用户看到界面上选了包、保存成功，但实际 bw_group_id 仍是 0，限速不生效。
+	// 现在两条路径都支持：
+	//   规则侧设置（本字段）—— 编辑规则时直接改归属
+	//   带宽包侧设置（PUT /api/bandwidth-groups/:id 的 member_rule_ids）—— 批量
+	// 两者最终都写 forward_rules.bw_group_id，引擎按同一处读取。
+	BWGroupID         uint   `json:"bw_group_id"`
 	SourceIP          string `json:"source_ip"`
 	UploadLimitKBps   int64  `json:"upload_limit_kbps"`
 	DownloadLimitKBps int64  `json:"download_limit_kbps"`
@@ -73,6 +82,7 @@ func (in *ruleInput) toRule() model.ForwardRule {
 		EgressIDs:         strings.TrimSpace(in.EgressIDs),
 		EgressGw:          strings.TrimSpace(in.EgressGw),
 		MinKBps:           in.MinKBps,
+		BWGroupID:         in.BWGroupID,
 		SourceIP:          strings.TrimSpace(in.SourceIP),
 		UploadLimitKBps:   in.UploadLimitKBps,
 		DownloadLimitKBps: in.DownloadLimitKBps,
@@ -194,6 +204,15 @@ func (in *ruleInput) validate(h *handlers) error {
 		}
 		if !local {
 			return fmt.Errorf("后端连接源 IP %s 不是本机地址（可用见 GET /api/interfaces）", ip)
+		}
+	}
+	// 带宽包必须存在（0 = 不绑包）。否则规则会绑到一个不存在的包上，
+	// 引擎查库失败 → 限速静默不生效（与"编辑忽略该字段"同类的静默失效）。
+	if in.BWGroupID != 0 {
+		var cnt int64
+		h.DB.Model(&model.BWGroup{}).Where("id = ?", in.BWGroupID).Count(&cnt)
+		if cnt == 0 {
+			return fmt.Errorf("带宽包 #%d 不存在", in.BWGroupID)
 		}
 	}
 	return nil
@@ -821,8 +840,7 @@ func (h *handlers) updateRule(c *gin.Context) {
 			return
 		}
 	}
-	// 按输入全字段更新（含 AclMode/AclGroupID/SnatIP——前端两页各自表单显式提供；
-	// BWGroupID 不入列表：带宽包成员关系由带宽包页管理，规则编辑不改归属）
+	// 按输入全字段更新（含 AclMode/AclGroupID/SnatIP——前端两页各自表单显式提供）
 	if err := h.DB.Model(&old).Select(
 		"Name", "Protocol", "ListenAddr", "TargetAddr", "AclMode",
 		"AllowList", "DenyList", "AclGroupID", "SnatIP", "EgressGw", "MinKBps", "SourceIP",
@@ -831,11 +849,15 @@ func (h *handlers) updateRule(c *gin.Context) {
 		// B6：M2/M3 新列显式加入（AGENTS 踩坑：Select 白名单漏新列=编辑静默丢字段）
 		"DnatRejectMode", "SnatMode", "SnatPool", "EgressIDs",
 		"UploadLimitKBps", "DownloadLimitKBps", "MaxConns", "IdleTimeoutSec", "HealthCheck", "Enabled",
+		// 带宽包归属：编辑规则时可直接改（历史坑——曾从白名单里排除并回填旧值，
+		// 导致界面上选了包、保存成功但实际没绑上，限速永远不生效）
+		"BWGroupID",
 	).Updates(rule).Error; err != nil {
 		h.serverError(c, "保存规则", err)
 		return
 	}
-	rule.BWGroupID = old.BWGroupID // 回填库内归属：引擎重建包 class（PUT 输入不含该字段）
+	// 带宽包变更后失效令牌桶缓存，让 Mgr.Apply 按新包重建限速器
+	h.Mgr.ResetBWLimiters()
 	if err := h.Mgr.Apply(rule); err != nil {
 		// 应用失败回滚到旧规则并恢复旧监听；回滚环节的失败必须全部暴露
 		if dbErr := h.DB.Save(&old).Error; dbErr != nil {
