@@ -225,3 +225,54 @@ func TestBothHTBSitesUsePassthroughLeaf(t *testing.T) {
 		t.Fatal("★ 仍有地方用 totalBits 建叶子类（应为 leafClassRateBits）")
 	}
 }
+
+// TestPassthroughFilterForLocalSource 断言 SNAT 限速树里有「源=本机 IP →
+// 直通叶子类」的 filter，且优先级高于按 daddr 分类的下载规则。
+//
+// 回归（2026-11-02 生产实测）：端口映射（用户态转发）的去程包 daddr 是后端
+// 地址，若该后端恰好在本 SNAT 规则的白名单里（同一台机器既是 SNAT 客户端
+// 又是映射后端），会被 `match ip dst <白名单源>` 误判成 SNAT 下载流量并限速。
+// 实测：UDP 打流 1000M 配置，直连 974Mbit/s，经端口映射只有 32.4Mbit/s；
+// 临时删掉 tc 树后恢复到 628Mbit/s —— 证明就是这棵树的误伤。
+//
+// 区分依据：端口映射去程由网关进程生成，源地址是本机 IP；SNAT 转发源是客户端。
+func TestPassthroughFilterForLocalSource(t *testing.T) {
+	body := readSnatGo(t)
+
+	// 必须有 localIPv4s 辅助函数
+	if !strings.Contains(body, "func localIPv4s()") {
+		t.Fatal("★ 缺少 localIPv4s：无法拿到本机 IP 列表来排除端口映射去程")
+	}
+
+	// applyHTBLimit 里必须有 prio 9 的直通 filter（源=本机 → 叶子类）
+	if !strings.Contains(body, `"prio", "9"`) {
+		t.Fatal("★ 缺少 prio 9 直通 filter：端口映射去程会被 SNAT 限速误伤")
+	}
+	// 直通 filter 的 flowid 必须是叶子类（10Gbit 直通），不能是限速子类
+	idx := strings.Index(body, `"prio", "9"`)
+	win := body[idx:min(idx+300, len(body))]
+	if !strings.Contains(win, "leafClassID") {
+		t.Fatalf("★ prio 9 直通 filter 应指向 leafClassID（直通类）。片段:\n%s", win)
+	}
+	if !strings.Contains(win, `"src"`) {
+		t.Fatalf("★ prio 9 直通 filter 必须按 ip src 匹配（本机 IP）。片段:\n%s", win)
+	}
+
+	// 下载分类的 prio 必须是 10（大于 9，确保直通先命中）
+	if !strings.Contains(body, `"prio", "10"`) {
+		t.Fatal("★ 下载分类 filter 的 prio 应为 10（低于直通的 9）")
+	}
+
+	// teardown 必须清理 prio 9 的 filter，否则解绑后残留
+	tdIdx := strings.Index(body, "func (m *Manager) teardownSnatLimitLocked")
+	if tdIdx < 0 {
+		t.Fatal("找不到 teardownSnatLimitLocked")
+	}
+	td := body[tdIdx:]
+	if end := strings.Index(td, "\nfunc "); end > 0 {
+		td = td[:end]
+	}
+	if !strings.Contains(td, `"prio", "9"`) {
+		t.Fatal("★ teardown 未清理 prio 9 直通 filter，解绑后会残留")
+	}
+}

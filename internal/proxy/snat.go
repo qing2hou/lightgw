@@ -46,6 +46,14 @@ type snatEntry struct {
 	dstMode   string   // 目标名单模式（off/whitelist/blacklist；快速路径比对用）
 	dstDeny   []string
 	dstAllow  []string
+	// ifbDev 是上一次 apply 时实际使用的 ifb 设备名（按带宽包隔离）。
+	//
+	// 为什么必须记在 entry（跨 apply 持久）而不是 spec（每次新建）：
+	// 解绑带宽包时 spec.bwGroupID 变成 0，ifbNameFor(0) 得到 "ifb-haweb0"，
+	// 而绑包期间用的是 "ifb-hw<N>"。按新值算会拆错设备，旧 ifb 上的子类与
+	// filter 永久残留 → 表现为"移除带宽包后限速依然生效"。
+	// teardown 用 entry.ifbDev（上次的真值），落空才回退按当前 bwGroupID 算。
+	ifbDev string
 }
 
 // sameForwarding 转发形态（iptables 行 + 策略路由 + tc 挂载点）是否与 spec 一致：
@@ -280,7 +288,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		// （B1：出口 up/down 翻转与 egress_ids 变更不在 sameForwarding 维度内，
 		//  由 egressDirty 强制全路径——否则切换/回切/分担变化全部被吞）
 		if old != nil && !m.egressDirty.Load() && old.sameForwarding(spec) {
-			if err := m.applySnatLimit(spec); err != nil {
+			if err := m.applySnatLimit(spec, old); err != nil {
 				logf("规则[%s#%d] tc 限速重建失败（保持原限速）: %v", rule.Name, rule.ID, err)
 			} else if spec.BWGroupKBps > 0 {
 				logf("规则[%s#%d] 带宽参数已热更新（iptables 未动，存量连接不受影响）", rule.Name, rule.ID)
@@ -300,7 +308,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 		s := old.spec()
 		s.teardownSnat()
 		m.teardownSnatNFT(rule.ID)
-		_ = m.teardownSnatLimit(s)
+		_ = m.teardownSnatLimit(s, old)
 		m.teardownEgressRouteNFT(s.RtTable)
 		s.teardownEgressRoute() // exec 兜底（netlink 版失败/引擎不可用时）
 		// 停用/删除时掐断本规则的存量穿越会话：iptables 拆除后，基线的
@@ -361,7 +369,7 @@ func (m *Manager) applySNAT(rule model.ForwardRule) error {
 	if err := m.installSnatNFT(spec); err != nil {
 		return err
 	}
-	if err := m.applySnatLimit(spec); err != nil {
+	if err := m.applySnatLimit(spec, m.snatEntryOf(rule.ID)); err != nil {
 		// 限速失败不阻塞主功能：iptables 已装好，限速降级（状态里留痕）
 		logf("规则[%s#%d] tc 入向限速未生效（降级为不限速）: %v", rule.Name, rule.ID, err)
 	}
@@ -511,6 +519,38 @@ func ipv4Of(ifName string) string {
 		}
 	}
 	return ""
+}
+
+// localIPv4s 返回本机全部非回环 IPv4 地址（按网卡顺序）。
+//
+// 用途：SNAT 的 tc 限速 filter 需要把「网关自己 dial 出去的流量」排除掉。
+// 端口映射（用户态转发）的去程包由网关进程生成，源地址是本机某个 IP；
+// 而 SNAT 转发的流量源地址是客户端。二者可能命中同一个 `match ip dst`
+// 条件（当端口映射的后端恰好也在 SNAT 白名单里时），必须靠源地址区分。
+func localIPv4s() []string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, iface := range ifaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipn, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			v4 := ipn.IP.To4()
+			if v4 == nil || v4.IsLoopback() {
+				continue
+			}
+			out = append(out, v4.String())
+		}
+	}
+	return out
 }
 
 // InterfaceExists 网卡存在且 UP（API 校验用）。
@@ -879,14 +919,21 @@ func snatPurgeByComment(ruleID uint) {
 // applySnatLimit SNAT 限速（ADR-9：自身限速彻底移除，仅带宽包共享）：
 // 入包成员（BWGroupKBps>0）在入口网卡挂 per-包 htb 共享 class 1:100，
 // 全部成员 filter 汇聚导入——同额度共享（PoC 实证）。未入包不限速。
-func (m *Manager) applySnatLimit(s *snatRuleSpec) error {
+func (m *Manager) applySnatLimit(s *snatRuleSpec, e *snatEntry) error {
 	// 整个 tc 序列串行：两条规则并发 Apply 时 tc 命令交错会留下半装状态
 	// （A 刚建子类、B 的清理把它删掉）。nft 有独立的 nftApplyMu，互不阻塞。
 	m.tcMu.Lock()
 	defer m.tcMu.Unlock()
 
-	_ = m.teardownSnatLimitLocked(s)
+	// 解绑带宽包（BWGroupKBps<=0）时必须能拆掉**绑包期间**建的 ifb 树。
+	// teardown 需要上次实际使用的设备名（entry.ifbDev），不能按当前
+	// bwGroupID 现算——那时它已经是 0，会算成 ifb-haweb0 而拆错设备。
+	_ = m.teardownSnatLimitLocked(s, e)
 	if s.BWGroupKBps <= 0 || len(s.AllowSrcs) == 0 {
+		// 已解绑：清掉记录的设备名，避免下次误拆
+		if e != nil {
+			e.ifbDev = ""
+		}
 		return nil
 	}
 
@@ -911,7 +958,7 @@ func (m *Manager) applySnatLimit(s *snatRuleSpec) error {
 	// src 仍是客户端真实 IP。故用 ingress + u32 match ip src 分类，mirred
 	// 重定向到 ifb 设备后在 ifb 的 egress 上做 htb 整形。
 	// ifb 建不起来（无模块权限）时降级：上传只受 egress 侧总额约束。
-	if err := m.applyIngressLimit(s, s.bwGroupID); err != nil {
+	if err := m.applyIngressLimit(s, s.bwGroupID, e); err != nil {
 		logf("[snat] 规则#%d 上传方向每源保底未生效（ingress/ifb 不可用，仅总额受限）: %v", s.ID, err)
 	}
 	return nil
@@ -981,6 +1028,19 @@ func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 			}
 		}
 	}
+	// 直通规则：把「本机自己发出的流量」从限速口径里摘出去（prio 9 < 10，
+	// 先于下载分类生效）。这些包是端口映射（Go 用户态转发）去后端的 dial，
+	// 由网关进程生成、源地址为本机 IP；它们的限速归规则自身的 Go 令牌桶管，
+	// 不该被 SNAT 带宽包的 tc 树二次限制。
+	//
+	// 不这么做的话：端口映射的后端若恰好是本 SNAT 白名单里的地址
+	// （同一台机器既是 SNAT 客户端又是映射后端），去程会被 `match ip dst`
+	// 误判成 SNAT 下载流量 → 实测从 628Mbit/s 掉到 32.4Mbit/s。
+	for _, lip := range localIPv4s() {
+		_ = runQuiet("tc", "filter", "replace", "dev", ifn,
+			"parent", "1:", "protocol", "ip", "prio", "9", "u32",
+			"match", "ip", "src", lip, "flowid", leafClassID)
+	}
 	// 每源保底子类 + 下载方向分类
 	minKB := s.MinKBps
 	if minKB <= 0 {
@@ -1012,6 +1072,16 @@ func (m *Manager) applyHTBLimit(s *snatRuleSpec, ifn string) error {
 			return err
 		}
 		// 下载方向：回程包 daddr=客户端 → 本子类（rate=保底、ceil=总额）
+		//
+		// 但有个必须排除的情况：**端口映射（用户态转发）的去程包也满足
+		// daddr=客户端**——网关 accept 后自己 dial 后端，daddr 是后端地址。
+		// 若该后端恰好也在本 SNAT 规则的白名单里（常见：同一台机器既是
+		// SNAT 客户端又是端口映射后端），就会被误判成"SNAT 下载流量"而限速。
+		// 实测：端口映射 UDP 打流经此限制从 628Mbit/s 掉到 32.4Mbit/s。
+		//
+		// 区分依据：端口映射的去程包**由网关进程生成**，源地址是本机某个 IP；
+		// SNAT 转发的包源地址是客户端。所以用更高优先级（pref 更小）的
+		// 直通规则先捞走"源=本机 IP"的流量，再按 daddr 分类。
 		if err := runQuiet("tc", "filter", "replace", "dev", ifn,
 			"parent", "1:", "protocol", "ip", "prio", "10", "u32",
 			"match", "ip", "dst", src, "flowid", clsID); err != nil {
@@ -1219,14 +1289,22 @@ func ipCidrToU32(s string) (hex, mask string, ok bool) {
 //
 // per-网卡共享结构的生命周期（root/class）随本机全部 snat 规则退化；
 // 不做显式删除（空 htb 无行为差异，避免"拆 A 时把 B 拆掉"的互踩——评审必修2）。
-func (m *Manager) teardownSnatLimit(s *snatRuleSpec) error {
+func (m *Manager) teardownSnatLimit(s *snatRuleSpec, e *snatEntry) error {
 	m.tcMu.Lock()
 	defer m.tcMu.Unlock()
-	return m.teardownSnatLimitLocked(s)
+	return m.teardownSnatLimitLocked(s, e)
+}
+
+// snatEntryOf 取规则当前注册的 entry（不存在返回 nil）。用于需要跨 apply
+// 读取"上次实际用了哪个 ifb 设备"这类信息的路径。
+func (m *Manager) snatEntryOf(id uint) *snatEntry {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.snatRules[id]
 }
 
 // teardownSnatLimitLocked 无锁版本（调用方已持 tcMu）。
-func (m *Manager) teardownSnatLimitLocked(s *snatRuleSpec) error {
+func (m *Manager) teardownSnatLimitLocked(s *snatRuleSpec, e *snatEntry) error {
 	// 下载方向：egress 上按 daddr=客户端 的分类 filter（每源一条）
 	for _, src := range s.AllowSrcs {
 		if src == "" {
@@ -1235,15 +1313,88 @@ func (m *Manager) teardownSnatLimitLocked(s *snatRuleSpec) error {
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "1:",
 			"protocol", "ip", "prio", "10", "u32", "match", "ip", "dst", src)
 	}
+	// 直通规则（prio 9，源=本机 IP → 叶子类）：applyHTBLimit 每次都会重装，
+	// 这里按本机 IP 列表逐条删除，避免规则解绑后残留。
+	for _, lip := range localIPv4s() {
+		_ = runQuiet("tc", "filter", "del", "dev", s.IfIn, "parent", "1:",
+			"protocol", "ip", "prio", "9", "u32", "match", "ip", "src", lip)
+	}
 	// 上传方向：ingress 重定向 filter + ifb 子类（teardown 内部自己加锁，
 	// 此处不持 tcMu——applySnatLimit 已持有时由 lockFree 变体处理）
-	m.teardownIngressLimitLocked(s)
+	m.teardownIngressLimitLocked(s, e)
 	// 历史形态清理（旧版上传在 egress 用 OutIP 分类）
 	if s.OutIP != "" {
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(uploadFilterPref(s.OutIP)))
 		_ = runQuiet("tc", "filter", "del", "dev", s.IfOut, "parent", "1:", "pref", strconv.Itoa(srcFilterPref(s.OutIP)))
 	}
+	// 本网卡上若已没有任何规则绑带宽包，拆掉 root htb —— 让「移除带宽包 = 解除限速」
+	// 真正成立。
+	//
+	// 背景：root htb 与 1:100 父类是网卡级共享结构，teardown 一直刻意不拆
+	// （避免拆 A 时把 B 的限速一起拆掉）。但这也导致最后一个绑包规则解绑后，
+	// 树留在网卡上继续限速——实测：规则 bw_group_id 改 0 后，eth0 的
+	// 1:100 rate 33554Kbit 仍生效，UDP 打流被压在 32.6Mbit/s。
+	// 判据保守：只有"本网卡上再无绑包规则"才拆，多规则共存时不动。
+	//
+	// 注意顺序：先清本 entry 的 ifbDev（否则 ifaceNeedsHTB 会把"自己"算成
+	// 仍需要树，导致卸载永远不生效），再判定与拆除。
+	prevDev := ""
+	if e != nil {
+		prevDev = e.ifbDev
+		e.ifbDev = ""
+	}
+	// 只有**本次是真的要卸载限速**（新 spec 不再绑包）时才考虑清根；
+	// applySnatLimit 的"先 teardown 再 apply"重装流程不拆，避免每轮重建抖动。
+	unloading := s.BWGroupKBps <= 0 || len(s.AllowSrcs) == 0
+	if unloading {
+		if !m.ifaceNeedsHTB(s.IfIn) {
+			_ = runQuiet("tc", "qdisc", "del", "dev", s.IfIn, "root")
+		}
+		// 绑包期间用过的 ifb 也一并清根（留着无害，但不清会积累）
+		if prevDev != "" && !m.ifbNeedsHTB(prevDev) {
+			_ = runQuiet("tc", "qdisc", "del", "dev", prevDev, "root")
+		}
+	}
 	return nil
+}
+
+// ifbNeedsHTB 判断某 ifb 设备是否还被其它规则占用（用于决定能否清根）。
+func (m *Manager) ifbNeedsHTB(dev string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, e := range m.snatRules {
+		if e != nil && e.ifbDev == dev {
+			return true
+		}
+	}
+	return false
+}
+
+// ifaceNeedsHTB 判断某网卡是否还有规则需要保留 htb 限速树。
+//
+// 遍历当前注册的全部 SNAT 规则：只要有任一规则（非本规则自身正在拆的场景）
+// 仍绑着带宽包且用到这块网卡，就不能拆 root。任一处误判都会导致同卡其它
+// 规则限速失效，所以判据取保守侧——不确定就保留。
+func (m *Manager) ifaceNeedsHTB(ifn string) bool {
+	if ifn == "" {
+		return false
+	}
+	m.mu.Lock()
+	entries := make([]*snatEntry, 0, len(m.snatRules))
+	for _, e := range m.snatRules {
+		entries = append(entries, e)
+	}
+	m.mu.Unlock()
+	for _, e := range entries {
+		if e == nil || e.ifIn != ifn {
+			continue
+		}
+		// entry 记着上次用的 ifb → 说明它参与过限速
+		if e.ifbDev != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------- 出口策略路由（eth0进→强制ens19出 的公网穿越场景） ----------
@@ -1892,8 +2043,14 @@ const ifbDevice = "ifb-haweb0"
 //
 // 幂等：qdisc/class/filter 全部 replace。ifb 创建失败时返回错误，调用方降级
 // （只记日志，上传方向退化为仅受 egress 总额约束）。
-func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
+func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint, e *snatEntry) error {
 	dev := ifbNameFor(bwID)
+	// 记录本次实际使用的设备（跨 apply 持久在 entry 上）：解绑带宽包时 bwID
+	// 会变 0，teardown 靠它找到正确的 ifb，否则按 ifbNameFor(0) 拆错设备，
+	// 旧 ifb 上的子类与 filter 永久残留 → 移除带宽包后限速依然生效。
+	if e != nil {
+		e.ifbDev = dev
+	}
 
 	// 1) 确保 ifb 设备存在并 up
 	if _, err := exec.Command("ip", "link", "show", dev).Output(); err != nil {
@@ -2017,15 +2174,25 @@ func (m *Manager) applyIngressLimit(s *snatRuleSpec, bwID uint) error {
 // teardownIngressLimit 拆除上传方向的 ingress 重定向与 ifb 子类。
 // ingress 上按 pref 精确删本规则的 filter；ifb 子类按所有权集合删。
 // ifb 设备与 ingress qdisc 保留（同包多规则共用）。
-func (m *Manager) teardownIngressLimit(s *snatRuleSpec) {
+func (m *Manager) teardownIngressLimit(s *snatRuleSpec, e *snatEntry) {
 	m.tcMu.Lock()
 	defer m.tcMu.Unlock()
-	m.teardownIngressLimitLocked(s)
+	m.teardownIngressLimitLocked(s, e)
 }
 
 // teardownIngressLimitLocked 无锁版本（调用方已持 tcMu）。
-func (m *Manager) teardownIngressLimitLocked(s *snatRuleSpec) {
-	dev := ifbNameFor(s.bwGroupID)
+func (m *Manager) teardownIngressLimitLocked(s *snatRuleSpec, e *snatEntry) {
+	// 设备名取**上次 apply 实际用的**（entry.ifbDev），不是按当前 bwGroupID 现算。
+	// 解绑带宽包时 s.bwGroupID 已变 0 → ifbNameFor(0)="ifb-haweb0"，
+	// 而绑包期间用的是 "ifb-hw<N>"，按新值算会把拆除操作打到一个无关设备上，
+	// 旧 ifb 的 htb 树与 ingress filter 永久残留（表现为"移除带宽包后限速仍在"）。
+	dev := ""
+	if e != nil {
+		dev = e.ifbDev
+	}
+	if dev == "" {
+		dev = ifbNameFor(s.bwGroupID)
+	}
 	for _, src := range s.AllowSrcs {
 		if src == "" {
 			continue
