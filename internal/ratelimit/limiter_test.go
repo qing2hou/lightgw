@@ -55,3 +55,55 @@ func TestTryWaitTimeout(t *testing.T) {
 		t.Log("桶随时间恢复，此断言仅记录行为")
 	}
 }
+
+// TestSharedModeTryWaitEnforced 回归（2026-11-02）：shared 形态下
+// TryWaitUpload/TryWaitDownload 必须真正限速。
+//
+// 历史 bug：两个方法直接读 l.upload/l.download，而 NewSharedTotal 只设置
+// l.shared，前两者是 nil → tryN 见 nil 直接返回 true，限速被完全绕过。
+// 表现为：UDP 规则绑了带宽包（带宽包走 shared 形态）也照样满速。
+// 生产影响面：UDP 的双向限速对绑包规则全部失效。
+func TestSharedModeTryWaitEnforced(t *testing.T) {
+	l := NewSharedTotal(100) // 100 B/s
+
+	// 1 万字节远超桶容量：限速生效时必然超时返回 false
+	if l.TryWaitUpload(10000, 20*time.Millisecond) {
+		t.Fatal("★ shared 形态下 TryWaitUpload 未限速（直接放行）")
+	}
+	if l.TryWaitDownload(10000, 20*time.Millisecond) {
+		t.Fatal("★ shared 形态下 TryWaitDownload 未限速（直接放行）")
+	}
+}
+
+// TestSharedModeIsShared 上传与下载共用同一个桶——一侧耗尽后另一侧也必须等。
+func TestSharedModeIsShared(t *testing.T) {
+	l := NewSharedTotal(1000) // 1000 B/s，桶 4096 起步
+
+	// 先耗尽：拿 4096（整个桶容量）应成功（桶初始满）
+	if !l.TryWaitUpload(4096, 50*time.Millisecond) {
+		t.Fatal("首个请求应能在桶满时通过")
+	}
+	// 紧接着再要 4096：桶已空，20ms 只能补 20 字节 → 必须失败
+	if l.TryWaitDownload(4096, 20*time.Millisecond) {
+		t.Fatal("★ 上传耗尽后下载仍能拿到配额，说明未共用同一个桶")
+	}
+}
+
+// TestSeparateModeIndependent 非 shared 形态（New）下两个方向互不影响。
+func TestSeparateModeIndependent(t *testing.T) {
+	l := New(100, 0) // 只限上传
+	if l.TryWaitUpload(100000, 20*time.Millisecond) {
+		t.Fatal("上传方向应受限")
+	}
+	if !l.TryWaitDownload(100000, 20*time.Millisecond) {
+		t.Fatal("未配置下载限速时不应受阻")
+	}
+}
+
+// TestNilLimiterTryWait nil Limiter 不 panic，且视为不限速。
+func TestNilLimiterTryWait(t *testing.T) {
+	var l *Limiter
+	if !l.TryWaitUpload(999999, time.Millisecond) || !l.TryWaitDownload(999999, time.Millisecond) {
+		t.Fatal("nil Limiter 应视为不限速")
+	}
+}

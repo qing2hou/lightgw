@@ -96,12 +96,29 @@ func waitN(l *rate.Limiter, ctx context.Context, n int) {
 }
 
 // TryWaitUpload 尝试在 maxWait 内获取 n 字节上传配额，超时返回 false（UDP 丢包场景）。
+//
+// shared 形态（带宽包 NewSharedTotal）下必须用共享桶：原来直接读 l.upload，
+// 而 shared 形态下 l.upload/l.download 都是 nil → tryN 见 nil 直接返回 true，
+// **限速被完全绕过**。表现为：UDP 规则绑了带宽包也照样满速收发。
 func (l *Limiter) TryWaitUpload(n int, maxWait time.Duration) bool {
+	if l == nil {
+		return true
+	}
+	if l.shared != nil {
+		return tryN(l.shared, n, maxWait)
+	}
 	return tryN(l.upload, n, maxWait)
 }
 
 // TryWaitDownload 尝试在 maxWait 内获取 n 字节下载配额，超时返回 false。
+// shared 形态处理同 TryWaitUpload。
 func (l *Limiter) TryWaitDownload(n int, maxWait time.Duration) bool {
+	if l == nil {
+		return true
+	}
+	if l.shared != nil {
+		return tryN(l.shared, n, maxWait)
+	}
 	return tryN(l.download, n, maxWait)
 }
 
