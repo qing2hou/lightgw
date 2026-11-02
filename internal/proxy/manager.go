@@ -442,7 +442,7 @@ func (m *Manager) stopStaleProtocol(rule model.ForwardRule) {
 	if staleSNAT != nil {
 		staleSNAT.teardownSnat()
 		m.teardownSnatNFT(rule.ID) // nft 形态同拆（评审 M4——漏拆则残留到下次重启）
-		_ = m.teardownSnatLimit(staleSNAT)
+		_ = m.teardownSnatLimit(staleSNAT, m.snatEntryOf(rule.ID))
 		staleSNAT.teardownEgressRoute()
 	}
 }

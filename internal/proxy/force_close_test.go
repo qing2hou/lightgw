@@ -206,3 +206,77 @@ func TestCloseDeniedSessionsBlacklist(t *testing.T) {
 		t.Fatal("★ 未命中黑名单的会话被误杀")
 	}
 }
+
+// TestIfaceNeedsHTB 网卡是否需要保留 htb 限速树的判据。
+//
+// 背景：root htb 是网卡级共享结构，teardown 刻意不拆（防拆 A 时把 B 拆掉）。
+// 但最后一个绑包规则解绑后若仍保留，就会持续限速——实测 eth0 的
+// 1:100 rate 33554Kbit 在规则 bw_group_id 改 0 后仍然生效，
+// 把端口映射的 UDP 流量压在 32.6Mbit/s。
+//
+// 判据：本网卡上只要还有 entry 记着 ifbDev（= 参与过限速），就必须保留。
+func TestIfaceNeedsHTB(t *testing.T) {
+	m := newTestManager(0, 60*time.Second)
+	m.snatRules = map[uint]*snatEntry{}
+
+	// 无任何规则 → 不需要
+	if m.ifaceNeedsHTB("eth0") {
+		t.Fatal("无规则时不应需要 htb")
+	}
+
+	// 一条绑包规则（ifbDev 有值）→ 需要
+	m.mu.Lock()
+	m.snatRules[1] = &snatEntry{ifIn: "eth0", ifbDev: "ifb-hw1"}
+	m.mu.Unlock()
+	if !m.ifaceNeedsHTB("eth0") {
+		t.Fatal("有绑包规则时应保留 htb")
+	}
+
+	// 别的网卡不受影响
+	if m.ifaceNeedsHTB("eth1") {
+		t.Fatal("eth1 上没有规则，不应需要 htb")
+	}
+
+	// 规则解绑（ifbDev 清空）→ 不再需要
+	m.mu.Lock()
+	m.snatRules[1].ifbDev = ""
+	m.mu.Unlock()
+	if m.ifaceNeedsHTB("eth0") {
+		t.Fatal("★ 规则解绑后仍判定需要 htb，会导致移除带宽包后限速不解除")
+	}
+}
+
+// TestIfbNeedsHTB ifb 设备占用判据：多规则共用同一 ifb 时不能清根。
+func TestIfbNeedsHTB(t *testing.T) {
+	m := newTestManager(0, 60*time.Second)
+	m.snatRules = map[uint]*snatEntry{}
+
+	if m.ifbNeedsHTB("ifb-hw1") {
+		t.Fatal("无规则时 ifb 不应被占用")
+	}
+
+	m.mu.Lock()
+	m.snatRules[1] = &snatEntry{ifIn: "eth0", ifbDev: "ifb-hw1"}
+	m.snatRules[2] = &snatEntry{ifIn: "eth0", ifbDev: "ifb-hw1"}
+	m.mu.Unlock()
+
+	if !m.ifbNeedsHTB("ifb-hw1") {
+		t.Fatal("有规则占用时 ifb 不应被清根")
+	}
+
+	// 只清掉一条，另一条还占着 → 仍需保留
+	m.mu.Lock()
+	m.snatRules[1].ifbDev = ""
+	m.mu.Unlock()
+	if !m.ifbNeedsHTB("ifb-hw1") {
+		t.Fatal("★ 还有规则占用 ifb 时被判定可清根，会拆掉别人的限速")
+	}
+
+	// 都清掉 → 可清根
+	m.mu.Lock()
+	m.snatRules[2].ifbDev = ""
+	m.mu.Unlock()
+	if m.ifbNeedsHTB("ifb-hw1") {
+		t.Fatal("全部解绑后 ifb 应可清根")
+	}
+}
